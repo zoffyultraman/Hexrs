@@ -1,76 +1,22 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app;
+mod lobby_view;
+mod theme;
 mod win32;
 
+use std::time::Duration;
+
 use gpui::{
-    div, prelude::*, px, rgba, size, App, Application, Bounds, Context, FontWeight, Render,
-    Window, WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
+    prelude::*, px, size, App, Application, AsyncApp, Bounds, WindowBackgroundAppearance,
+    WindowBounds, WindowKind, WindowOptions,
 };
+use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-/// Minimal hextech transparent overlay card rendered in Phase 1 to verify Win32 overlay behavior.
-struct HexOverlayDemo;
+use crate::app::HexOverlayApp;
 
-impl Render for HexOverlayDemo {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .p_3()
-            .flex()
-            .flex_col()
-            .justify_between()
-            .rounded_xl()
-            .border_1()
-            .border_color(rgba(0xC8AA6E99))
-            .bg(rgba(0x0A1428D9))
-            .shadow_lg()
-            .text_color(rgba(0xF0E6D2FF))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_sm()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgba(0xC8AA6EFF))
-                            .child("HEXOVERLAY // PHASE 1"),
-                    )
-                    .child(
-                        div()
-                            .px_2()
-                            .py(px(2.0))
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgba(0x0AC8B999))
-                            .bg(rgba(0x0AC8B933))
-                            .text_xs()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgba(0x0AC8B9FF))
-                            .child("TOP-MOST"),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgba(0xA09B8CFF))
-                            .child("Transparent click-through GPUI overlay initialized"),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgba(0x0AC8B9FF))
-                            .child("WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT"),
-                    ),
-            )
-    }
-}
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(80);
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -80,25 +26,49 @@ fn init_tracing() {
 fn main() {
     init_tracing();
 
-    Application::new().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(360.0), px(120.0)), cx);
+    let (event_rx, core_handle) = match hex_core::spawn_core_service() {
+        Ok(pair) => pair,
+        Err(err) => {
+            error!(error = %err, "failed to start hex-core background service");
+            return;
+        }
+    };
+
+    info!("HexOverlay starting GPUI event loop (Dormant until League client enters Champ Select or Match)");
+
+    Application::new().run(move |cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(win32::SIDEBAR_WIDTH_DIP), px(680.0)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: None,
             kind: WindowKind::PopUp,
             window_background: WindowBackgroundAppearance::Transparent,
             focus: false,
-            show: true,
+            show: false,
             ..Default::default()
         };
 
-        if let Err(err) = cx.open_window(options, |window, cx| {
-            if let Err(style_err) = win32::apply_overlay_styles(window) {
-                tracing::warn!(error = %style_err, "failed to apply Win32 overlay styles");
-            }
-            cx.new(|_| HexOverlayDemo)
+        let window_handle = match cx.open_window(options, |_window, cx| {
+            cx.new(|_| HexOverlayApp::new(event_rx, core_handle))
         }) {
-            tracing::error!(error = %err, "failed to open HexOverlay window");
-        }
+            Ok(handle) => handle,
+            Err(err) => {
+                error!(error = %err, "failed to open HexOverlay window");
+                return;
+            }
+        };
+
+        cx.spawn(async move |cx: &mut AsyncApp| loop {
+            cx.background_executor().timer(EVENT_POLL_INTERVAL).await;
+            let alive = window_handle
+                .update(cx, |app, window, cx| {
+                    app.tick(window, cx);
+                })
+                .is_ok();
+            if !alive {
+                break;
+            }
+        })
+        .detach();
     });
 }

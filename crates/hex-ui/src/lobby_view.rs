@@ -1,0 +1,754 @@
+//! Champ Select GPUI sidebar rendering (`code_artifact.md` Section 3.1).
+
+use gpui::{div, prelude::*, px, AnyElement, Context, Div, FontWeight, SharedString};
+use hex_core::ChampSelectState;
+use hex_data::{
+    AugmentEvaluation, BenchHighlight, DynamicBuildPlan, HeroPreview, HeroStats,
+    SynergyRecommendation, TeamDiagnosis, TeamRecommendations,
+};
+
+use crate::app::HexOverlayApp;
+use crate::theme::{self, tier_badge};
+
+const SPLIT_BAR_WIDTH_PX: f32 = 268.0;
+
+/// Renders the interactive 320px-wide Champ Select sidebar docked beside `LeagueClientUx.exe`.
+pub fn render_lobby_sidebar(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>) -> Div {
+    let champ_select = app.champ_select.as_ref();
+    let lcu_connected = app.lcu_connected;
+    let current_hero = app.current_hero_stats.as_ref();
+    let bench = &app.bench_highlights;
+    let recs = &app.team_recs;
+    let expanded_hero_id = app.expanded_hero_id;
+    let selected_preview = app.selected_preview.as_ref();
+
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(theme::canvas_bg())
+        .border_1()
+        .border_color(theme::border_gold())
+        .text_color(theme::text_primary())
+        .child(render_header(lcu_connected, champ_select))
+        .child(
+            div()
+                .id("lobby-sidebar-scroll")
+                .flex_1()
+                .overflow_y_scroll()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(render_active_hero_section(
+                    current_hero,
+                    expanded_hero_id,
+                    selected_preview,
+                    cx,
+                ))
+                .when(!bench.is_empty(), |parent| {
+                    parent.child(render_bench_section(
+                        bench,
+                        expanded_hero_id,
+                        selected_preview,
+                        cx,
+                    ))
+                })
+                .child(render_diagnosis_section(&recs.diagnosis))
+                .child(render_recommendations_section(
+                    recs,
+                    expanded_hero_id,
+                    selected_preview,
+                    cx,
+                )),
+        )
+}
+
+fn render_header(lcu_connected: bool, champ_select: Option<&ChampSelectState>) -> Div {
+    let status_dot_color = if lcu_connected {
+        theme::cyan()
+    } else {
+        theme::warning_text()
+    };
+    let mode_label = format_game_mode(
+        champ_select.map(|s| s.game_mode.as_str()).unwrap_or(""),
+        champ_select.and_then(|s| s.queue_id),
+    );
+    let phase_label = champ_select
+        .map(|s| format_phase(&s.phase))
+        .unwrap_or("等待对局");
+
+    div()
+        .px_3()
+        .py_2()
+        .bg(theme::card_bg())
+        .border_b_1()
+        .border_color(theme::border_subtle())
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .rounded_full()
+                        .bg(status_dot_color),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::gold())
+                        .child("HEXOVERLAY"),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    div()
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded_md()
+                        .bg(theme::cyan_dim())
+                        .border_1()
+                        .border_color(theme::border_cyan())
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::cyan())
+                        .child(mode_label),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child(phase_label),
+                ),
+        )
+}
+
+fn render_active_hero_section(
+    current_hero: Option<&HeroStats>,
+    expanded_hero_id: Option<i32>,
+    selected_preview: Option<&HeroPreview>,
+    cx: &mut Context<HexOverlayApp>,
+) -> Div {
+    let Some(hero) = current_hero else {
+        return div()
+            .p_3()
+            .rounded_lg()
+            .bg(theme::card_bg())
+            .border_1()
+            .border_color(theme::border_subtle())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::gold())
+                    .child("当前英雄"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::text_muted())
+                    .child("等待锁定或预选英雄以加载强度与出装建议..."),
+            );
+    };
+
+    let hero_id = hero.hero_id;
+    let is_expanded = expanded_hero_id == Some(hero_id);
+    let preview_matches = selected_preview.filter(|p| p.hero_id == hero_id);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .id(SharedString::from(format!("active-hero-{hero_id}")))
+                .cursor_pointer()
+                .p_3()
+                .rounded_lg()
+                .bg(theme::card_bg())
+                .border_1()
+                .border_color(if is_expanded {
+                    theme::border_cyan()
+                } else {
+                    theme::border_gold()
+                })
+                .hover(|s| s.bg(theme::card_elevated_bg()))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.toggle_hero_preview(hero_id, cx);
+                }))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(tier_badge(hero.tier))
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::BOLD)
+                                        .child(format!("{} · {}", hero.name_zh, hero.title_zh)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::text_muted())
+                                .child(if is_expanded { "收起预览 ▲" } else { "战前预览 ▼" }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::cyan())
+                                .child(format!("胜率 {:.1}%", hero.win_rate)),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::text_muted())
+                                .child(format!("登场 {:.1}%", hero.pick_rate)),
+                        ),
+                )
+                .when(!hero.tags.is_empty(), |card| {
+                    card.child(render_tag_row(&hero.tags))
+                }),
+        )
+        .when_some(preview_matches, |container, preview| {
+            container.child(render_hero_preview_drawer(preview))
+        })
+}
+
+fn render_bench_section(
+    bench: &[BenchHighlight],
+    expanded_hero_id: Option<i32>,
+    selected_preview: Option<&HeroPreview>,
+    cx: &mut Context<HexOverlayApp>,
+) -> Div {
+    let mut pills = div().flex().flex_wrap().gap_1();
+    for item in bench {
+        let hero_id = item.hero_id;
+        let is_expanded = expanded_hero_id == Some(hero_id);
+        pills = pills.child(
+            div()
+                .id(SharedString::from(format!("bench-hero-{hero_id}")))
+                .cursor_pointer()
+                .px_2()
+                .py(px(4.0))
+                .rounded_md()
+                .bg(theme::gold_dim())
+                .border_1()
+                .border_color(if is_expanded {
+                    theme::border_cyan()
+                } else {
+                    theme::border_gold()
+                })
+                .hover(|s| s.bg(theme::card_elevated_bg()))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.toggle_hero_preview(hero_id, cx);
+                }))
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(tier_badge(item.tier))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(item.name_zh.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::gold())
+                        .child(format!("{:.1}%", item.win_rate)),
+                ),
+        );
+    }
+
+    let preview_for_bench = selected_preview.filter(|p| {
+        expanded_hero_id == Some(p.hero_id) && bench.iter().any(|b| b.hero_id == p.hero_id)
+    });
+
+    div()
+        .p_3()
+        .rounded_lg()
+        .bg(theme::card_bg())
+        .border_1()
+        .border_color(theme::border_subtle())
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::gold())
+                        .child("备选池高亮"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child("高胜优先抢选"),
+                ),
+        )
+        .child(pills)
+        .when_some(preview_for_bench, |container, preview| {
+            container.child(render_hero_preview_drawer(preview))
+        })
+}
+
+fn render_diagnosis_section(diagnosis: &TeamDiagnosis) -> Div {
+    let ad_pct = (diagnosis.ad_ratio * 100.0).clamp(0.0, 100.0);
+    let ap_pct = (diagnosis.ap_ratio * 100.0).clamp(0.0, 100.0);
+    let ad_px = ((SPLIT_BAR_WIDTH_PX * diagnosis.ad_ratio as f32).round()).clamp(2.0, SPLIT_BAR_WIDTH_PX - 2.0);
+    let ap_px = (SPLIT_BAR_WIDTH_PX - ad_px).max(2.0);
+
+    let mut warnings_row = div().flex().flex_wrap().gap_1();
+    if diagnosis.warnings.is_empty() {
+        warnings_row = warnings_row.child(
+            div()
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded_md()
+                .bg(theme::cyan_dim())
+                .border_1()
+                .border_color(theme::border_cyan())
+                .text_xs()
+                .text_color(theme::cyan())
+                .child("阵容结构均衡"),
+        );
+    } else {
+        for warn in &diagnosis.warnings {
+            warnings_row = warnings_row.child(
+                div()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded_md()
+                    .bg(theme::warning_bg())
+                    .border_1()
+                    .border_color(theme::warning_border())
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::warning_text())
+                    .child(warn.clone()),
+            );
+        }
+    }
+
+    div()
+        .p_3()
+        .rounded_lg()
+        .bg(theme::card_bg())
+        .border_1()
+        .border_color(theme::border_subtle())
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::gold())
+                        .child("阵容短板诊断"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child(format!(
+                            "前排 {:.1} · 硬控 {:.1}",
+                            diagnosis.tank_total, diagnosis.cc_total
+                        )),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .text_xs()
+                        .child(
+                            div()
+                                .text_color(theme::ad_bar())
+                                .child(format!("物理 {:.0}%", ad_pct)),
+                        )
+                        .child(
+                            div()
+                                .text_color(theme::ap_bar())
+                                .child(format!("魔法 {:.0}%", ap_pct)),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(px(SPLIT_BAR_WIDTH_PX))
+                        .h(px(6.0))
+                        .rounded_full()
+                        .overflow_hidden()
+                        .flex()
+                        .child(div().w(px(ad_px)).h_full().bg(theme::ad_bar()))
+                        .child(div().w(px(ap_px)).h_full().bg(theme::ap_bar())),
+                ),
+        )
+        .child(warnings_row)
+}
+
+fn render_recommendations_section(
+    recs: &TeamRecommendations,
+    expanded_hero_id: Option<i32>,
+    selected_preview: Option<&HeroPreview>,
+    cx: &mut Context<HexOverlayApp>,
+) -> Div {
+    let mut list = div().flex().flex_col().gap_2();
+
+    if recs.top_picks.is_empty() {
+        list = list.child(
+            div()
+                .text_xs()
+                .text_color(theme::text_muted())
+                .child("暂无可选搭档推荐"),
+        );
+    } else {
+        for rec in &recs.top_picks {
+            list = list.child(render_recommendation_row(
+                rec,
+                expanded_hero_id,
+                selected_preview,
+                cx,
+            ));
+        }
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::gold())
+                        .child("智能搭档推荐 TOP 5"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child("点击查看核心海克斯与三件套"),
+                ),
+        )
+        .child(list)
+}
+
+fn render_recommendation_row(
+    rec: &SynergyRecommendation,
+    expanded_hero_id: Option<i32>,
+    selected_preview: Option<&HeroPreview>,
+    cx: &mut Context<HexOverlayApp>,
+) -> AnyElement {
+    let hero_id = rec.hero_id;
+    let is_expanded = expanded_hero_id == Some(hero_id);
+    let preview_matches = selected_preview.filter(|p| p.hero_id == hero_id);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .id(SharedString::from(format!("rec-hero-{hero_id}")))
+                .cursor_pointer()
+                .p_2()
+                .rounded_lg()
+                .bg(theme::card_bg())
+                .border_1()
+                .border_color(if is_expanded {
+                    theme::border_cyan()
+                } else {
+                    theme::border_subtle()
+                })
+                .hover(|s| s.bg(theme::card_elevated_bg()))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.toggle_hero_preview(hero_id, cx);
+                }))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(tier_badge(rec.tier))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(FontWeight::BOLD)
+                                        .child(rec.name_zh.clone()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::cyan())
+                                .child(format!("{:.1}% 胜率", rec.win_rate)),
+                        ),
+                )
+                .when_some(rec.synergy_reason.as_ref(), |row, reason| {
+                    row.child(
+                        div()
+                            .text_xs()
+                            .text_color(theme::gold())
+                            .child(reason.clone()),
+                    )
+                })
+                .when_some(rec.comp_reason.as_ref(), |row, comp| {
+                    row.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .px(px(5.0))
+                                    .py(px(1.0))
+                                    .rounded_md()
+                                    .bg(theme::cyan_dim())
+                                    .border_1()
+                                    .border_color(theme::border_cyan())
+                                    .text_xs()
+                                    .text_color(theme::cyan())
+                                    .child(comp.clone()),
+                            ),
+                    )
+                })
+                .when(!rec.tags.is_empty(), |row| {
+                    row.child(render_tag_row(&rec.tags))
+                }),
+        )
+        .when_some(preview_matches, |container, preview| {
+            container.child(render_hero_preview_drawer(preview))
+        })
+        .into_any_element()
+}
+
+fn render_hero_preview_drawer(preview: &HeroPreview) -> Div {
+    let mut aug_list = div().flex().flex_col().gap_1();
+    if preview.top_augments.is_empty() {
+        aug_list = aug_list.child(
+            div()
+                .text_xs()
+                .text_color(theme::text_muted())
+                .child("暂无海克斯统计"),
+        );
+    } else {
+        for aug in &preview.top_augments {
+            aug_list = aug_list.child(render_preview_augment_row(aug));
+        }
+    }
+
+    let mut build_list = div().flex().flex_col().gap_1();
+    if preview.core_builds.is_empty() {
+        build_list = build_list.child(
+            div()
+                .text_xs()
+                .text_color(theme::text_muted())
+                .child("暂无出装数据"),
+        );
+    } else {
+        for build in preview.core_builds.iter().take(2) {
+            build_list = build_list.child(render_preview_build_row(build));
+        }
+    }
+
+    div()
+        .p_2()
+        .rounded_lg()
+        .bg(theme::card_elevated_bg())
+        .border_1()
+        .border_color(theme::border_cyan())
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::cyan())
+                .child(format!("{} · 核心海克斯 TOP 3", preview.name_zh)),
+        )
+        .child(aug_list)
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::gold())
+                .child("核心三件套"),
+        )
+        .child(build_list)
+}
+
+fn render_preview_augment_row(aug: &AugmentEvaluation) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(tier_badge(aug.tier))
+                .child(div().text_xs().child(aug.name_zh.clone()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child(aug.rarity.clone()),
+                ),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme::cyan())
+                .child(format!("{:.1}%", aug.win_rate)),
+        )
+}
+
+fn render_preview_build_row(build: &DynamicBuildPlan) -> Div {
+    let mut item_chips = div().flex().flex_wrap().gap_1();
+    for item in &build.items {
+        item_chips = item_chips.child(
+            div()
+                .px(px(5.0))
+                .py(px(1.0))
+                .rounded_md()
+                .bg(theme::card_bg())
+                .border_1()
+                .border_color(theme::border_subtle())
+                .text_xs()
+                .child(item.name_zh.clone()),
+        );
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::gold())
+                        .child(build.playstyle_tag.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::cyan())
+                        .child(format!("{:.1}%", build.win_rate)),
+                ),
+        )
+        .child(item_chips)
+}
+
+fn render_tag_row(tags: &[String]) -> Div {
+    let mut row = div().flex().flex_wrap().gap_1();
+    for tag in tags.iter().take(3) {
+        row = row.child(
+            div()
+                .px(px(5.0))
+                .py(px(1.0))
+                .rounded_md()
+                .bg(theme::canvas_bg())
+                .border_1()
+                .border_color(theme::border_subtle())
+                .text_xs()
+                .text_color(theme::text_muted())
+                .child(tag.clone()),
+        );
+    }
+    row
+}
+
+fn format_game_mode(raw: &str, queue_id: Option<i32>) -> &'static str {
+    if matches!(queue_id, Some(1700)) || raw.eq_ignore_ascii_case("CHERRY") {
+        "斗魂竞技场"
+    } else if matches!(queue_id, Some(450) | Some(2400))
+        || raw.eq_ignore_ascii_case("ARAM")
+        || raw.eq_ignore_ascii_case("KIWI")
+    {
+        "海克斯大乱斗"
+    } else if raw.is_empty() {
+        "娱乐模式"
+    } else {
+        "选人阶段"
+    }
+}
+
+fn format_phase(raw: &str) -> &'static str {
+    match raw {
+        "PLANNING" => "预选阶段",
+        "BAN_PICK" => "禁用/选人",
+        "FINALIZATION" => "最终备战",
+        "GAME_STARTING" => "即将载入",
+        _ => "选人中",
+    }
+}
