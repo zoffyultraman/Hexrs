@@ -10,7 +10,6 @@ permissions:
   contents: write
 
 env:
-  RUSTFLAGS: "-C target-feature=+crt-static"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -22,6 +21,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
 
       - name: Setup MSVC & Windows SDK
         uses: ilammy/msvc-dev-cmd@v1
@@ -43,17 +44,17 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build HexOverlay release binary
-        run: cargo build --release --bin HexOverlay
+        run: cargo build --release --target x86_64-pc-windows-msvc --bin HexOverlay
 
       - name: Report HexOverlay.exe size
         shell: pwsh
         run: |
-          $exe = Get-Item "target/release/HexOverlay.exe"
+          $exe = Get-Item "target/x86_64-pc-windows-msvc/release/HexOverlay.exe"
           $mb = [math]::Round($exe.Length / 1MB, 2)
           Write-Host "HexOverlay.exe size: $($exe.Length) bytes ($mb MB)"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/release/HexOverlay.exe
+          files: target/x86_64-pc-windows-msvc/release/HexOverlay.exe
           generate_release_notes: true

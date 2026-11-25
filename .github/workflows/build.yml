@@ -7,7 +7,6 @@ on:
   workflow_dispatch:
 
 env:
-  RUSTFLAGS: "-C target-feature=+crt-static"
   CARGO_TERM_COLOR: always
 
 jobs:
@@ -19,6 +18,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
 
       - name: Setup MSVC & Windows SDK
         uses: ilammy/msvc-dev-cmd@v1
@@ -40,12 +41,30 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build HexOverlay release binary
-        run: cargo build --release --bin HexOverlay
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          cargo build --release --target x86_64-pc-windows-msvc --bin HexOverlay 2>&1 | Tee-Object -FilePath build.log
+          $code = $LASTEXITCODE
+          if ($code -ne 0) {
+            $lines = Get-Content -Path build.log -ErrorAction SilentlyContinue |
+              ForEach-Object { $_ -replace '\x1b\[[0-9;]*[mK]', '' }
+            $matched = @($lines | Where-Object {
+              $_ -match 'error(\[E\d+\])?:|panicked at|fatal error|LNK\d+|cannot find|mismatched types|unresolved|failed to run custom build'
+            } | Select-Object -First 8)
+            if ($matched.Count -eq 0) {
+              $matched = @($lines | Where-Object { $_.Trim().Length -gt 0 } | Select-Object -Last 8)
+            }
+            foreach ($line in $matched) {
+              Write-Host "::error::$($line)"
+            }
+            exit $code
+          }
 
       - name: Report HexOverlay.exe size
         shell: pwsh
         run: |
-          $exe = Get-Item "target/release/HexOverlay.exe"
+          $exe = Get-Item "target/x86_64-pc-windows-msvc/release/HexOverlay.exe"
           $mb = [math]::Round($exe.Length / 1MB, 2)
           Write-Host "HexOverlay.exe size: $($exe.Length) bytes ($mb MB)"
 
@@ -53,5 +72,5 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: HexOverlay-windows-x86_64
-          path: target/release/HexOverlay.exe
+          path: target/x86_64-pc-windows-msvc/release/HexOverlay.exe
           if-no-files-found: error
