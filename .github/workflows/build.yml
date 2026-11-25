@@ -40,11 +40,11 @@ jobs:
       - name: Cache Cargo dependencies and artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build HexOverlay release binary
+      - name: Build workspace release binaries
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
-          cargo build --release --target x86_64-pc-windows-msvc --bin HexOverlay 2>&1 | Tee-Object -FilePath build.log
+          cargo build --release --workspace --target x86_64-pc-windows-msvc 2>&1 | Tee-Object -FilePath build.log
           $code = $LASTEXITCODE
           if ($code -ne 0) {
             $lines = Get-Content -Path build.log -ErrorAction SilentlyContinue |
