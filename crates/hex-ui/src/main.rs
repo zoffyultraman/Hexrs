@@ -2,7 +2,9 @@
 
 mod app;
 mod lobby_view;
+mod overlay_view;
 mod theme;
+mod tray;
 mod win32;
 
 use std::time::Duration;
@@ -11,12 +13,13 @@ use gpui::{
     prelude::*, px, size, App, Application, AsyncApp, Bounds, WindowBackgroundAppearance,
     WindowBounds, WindowKind, WindowOptions,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::app::HexOverlayApp;
+use crate::tray::TrayController;
 
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(80);
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(60);
 
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -34,9 +37,17 @@ fn main() {
         }
     };
 
-    info!("HexOverlay starting GPUI event loop (Dormant until League client enters Champ Select or Match)");
+    info!("HexOverlay starting GPUI event loop");
 
     Application::new().run(move |cx: &mut App| {
+        let tray = match TrayController::new() {
+            Ok(controller) => Some(controller),
+            Err(err) => {
+                warn!(error = %err, "failed to initialize system tray; continuing without tray icon");
+                None
+            }
+        };
+
         let bounds = Bounds::centered(None, size(px(win32::SIDEBAR_WIDTH_DIP), px(680.0)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -49,7 +60,7 @@ fn main() {
         };
 
         let window_handle = match cx.open_window(options, |_window, cx| {
-            cx.new(|_| HexOverlayApp::new(event_rx, core_handle))
+            cx.new(|_| HexOverlayApp::new(event_rx, core_handle, tray))
         }) {
             Ok(handle) => handle,
             Err(err) => {

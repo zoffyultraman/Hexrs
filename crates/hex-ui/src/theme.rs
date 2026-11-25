@@ -88,6 +88,36 @@ pub fn ap_bar() -> Rgba {
     rgb(0x4EA8DE)
 }
 
+/// Translucent dark obsidian fill for floating in-game overlay cards.
+pub fn overlay_card_bg() -> Rgba {
+    rgba(0x0B101BE8)
+}
+
+/// Glowing gold background for `⚡ 完美协同` alerts.
+pub fn synergy_gold_bg() -> Rgba {
+    rgba(0xC8AA6E33)
+}
+
+/// Glowing gold border for `⚡ 完美协同` alerts.
+pub fn synergy_gold_border() -> Rgba {
+    rgba(0xFFD97DCC)
+}
+
+/// Bright gold text for `⚡ 完美协同` alerts.
+pub fn synergy_gold_text() -> Rgba {
+    rgb(0xFFD97D)
+}
+
+/// Highlight background for already-owned build items.
+pub fn owned_item_bg() -> Rgba {
+    rgba(0x0AC8B92E)
+}
+
+/// Highlight border for already-owned build items.
+pub fn owned_item_border() -> Rgba {
+    rgba(0x0AC8B9AA)
+}
+
 /// Color trio for rendering strength tier badges (`S+` .. `D`).
 pub struct TierPalette {
     pub bg: Rgba,

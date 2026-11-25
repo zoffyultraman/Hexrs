@@ -1,4 +1,4 @@
-//! Win32 window lookup, lobby auto-docking, click-through overlay styles, and visibility control.
+//! Win32 window handle lookup, lobby auto-docking, in-game overlay transparency, and Alt hotkey polling.
 
 /// Logical sidebar width in DIPs (`code_artifact.md` Section 3.1).
 pub const SIDEBAR_WIDTH_DIP: f32 = 320.0;
@@ -25,6 +25,7 @@ impl WindowRectInfo {
     }
 
     /// Returns the DPI scale factor (`1.0` at 96 DPI).
+    #[allow(dead_code)]
     pub fn scale(self) -> f32 {
         if self.dpi == 0 {
             1.0
@@ -36,12 +37,16 @@ impl WindowRectInfo {
 
 #[cfg(target_os = "windows")]
 mod imp {
+    use std::path::Path;
+    use std::process::Command;
+
     use anyhow::{Context, Result};
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::core::BOOL;
     use windows::Win32::Foundation::{HWND, LPARAM, RECT};
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
         GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetWindowLongPtrW, SetWindowPos,
@@ -184,7 +189,14 @@ mod imp {
         }
     }
 
+    /// Returns `true` while the Alt key (`VK_MENU`) is currently held down (compliant polling, zero hooks).
+    pub fn is_alt_hotkey_pressed() -> bool {
+        // SAFETY: `GetAsyncKeyState` is a standard stateless Win32 key state query.
+        unsafe { GetAsyncKeyState(i32::from(VK_MENU.0)) < 0 }
+    }
+
     /// Applies topmost, layered, click-through, and tool-window extended styles for in-game overlay mode.
+    #[allow(dead_code)]
     pub fn apply_overlay_styles(window: &Window) -> Result<()> {
         let hwnd = extract_hwnd(window)?;
 
@@ -217,10 +229,55 @@ mod imp {
         Ok(())
     }
 
+    /// Aligns the full-window transparent overlay over `League of Legends.exe` and toggles click-through.
+    pub fn set_in_game_overlay_mode(
+        window: &Window,
+        target_rect: Option<WindowRectInfo>,
+        interactive: bool,
+        visible: bool,
+    ) -> Result<()> {
+        let hwnd = extract_hwnd(window)?;
+
+        // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
+        unsafe {
+            let current = WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32);
+            let base = (current & !WS_EX_APPWINDOW)
+                | WS_EX_TOPMOST
+                | WS_EX_LAYERED
+                | WS_EX_TOOLWINDOW;
+            let next = if interactive {
+                base & !WS_EX_TRANSPARENT
+            } else {
+                base | WS_EX_TRANSPARENT
+            };
+
+            if next != current {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next.0 as isize);
+            }
+
+            let Some(target) = target_rect.filter(|_| visible) else {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return Ok(());
+            };
+
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                target.left,
+                target.top,
+                target.width(),
+                target.height(),
+                SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            .context("SetWindowPos(in-game overlay) failed")?;
+
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+
+        Ok(())
+    }
+
     /// Configures interactive Champ Select sidebar mode docked beside `LeagueClientUx.exe`.
-    ///
-    /// Removes `WS_EX_TRANSPARENT` so clicks work, preserves `WS_EX_TOOLWINDOW`, and hides
-    /// the sidebar when `target_rect` is `None` (client minimized or not visible).
     pub fn set_lobby_dock_mode(window: &Window, target_rect: Option<WindowRectInfo>) -> Result<()> {
         let hwnd = extract_hwnd(window)?;
 
@@ -305,17 +362,45 @@ mod imp {
         }
         Ok(())
     }
+
+    /// Opens the local data directory in Windows Explorer.
+    pub fn open_data_directory(path: &Path) -> Result<()> {
+        let _ = std::fs::create_dir_all(path);
+        Command::new("explorer.exe")
+            .arg(path)
+            .spawn()
+            .with_context(|| format!("failed to open data directory {}", path.display()))?;
+        Ok(())
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
 mod imp {
+    use std::path::Path;
+
     use anyhow::Result;
     use gpui::Window;
 
     use super::WindowRectInfo;
 
+    /// Non-Windows stub for `is_alt_hotkey_pressed`.
+    pub fn is_alt_hotkey_pressed() -> bool {
+        false
+    }
+
     /// Non-Windows stub for `apply_overlay_styles`.
+    #[allow(dead_code)]
     pub fn apply_overlay_styles(_window: &Window) -> Result<()> {
+        Ok(())
+    }
+
+    /// Non-Windows stub for `set_in_game_overlay_mode`.
+    pub fn set_in_game_overlay_mode(
+        _window: &Window,
+        _target_rect: Option<WindowRectInfo>,
+        _interactive: bool,
+        _visible: bool,
+    ) -> Result<()> {
         Ok(())
     }
 
@@ -339,9 +424,15 @@ mod imp {
     pub fn show_window_no_activate(_window: &Window) -> Result<()> {
         Ok(())
     }
+
+    /// Non-Windows stub for `open_data_directory`.
+    pub fn open_data_directory(path: &Path) -> Result<()> {
+        tracing::info!(path = %path.display(), "open_data_directory requested on non-Windows");
+        Ok(())
+    }
 }
 
 pub use imp::{
-    apply_overlay_styles, find_window_by_pid, hide_window, set_lobby_dock_mode,
-    show_window_no_activate,
+    find_window_by_pid, hide_window, is_alt_hotkey_pressed, open_data_directory,
+    set_in_game_overlay_mode, set_lobby_dock_mode,
 };

@@ -11,8 +11,10 @@ path = "src/main.rs"
 [dependencies]
 hex-core = { path = "../hex-core" }
 hex-data = { path = "../hex-data" }
+hex-vision = { path = "../hex-vision" }
 gpui.workspace = true
 raw-window-handle.workspace = true
+tray-icon.workspace = true
 crossbeam-channel.workspace = true
 serde.workspace = true
 anyhow.workspace = true

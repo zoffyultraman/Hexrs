@@ -1,24 +1,33 @@
-//! Root GPUI application entity, event-loop polling, and Win32 window state orchestration.
+//! Root GPUI application entity, event-loop polling, WGC vision wiring, tray menu, and Win32 orchestration.
 
-use crossbeam_channel::Receiver;
+use std::sync::{Arc, RwLock};
+
+use crossbeam_channel::{unbounded, Receiver};
 use gpui::{div, prelude::*, rgba, Context, Render, Window};
-use hex_core::{AppEvent, AppMode, ChampSelectState, CoreHandle, LiveGameState};
+use hex_core::{AppEvent, AppMode, ChampSelectState, CoreHandle, LiveGameState, RoiManifest};
 use hex_data::{
-    BenchHighlight, HeroPreview, HeroStats, MetaEngine, TeamRecommendations,
+    AugmentEvaluation, BenchHighlight, DynamicBuildPlan, HeroPreview, HeroStats, MetaEngine,
+    TeamRecommendations,
 };
+use hex_vision::{SharedRoiManifest, VisionController};
 use tracing::{debug, info, warn};
 
 use crate::lobby_view;
-use crate::theme;
+use crate::overlay_view;
+use crate::tray::{TrayAction, TrayController};
 use crate::win32::{self, WindowRectInfo};
 
 const BENCH_HIGHLIGHT_LIMIT: usize = 3;
 const TEAM_RECOMMENDATION_LIMIT: usize = 5;
 
-/// Root GPUI state and controller bridging `hex-core` events, `hex-data` queries, and Win32 windowing.
+/// Root GPUI state and controller bridging `hex-core`, `hex-vision`, `hex-data`, `tray-icon`, and Win32.
 pub struct HexOverlayApp {
     pub mode: AppMode,
     pub lcu_connected: bool,
+    pub overlay_visible: bool,
+    pub hotkey_interactive: bool,
+    pub telemetry_enabled: bool,
+    pub updater_refresh_requested: bool,
     pub champ_select: Option<ChampSelectState>,
     pub live_game: Option<LiveGameState>,
     pub bench_highlights: Vec<BenchHighlight>,
@@ -26,16 +35,30 @@ pub struct HexOverlayApp {
     pub current_hero_stats: Option<HeroStats>,
     pub expanded_hero_id: Option<i32>,
     pub selected_preview: Option<HeroPreview>,
+    pub owned_augment_ids: Vec<i32>,
+    pub offered_augments: Vec<AugmentEvaluation>,
+    pub last_offer_capture_ms: Option<u64>,
+    pub dynamic_build: Option<DynamicBuildPlan>,
+    pub active_hero_name_zh: Option<String>,
+    pub roi_manifest: SharedRoiManifest,
     meta: Option<MetaEngine>,
     event_rx: Receiver<AppEvent>,
+    vision_rx: Receiver<AppEvent>,
     core_handle: CoreHandle,
-    last_window_sync: Option<(AppMode, Option<WindowRectInfo>)>,
-    in_game_styles_applied: bool,
+    vision: VisionController,
+    tray: Option<TrayController>,
+    last_lobby_sync: Option<(Option<WindowRectInfo>, bool)>,
+    last_overlay_sync: Option<(Option<WindowRectInfo>, bool, bool)>,
+    last_dormant_hidden: bool,
 }
 
 impl HexOverlayApp {
-    /// Constructs the GPUI root entity, opening `MetaEngine::open_default()` with graceful fallback.
-    pub fn new(event_rx: Receiver<AppEvent>, core_handle: CoreHandle) -> Self {
+    /// Constructs the GPUI root entity, initializing `MetaEngine`, `VisionController`, and tray status.
+    pub fn new(
+        event_rx: Receiver<AppEvent>,
+        core_handle: CoreHandle,
+        tray: Option<TrayController>,
+    ) -> Self {
         let meta = match MetaEngine::open_default() {
             Ok(engine) => {
                 info!("MetaEngine initialized successfully");
@@ -47,12 +70,27 @@ impl HexOverlayApp {
             }
         };
 
+        let hashes = meta
+            .as_ref()
+            .map(MetaEngine::list_augment_hashes)
+            .unwrap_or_default();
+        let roi_manifest = Arc::new(RwLock::new(RoiManifest::default()));
+        let (vision_tx, vision_rx) = unbounded::<AppEvent>();
+        let vision = VisionController::start(hashes, Arc::clone(&roi_manifest), vision_tx);
+
         let mode = core_handle.current_mode();
         let lcu_connected = core_handle.is_lcu_connected();
+        if let Some(ref tray_ctrl) = tray {
+            tray_ctrl.update_status(mode);
+        }
 
         Self {
             mode,
             lcu_connected,
+            overlay_visible: true,
+            hotkey_interactive: false,
+            telemetry_enabled: true,
+            updater_refresh_requested: false,
             champ_select: None,
             live_game: None,
             bench_highlights: Vec::new(),
@@ -60,62 +98,95 @@ impl HexOverlayApp {
             current_hero_stats: None,
             expanded_hero_id: None,
             selected_preview: None,
+            owned_augment_ids: Vec::new(),
+            offered_augments: Vec::new(),
+            last_offer_capture_ms: None,
+            dynamic_build: None,
+            active_hero_name_zh: None,
+            roi_manifest,
             meta,
             event_rx,
+            vision_rx,
             core_handle,
-            last_window_sync: None,
-            in_game_styles_applied: false,
+            vision,
+            tray,
+            last_lobby_sync: None,
+            last_overlay_sync: None,
+            last_dormant_hidden: false,
         }
     }
 
-    /// Drains pending `AppEvent`s from `hex-core` and synchronizes Win32 window docking/visibility.
+    /// Drains pending `hex-core` & `hex-vision` events, polls Alt hotkey + tray, and syncs Win32 state.
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut dirty = false;
 
         while let Ok(event) = self.event_rx.try_recv() {
             dirty = true;
-            match event {
-                AppEvent::ModeChanged(next_mode) => {
-                    info!(?next_mode, "overlay mode transitioned");
-                    if next_mode != AppMode::InGameOverlay {
-                        self.in_game_styles_applied = false;
+            self.handle_app_event(event);
+        }
+
+        while let Ok(event) = self.vision_rx.try_recv() {
+            dirty = true;
+            self.handle_app_event(event);
+        }
+
+        if let Some(actions) = self.tray.as_ref().map(TrayController::poll_actions) {
+            for action in actions {
+                match action {
+                    TrayAction::ToggleOverlay => {
+                        self.overlay_visible = self
+                            .tray
+                            .as_ref()
+                            .map(TrayController::is_overlay_checked)
+                            .unwrap_or(!self.overlay_visible);
+                        info!(visible = self.overlay_visible, "overlay visibility toggled via tray");
+                        if self.mode == AppMode::InGameOverlay {
+                            let mode_str = self
+                                .live_game
+                                .as_ref()
+                                .map(|l| l.game_mode.as_str())
+                                .unwrap_or("");
+                            self.vision.set_active(self.overlay_visible, mode_str);
+                        }
+                        dirty = true;
                     }
-                    if next_mode != AppMode::LobbyDocked {
-                        self.expanded_hero_id = None;
-                        self.selected_preview = None;
+                    TrayAction::ToggleTelemetry => {
+                        self.telemetry_enabled = self
+                            .tray
+                            .as_ref()
+                            .map(TrayController::is_telemetry_checked)
+                            .unwrap_or(!self.telemetry_enabled);
+                        info!(enabled = self.telemetry_enabled, "anonymized EOG telemetry toggled");
                     }
-                    self.mode = next_mode;
-                }
-                AppEvent::LcuConnectionChanged(connected) => {
-                    self.lcu_connected = connected;
-                    if !connected {
-                        self.champ_select = None;
-                        self.bench_highlights.clear();
-                        self.team_recs = TeamRecommendations::default();
-                        self.current_hero_stats = None;
+                    TrayAction::CheckDataUpdate => {
+                        self.updater_refresh_requested = true;
+                        info!("manual data hot-update check requested from tray");
                     }
-                }
-                AppEvent::ChampSelectUpdated(state) => {
-                    self.refresh_champ_select_data(&state);
-                    self.champ_select = Some(state);
-                }
-                AppEvent::LiveGameUpdated(live) => {
-                    self.live_game = Some(live);
-                }
-                AppEvent::AugmentOfferDetected {
-                    candidates,
-                    capture_ms,
-                } => {
-                    debug!(?candidates, capture_ms, "augment offer event received");
-                }
-                AppEvent::EndOfGameCaptured(eog) => {
-                    info!(
-                        game_mode = %eog.game_mode,
-                        participants = eog.participants.len(),
-                        "anonymized end-of-game stats captured"
-                    );
+                    TrayAction::OpenDataDir => {
+                        if let Err(err) = win32::open_data_directory(&hex_data::data_dir()) {
+                            warn!(error = %err, "failed to open local data directory");
+                        }
+                    }
+                    TrayAction::Quit => {
+                        info!("exit requested from system tray; shutting down services");
+                        self.vision.shutdown();
+                        self.core_handle.shutdown();
+                        cx.quit();
+                        return;
+                    }
                 }
             }
+        }
+
+        if self.mode == AppMode::InGameOverlay && self.overlay_visible {
+            let alt_pressed = win32::is_alt_hotkey_pressed();
+            if alt_pressed != self.hotkey_interactive {
+                self.hotkey_interactive = alt_pressed;
+                dirty = true;
+            }
+        } else if self.hotkey_interactive {
+            self.hotkey_interactive = false;
+            dirty = true;
         }
 
         self.sync_window_mode(window);
@@ -138,6 +209,140 @@ impl HexOverlayApp {
                 .and_then(|engine| engine.get_hero_preview(hero_id));
         }
         cx.notify();
+    }
+
+    /// Dismisses the currently displayed floating augment offer badges.
+    pub fn dismiss_augment_offer(&mut self, cx: &mut Context<Self>) {
+        self.offered_augments.clear();
+        self.last_offer_capture_ms = None;
+        cx.notify();
+    }
+
+    fn handle_app_event(&mut self, event: AppEvent) {
+        match event {
+            AppEvent::ModeChanged(next_mode) => {
+                info!(?next_mode, "overlay mode transitioned");
+                self.mode = next_mode;
+                self.last_lobby_sync = None;
+                self.last_overlay_sync = None;
+                self.last_dormant_hidden = false;
+
+                if let Some(ref tray_ctrl) = self.tray {
+                    tray_ctrl.update_status(next_mode);
+                }
+
+                if next_mode != AppMode::LobbyDocked {
+                    self.expanded_hero_id = None;
+                    self.selected_preview = None;
+                }
+
+                if next_mode == AppMode::InGameOverlay {
+                    let game_mode = self
+                        .live_game
+                        .as_ref()
+                        .map(|l| l.game_mode.as_str())
+                        .unwrap_or("");
+                    self.vision.set_active(self.overlay_visible, game_mode);
+                } else {
+                    self.vision.set_active(false, "");
+                    self.offered_augments.clear();
+                    self.owned_augment_ids.clear();
+                    self.last_offer_capture_ms = None;
+                    self.dynamic_build = None;
+                    self.active_hero_name_zh = None;
+                    self.hotkey_interactive = false;
+                }
+            }
+            AppEvent::LcuConnectionChanged(connected) => {
+                self.lcu_connected = connected;
+                if !connected {
+                    self.champ_select = None;
+                    self.bench_highlights.clear();
+                    self.team_recs = TeamRecommendations::default();
+                    self.current_hero_stats = None;
+                }
+            }
+            AppEvent::ChampSelectUpdated(state) => {
+                self.refresh_champ_select_data(&state);
+                self.champ_select = Some(state);
+            }
+            AppEvent::LiveGameUpdated(live) => {
+                self.refresh_live_game_data(&live);
+                self.live_game = Some(live);
+            }
+            AppEvent::AugmentOfferDetected {
+                candidates,
+                capture_ms,
+            } => {
+                debug!(?candidates, capture_ms, "augment offer detected by hex-vision");
+                self.evaluate_detected_offer(&candidates, capture_ms);
+            }
+            AppEvent::EndOfGameCaptured(eog) => {
+                info!(
+                    game_mode = %eog.game_mode,
+                    participants = eog.participants.len(),
+                    telemetry_enabled = self.telemetry_enabled,
+                    "anonymized end-of-game stats captured"
+                );
+            }
+        }
+    }
+
+    fn resolve_active_hero_id(&self) -> Option<i32> {
+        if let Some(live) = self.live_game.as_ref() {
+            if let Some(id) = live.active_champion_id {
+                return Some(id);
+            }
+            if let Some(meta) = self.meta.as_ref() {
+                if let Some(id) = meta.resolve_champion_id_by_alias(&live.active_champion_name) {
+                    return Some(id);
+                }
+            }
+        }
+
+        self.champ_select
+            .as_ref()
+            .map(|cs| {
+                if cs.local_champion_id > 0 {
+                    cs.local_champion_id
+                } else {
+                    cs.local_intent_id
+                }
+            })
+            .filter(|&id| id > 0)
+    }
+
+    fn refresh_live_game_data(&mut self, live: &LiveGameState) {
+        self.vision
+            .set_active(self.mode == AppMode::InGameOverlay && self.overlay_visible, &live.game_mode);
+
+        let Some(meta) = self.meta.as_ref() else {
+            return;
+        };
+
+        let hero_id = live
+            .active_champion_id
+            .or_else(|| meta.resolve_champion_id_by_alias(&live.active_champion_name));
+
+        self.active_hero_name_zh = hero_id
+            .and_then(|id| meta.get_hero_stats(id))
+            .map(|stats| stats.name_zh);
+
+        self.dynamic_build = hero_id.and_then(|id| {
+            meta.get_dynamic_build(id, &self.owned_augment_ids, &live.owned_item_ids)
+        });
+    }
+
+    fn evaluate_detected_offer(&mut self, candidates: &[i32], capture_ms: u64) {
+        let Some(meta) = self.meta.as_ref() else {
+            return;
+        };
+        let hero_id = self.resolve_active_hero_id().unwrap_or(0);
+        let evals = meta.evaluate_augment_offer(hero_id, candidates, &self.owned_augment_ids);
+        if !evals.is_empty() {
+            self.offered_augments = evals;
+            self.last_offer_capture_ms = Some(capture_ms);
+        }
     }
 
     fn refresh_champ_select_data(&mut self, state: &ChampSelectState) {
@@ -187,32 +392,44 @@ impl HexOverlayApp {
     fn sync_window_mode(&mut self, window: &Window) {
         match self.mode {
             AppMode::LobbyDocked => {
-                let target_rect = self.core_handle.lcu_pid().and_then(win32::find_window_by_pid);
-                if self.last_window_sync != Some((AppMode::LobbyDocked, target_rect)) {
+                let target_rect = if self.overlay_visible {
+                    self.core_handle.lcu_pid().and_then(win32::find_window_by_pid)
+                } else {
+                    None
+                };
+                let state = (target_rect, self.overlay_visible);
+                if self.last_lobby_sync != Some(state) {
                     if let Err(err) = win32::set_lobby_dock_mode(window, target_rect) {
                         warn!(error = %err, "failed to dock lobby sidebar");
                     }
-                    self.last_window_sync = Some((AppMode::LobbyDocked, target_rect));
+                    self.last_lobby_sync = Some(state);
                 }
             }
             AppMode::InGameOverlay => {
-                if !self.in_game_styles_applied
-                    || self.last_window_sync.map(|(m, _)| m) != Some(AppMode::InGameOverlay)
-                {
-                    if let Err(err) = win32::apply_overlay_styles(window) {
-                        warn!(error = %err, "failed to apply in-game overlay styles");
-                    } else {
-                        self.in_game_styles_applied = true;
+                let target_rect = if self.overlay_visible {
+                    self.core_handle.game_pid().and_then(win32::find_window_by_pid)
+                } else {
+                    None
+                };
+                let state = (target_rect, self.hotkey_interactive, self.overlay_visible);
+                if self.last_overlay_sync != Some(state) {
+                    if let Err(err) = win32::set_in_game_overlay_mode(
+                        window,
+                        target_rect,
+                        self.hotkey_interactive,
+                        self.overlay_visible,
+                    ) {
+                        warn!(error = %err, "failed to update in-game overlay window");
                     }
-                    self.last_window_sync = Some((AppMode::InGameOverlay, None));
+                    self.last_overlay_sync = Some(state);
                 }
             }
             AppMode::Dormant => {
-                if self.last_window_sync.map(|(m, _)| m) != Some(AppMode::Dormant) {
+                if !self.last_dormant_hidden {
                     if let Err(err) = win32::hide_window(window) {
                         warn!(error = %err, "failed to hide dormant overlay window");
                     }
-                    self.last_window_sync = Some((AppMode::Dormant, None));
+                    self.last_dormant_hidden = true;
                 }
             }
         }
@@ -220,28 +437,12 @@ impl HexOverlayApp {
 }
 
 impl Render for HexOverlayApp {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match self.mode {
             AppMode::LobbyDocked => lobby_view::render_lobby_sidebar(self, cx).into_any_element(),
-            AppMode::InGameOverlay => div()
-                .size_full()
-                .p_3()
-                .flex()
-                .items_start()
-                .justify_end()
-                .child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .rounded_lg()
-                        .border_1()
-                        .border_color(theme::border_gold())
-                        .bg(rgba(0x0A1428CC))
-                        .text_xs()
-                        .text_color(theme::cyan())
-                        .child("HEXOVERLAY // IN-GAME STANDBY"),
-                )
-                .into_any_element(),
+            AppMode::InGameOverlay => {
+                overlay_view::render_in_game_overlay(self, window, cx).into_any_element()
+            }
             AppMode::Dormant => div()
                 .size_full()
                 .bg(rgba(0x00000000))
