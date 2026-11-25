@@ -6,8 +6,8 @@ use crossbeam_channel::{unbounded, Receiver};
 use gpui::{div, prelude::*, rgba, Context, Render, Window};
 use hex_core::{AppEvent, AppMode, ChampSelectState, CoreHandle, LiveGameState, RoiManifest};
 use hex_data::{
-    AugmentEvaluation, BenchHighlight, DynamicBuildPlan, HeroPreview, HeroStats, MetaEngine,
-    TeamRecommendations,
+    spawn_background_update, AugmentEvaluation, BenchHighlight, DynamicBuildPlan, EogReporter,
+    HeroPreview, HeroStats, MetaEngine, TeamRecommendations, UpdateOutcome, UpdaterConfig,
 };
 use hex_vision::{SharedRoiManifest, VisionController};
 use tracing::{debug, info, warn};
@@ -44,6 +44,11 @@ pub struct HexOverlayApp {
     meta: Option<MetaEngine>,
     event_rx: Receiver<AppEvent>,
     vision_rx: Receiver<AppEvent>,
+    updater_config: UpdaterConfig,
+    update_tx: crossbeam_channel::Sender<anyhow::Result<UpdateOutcome>>,
+    update_rx: Receiver<anyhow::Result<UpdateOutcome>>,
+    update_in_flight: bool,
+    reporter: EogReporter,
     core_handle: CoreHandle,
     vision: VisionController,
     tray: Option<TrayController>,
@@ -78,6 +83,11 @@ impl HexOverlayApp {
         let (vision_tx, vision_rx) = unbounded::<AppEvent>();
         let vision = VisionController::start(hashes, Arc::clone(&roi_manifest), vision_tx);
 
+        let updater_config = UpdaterConfig::from_env();
+        let (update_tx, update_rx) = unbounded::<anyhow::Result<UpdateOutcome>>();
+        spawn_background_update(updater_config.clone(), update_tx.clone());
+        let reporter = EogReporter::from_env();
+
         let mode = core_handle.current_mode();
         let lcu_connected = core_handle.is_lcu_connected();
         if let Some(ref tray_ctrl) = tray {
@@ -107,6 +117,11 @@ impl HexOverlayApp {
             meta,
             event_rx,
             vision_rx,
+            updater_config,
+            update_tx,
+            update_rx,
+            update_in_flight: true,
+            reporter,
             core_handle,
             vision,
             tray,
@@ -128,6 +143,49 @@ impl HexOverlayApp {
         while let Ok(event) = self.vision_rx.try_recv() {
             dirty = true;
             self.handle_app_event(event);
+        }
+
+        while let Ok(outcome) = self.update_rx.try_recv() {
+            self.update_in_flight = false;
+            self.updater_refresh_requested = false;
+            match outcome {
+                Ok(UpdateOutcome::AlreadyUpToDate { version }) => {
+                    debug!(%version, "meta.db is already up to date");
+                }
+                Ok(UpdateOutcome::Updated {
+                    version,
+                    db_path,
+                    roi_manifest,
+                }) => {
+                    info!(%version, path = %db_path.display(), "reloading hot-updated meta.db");
+                    if let Some(meta) = self.meta.as_mut() {
+                        match meta.reload_from_path(&db_path) {
+                            Ok(()) => {
+                                self.vision.update_hashes(meta.list_augment_hashes());
+                                if let Some(cs) = self.champ_select.clone() {
+                                    self.refresh_champ_select_data(&cs);
+                                }
+                                if let Some(live) = self.live_game.clone() {
+                                    self.refresh_live_game_data(&live);
+                                }
+                                dirty = true;
+                            }
+                            Err(err) => {
+                                warn!(error = %err, "failed to reload hot-updated meta.db");
+                            }
+                        }
+                    }
+                    if let Some(manifest) = roi_manifest {
+                        if let Ok(mut guard) = self.roi_manifest.write() {
+                            *guard = manifest;
+                            dirty = true;
+                        }
+                    }
+                }
+                Err(err) => {
+                    debug!(error = %err, "silent meta hot-update check skipped; using local DB");
+                }
+            }
         }
 
         if let Some(actions) = self.tray.as_ref().map(TrayController::poll_actions) {
@@ -156,11 +214,19 @@ impl HexOverlayApp {
                             .as_ref()
                             .map(TrayController::is_telemetry_checked)
                             .unwrap_or(!self.telemetry_enabled);
+                        self.reporter.set_enabled(self.telemetry_enabled);
                         info!(enabled = self.telemetry_enabled, "anonymized EOG telemetry toggled");
                     }
                     TrayAction::CheckDataUpdate => {
-                        self.updater_refresh_requested = true;
-                        info!("manual data hot-update check requested from tray");
+                        if !self.update_in_flight {
+                            self.update_in_flight = true;
+                            self.updater_refresh_requested = true;
+                            spawn_background_update(
+                                self.updater_config.clone(),
+                                self.update_tx.clone(),
+                            );
+                            info!("manual data hot-update check started from tray");
+                        }
                     }
                     TrayAction::OpenDataDir => {
                         if let Err(err) = win32::open_data_directory(&hex_data::data_dir()) {
@@ -284,6 +350,9 @@ impl HexOverlayApp {
                     telemetry_enabled = self.telemetry_enabled,
                     "anonymized end-of-game stats captured"
                 );
+                if self.telemetry_enabled {
+                    self.reporter.submit_async(eog);
+                }
             }
         }
     }
