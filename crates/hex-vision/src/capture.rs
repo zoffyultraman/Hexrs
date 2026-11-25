@@ -235,7 +235,7 @@ mod win_capture {
             }
             self.last_processed = Instant::now();
 
-            let mut buffer = frame.buffer()?;
+            let buffer = frame.buffer()?;
             let width = buffer.width();
             let height = buffer.height();
             let rgba = buffer.as_nopadding_buffer(&mut self.scratch_buf);
@@ -315,7 +315,7 @@ mod win_capture {
                 if !shared.shutdown.load(Ordering::Acquire)
                     && !shared.active.load(Ordering::Acquire)
                 {
-                    let _ = shared.wake_cv.wait(guard);
+                    drop(shared.wake_cv.wait(guard));
                 }
                 continue;
             }
@@ -358,7 +358,7 @@ mod win_capture {
                 WINDOW_RETRY_INTERVAL
             };
             if let Ok(guard) = shared.wake_lock.lock() {
-                let _ = shared.wake_cv.wait_timeout(guard, wait_dur);
+                drop(shared.wake_cv.wait_timeout(guard, wait_dur));
             }
         }
 
