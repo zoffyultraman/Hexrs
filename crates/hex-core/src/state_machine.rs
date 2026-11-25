@@ -1,0 +1,469 @@
+//! Background Tokio runtime & state machine coordinating process polling, LCU WS, and Live API.
+
+use std::sync::{Arc, RwLock};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use crossbeam_channel::{unbounded, Receiver, Sender};
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle as TokioJoinHandle;
+use tokio::time::{interval, MissedTickBehavior};
+use tracing::{debug, info, warn};
+
+use crate::lcu::{LcuClient, LcuWsEvent};
+use crate::live::LiveClient;
+use crate::models::{AppEvent, AppMode, ChampSelectState};
+use crate::process::{LcuCredentials, ProcessMonitor, ProcessSnapshot};
+
+const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+const LIVE_API_POLL_INTERVAL: Duration = Duration::from_millis(2000);
+
+#[derive(Debug, Default)]
+struct CoreSharedState {
+    mode: AppMode,
+    snapshot: ProcessSnapshot,
+    lcu_connected: bool,
+    in_champ_select: bool,
+}
+
+/// Control handle for querying core state and cleanly shutting down the background service.
+pub struct CoreHandle {
+    shutdown_tx: watch::Sender<bool>,
+    shared: Arc<RwLock<CoreSharedState>>,
+    join_handle: Option<JoinHandle<()>>,
+}
+
+impl CoreHandle {
+    /// Returns the active overlay operating mode.
+    pub fn current_mode(&self) -> AppMode {
+        self.shared
+            .read()
+            .map(|guard| guard.mode)
+            .unwrap_or_default()
+    }
+
+    /// Returns the latest observed process snapshot (`lcu_pid`, `game_pid`, etc.).
+    pub fn process_snapshot(&self) -> ProcessSnapshot {
+        self.shared
+            .read()
+            .map(|guard| guard.snapshot.clone())
+            .unwrap_or_default()
+    }
+
+    /// Returns the currently observed `LeagueClientUx.exe` PID, if running.
+    pub fn lcu_pid(&self) -> Option<u32> {
+        self.shared
+            .read()
+            .ok()
+            .and_then(|guard| guard.snapshot.lcu_pid)
+    }
+
+    /// Returns the currently observed `League of Legends.exe` PID, if running.
+    pub fn game_pid(&self) -> Option<u32> {
+        self.shared
+            .read()
+            .ok()
+            .and_then(|guard| guard.snapshot.game_pid)
+    }
+
+    /// Returns whether the LCU WebSocket is currently connected.
+    pub fn is_lcu_connected(&self) -> bool {
+        self.shared
+            .read()
+            .map(|guard| guard.lcu_connected)
+            .unwrap_or(false)
+    }
+
+    /// Signals the background Tokio runtime to stop and joins its worker thread.
+    pub fn shutdown(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for CoreHandle {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Spawns and owns the background `hex-core` coordinator service.
+pub struct CoreRuntime;
+
+impl CoreRuntime {
+    /// Starts the background `hex-core` runtime on a dedicated OS thread with a 2-thread Tokio pool.
+    pub fn spawn() -> Result<(Receiver<AppEvent>, CoreHandle)> {
+        let (event_tx, event_rx) = unbounded::<AppEvent>();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let shared = Arc::new(RwLock::new(CoreSharedState::default()));
+        let shared_clone = Arc::clone(&shared);
+
+        let join_handle = thread::Builder::new()
+            .name("hex-core-runtime".to_owned())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(err) => {
+                        warn!(error = %err, "failed to create hex-core tokio runtime");
+                        return;
+                    }
+                };
+
+                rt.block_on(run_coordinator(event_tx, shutdown_rx, shared_clone));
+            })
+            .context("failed to spawn hex-core-runtime thread")?;
+
+        Ok((
+            event_rx,
+            CoreHandle {
+                shutdown_tx,
+                shared,
+                join_handle: Some(join_handle),
+            },
+        ))
+    }
+}
+
+/// Convenience entrypoint starting the `hex-core` service and returning `(Receiver<AppEvent>, CoreHandle)`.
+pub fn spawn_core_service() -> Result<(Receiver<AppEvent>, CoreHandle)> {
+    CoreRuntime::spawn()
+}
+
+struct CoordinatorState {
+    event_tx: Sender<AppEvent>,
+    shared: Arc<RwLock<CoreSharedState>>,
+    mode: AppMode,
+    snapshot: ProcessSnapshot,
+    active_creds: Option<LcuCredentials>,
+    active_lcu: Option<LcuClient>,
+    lcu_connected: bool,
+    in_champ_select: bool,
+    cached_game_mode: Option<String>,
+    cached_queue_id: Option<i32>,
+    last_champ_select: Option<ChampSelectState>,
+    gameflow_fetch_in_flight: bool,
+    ws_shutdown_tx: Option<watch::Sender<bool>>,
+    ws_task: Option<TokioJoinHandle<()>>,
+}
+
+impl CoordinatorState {
+    fn new(event_tx: Sender<AppEvent>, shared: Arc<RwLock<CoreSharedState>>) -> Self {
+        Self {
+            event_tx,
+            shared,
+            mode: AppMode::Dormant,
+            snapshot: ProcessSnapshot::default(),
+            active_creds: None,
+            active_lcu: None,
+            lcu_connected: false,
+            in_champ_select: false,
+            cached_game_mode: None,
+            cached_queue_id: None,
+            last_champ_select: None,
+            gameflow_fetch_in_flight: false,
+            ws_shutdown_tx: None,
+            ws_task: None,
+        }
+    }
+
+    fn stop_lcu_ws(&mut self) {
+        if let Some(tx) = self.ws_shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(task) = self.ws_task.take() {
+            task.abort();
+        }
+    }
+
+    fn sync_shared_and_mode(&mut self) {
+        let next_mode = compute_mode(
+            self.snapshot.game_running,
+            self.active_lcu.is_some(),
+            self.in_champ_select,
+        );
+        let mode_changed = next_mode != self.mode;
+        self.mode = next_mode;
+
+        if let Ok(mut guard) = self.shared.write() {
+            guard.mode = self.mode;
+            guard.snapshot = self.snapshot.clone();
+            guard.lcu_connected = self.lcu_connected;
+            guard.in_champ_select = self.in_champ_select;
+        }
+
+        if mode_changed {
+            info!(?next_mode, "overlay state machine mode transition");
+            let _ = self.event_tx.send(AppEvent::ModeChanged(next_mode));
+        }
+    }
+
+    fn handle_process_snapshot(
+        &mut self,
+        next: ProcessSnapshot,
+        ws_event_tx: &mpsc::UnboundedSender<LcuWsEvent>,
+    ) {
+        let creds_changed = next.lcu != self.active_creds;
+        self.snapshot = next;
+
+        if creds_changed {
+            self.stop_lcu_ws();
+            let was_connected = self.lcu_connected;
+            self.lcu_connected = false;
+            self.in_champ_select = false;
+            self.cached_game_mode = None;
+            self.cached_queue_id = None;
+            self.last_champ_select = None;
+            self.gameflow_fetch_in_flight = false;
+            self.active_lcu = None;
+            self.active_creds = self.snapshot.lcu.clone();
+
+            if was_connected {
+                let _ = self.event_tx.send(AppEvent::LcuConnectionChanged(false));
+            }
+
+            if let Some(creds) = self.active_creds.clone() {
+                match LcuClient::new(creds.port, &creds.token) {
+                    Ok(client) => {
+                        let (ws_stop_tx, ws_stop_rx) = watch::channel(false);
+                        let ws_client = client.clone();
+                        let tx = ws_event_tx.clone();
+                        let ws_task = tokio::spawn(async move {
+                            ws_client.run_ws_loop(tx, ws_stop_rx).await;
+                        });
+                        self.ws_shutdown_tx = Some(ws_stop_tx);
+                        self.ws_task = Some(ws_task);
+
+                        let fetch_client = client.clone();
+                        let tx_init = ws_event_tx.clone();
+                        tokio::spawn(async move {
+                            emit_initial_champ_select(&fetch_client, &tx_init).await;
+                        });
+
+                        self.active_lcu = Some(client);
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "failed to initialize LcuClient");
+                    }
+                }
+            }
+        }
+
+        self.sync_shared_and_mode();
+    }
+
+    fn handle_ws_event(
+        &mut self,
+        event: LcuWsEvent,
+        ws_event_tx: &mpsc::UnboundedSender<LcuWsEvent>,
+        gameflow_tx: &mpsc::UnboundedSender<Option<(String, Option<i32>)>>,
+    ) {
+        match event {
+            LcuWsEvent::Connected => {
+                if !self.lcu_connected {
+                    self.lcu_connected = true;
+                    let _ = self.event_tx.send(AppEvent::LcuConnectionChanged(true));
+                }
+                if let Some(client) = self.active_lcu.clone() {
+                    let tx = ws_event_tx.clone();
+                    tokio::spawn(async move {
+                        emit_initial_champ_select(&client, &tx).await;
+                    });
+                }
+            }
+            LcuWsEvent::Disconnected => {
+                if self.lcu_connected {
+                    self.lcu_connected = false;
+                    let _ = self.event_tx.send(AppEvent::LcuConnectionChanged(false));
+                }
+            }
+            LcuWsEvent::ChampSelectUpdated(mut state) => {
+                self.in_champ_select = true;
+                if state.game_mode.is_empty() {
+                    if let Some(mode) = &self.cached_game_mode {
+                        state.game_mode = mode.clone();
+                    }
+                } else {
+                    self.cached_game_mode = Some(state.game_mode.clone());
+                }
+                if state.queue_id.is_none() {
+                    state.queue_id = self.cached_queue_id;
+                } else {
+                    self.cached_queue_id = state.queue_id;
+                }
+
+                if state.game_mode.is_empty() && !self.gameflow_fetch_in_flight {
+                    if let Some(client) = self.active_lcu.clone() {
+                        self.gameflow_fetch_in_flight = true;
+                        let gf_tx = gameflow_tx.clone();
+                        tokio::spawn(async move {
+                            let resolved = client
+                                .get_current_game_mode_and_queue()
+                                .await
+                                .ok()
+                                .flatten();
+                            let _ = gf_tx.send(resolved);
+                        });
+                    }
+                }
+
+                self.last_champ_select = Some(state.clone());
+                let _ = self.event_tx.send(AppEvent::ChampSelectUpdated(state));
+            }
+            LcuWsEvent::ChampSelectEnded => {
+                self.in_champ_select = false;
+                self.cached_game_mode = None;
+                self.cached_queue_id = None;
+                self.last_champ_select = None;
+                self.gameflow_fetch_in_flight = false;
+            }
+            LcuWsEvent::EndOfGameCaptured(stats) => {
+                let _ = self.event_tx.send(AppEvent::EndOfGameCaptured(stats));
+            }
+        }
+
+        self.sync_shared_and_mode();
+    }
+
+    fn handle_gameflow_resolved(&mut self, resolved: Option<(String, Option<i32>)>) {
+        self.gameflow_fetch_in_flight = false;
+        if let Some((mode, queue_id)) = resolved {
+            self.cached_game_mode = Some(mode.clone());
+            if queue_id.is_some() {
+                self.cached_queue_id = queue_id;
+            }
+            if self.in_champ_select {
+                if let Some(mut session) = self.last_champ_select.clone() {
+                    let mut changed = false;
+                    if session.game_mode.is_empty() {
+                        session.game_mode = mode;
+                        changed = true;
+                    }
+                    if session.queue_id.is_none() && queue_id.is_some() {
+                        session.queue_id = queue_id;
+                        changed = true;
+                    }
+                    if changed {
+                        self.last_champ_select = Some(session.clone());
+                        let _ = self.event_tx.send(AppEvent::ChampSelectUpdated(session));
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn emit_initial_champ_select(
+    client: &LcuClient,
+    ws_event_tx: &mpsc::UnboundedSender<LcuWsEvent>,
+) {
+    let mode_and_queue = match client.get_current_game_mode_and_queue().await {
+        Ok(info) => info,
+        Err(err) => {
+            debug!(error = %err, "failed to fetch initial LCU game mode");
+            None
+        }
+    };
+
+    match client.get_champ_select_session().await {
+        Ok(Some(mut session)) => {
+            if let Some((mode, queue_id)) = mode_and_queue {
+                if session.game_mode.is_empty() {
+                    session.game_mode = mode;
+                }
+                if session.queue_id.is_none() {
+                    session.queue_id = queue_id;
+                }
+            }
+            let _ = ws_event_tx.send(LcuWsEvent::ChampSelectUpdated(session));
+        }
+        Ok(None) => {}
+        Err(err) => {
+            debug!(error = %err, "failed to fetch initial LCU champ select session");
+        }
+    }
+}
+
+fn compute_mode(game_running: bool, lcu_active: bool, in_champ_select: bool) -> AppMode {
+    if game_running {
+        AppMode::InGameOverlay
+    } else if lcu_active && in_champ_select {
+        AppMode::LobbyDocked
+    } else {
+        AppMode::Dormant
+    }
+}
+
+async fn run_coordinator(
+    event_tx: Sender<AppEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    shared: Arc<RwLock<CoreSharedState>>,
+) {
+    let mut monitor = ProcessMonitor::new();
+    let live_client = match LiveClient::new() {
+        Ok(client) => Some(client),
+        Err(err) => {
+            warn!(error = %err, "failed to create LiveClient; in-game telemetry disabled");
+            None
+        }
+    };
+
+    let (ws_event_tx, mut ws_event_rx) = mpsc::unbounded_channel::<LcuWsEvent>();
+    let (gameflow_tx, mut gameflow_rx) = mpsc::unbounded_channel::<Option<(String, Option<i32>)>>();
+    let mut state = CoordinatorState::new(event_tx.clone(), shared);
+
+    // Perform an immediate initial process poll so startup doesn't wait 1.5s.
+    let initial_snapshot = monitor.poll();
+    state.handle_process_snapshot(initial_snapshot, &ws_event_tx);
+
+    let mut process_tick = interval(PROCESS_POLL_INTERVAL);
+    process_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    process_tick.tick().await;
+
+    let mut live_tick = interval(LIVE_API_POLL_INTERVAL);
+    live_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    live_tick.tick().await;
+
+    loop {
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+            }
+            _ = process_tick.tick() => {
+                let snapshot = monitor.poll();
+                state.handle_process_snapshot(snapshot, &ws_event_tx);
+            }
+            _ = live_tick.tick() => {
+                if state.snapshot.game_running {
+                    if let Some(client) = &live_client {
+                        match client.fetch_all_game_data().await {
+                            Ok(Some(live_state)) => {
+                                let _ = state.event_tx.send(AppEvent::LiveGameUpdated(live_state));
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                debug!(error = %err, "Live API poll failed");
+                            }
+                        }
+                    }
+                }
+            }
+            Some(ws_event) = ws_event_rx.recv() => {
+                state.handle_ws_event(ws_event, &ws_event_tx, &gameflow_tx);
+            }
+            Some(resolved) = gameflow_rx.recv() => {
+                state.handle_gameflow_resolved(resolved);
+            }
+        }
+    }
+
+    state.stop_lcu_ws();
+}
