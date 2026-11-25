@@ -1,0 +1,41 @@
+name: Build HexOverlay (Windows)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  RUSTFLAGS: "-C target-feature=+crt-static"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies and artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build HexOverlay release binary
+        run: cargo build --release --bin HexOverlay
+
+      - name: Report HexOverlay.exe size
+        shell: pwsh
+        run: |
+          $exe = Get-Item "target/release/HexOverlay.exe"
+          $mb = [math]::Round($exe.Length / 1MB, 2)
+          Write-Host "HexOverlay.exe size: $($exe.Length) bytes ($mb MB)"
+
+      - name: Upload HexOverlay artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HexOverlay-windows-x86_64
+          path: target/release/HexOverlay.exe
+          if-no-files-found: error

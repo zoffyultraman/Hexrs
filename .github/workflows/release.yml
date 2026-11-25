@@ -1,0 +1,43 @@
+name: Release HexOverlay (Windows)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  RUSTFLAGS: "-C target-feature=+crt-static"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies and artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build HexOverlay release binary
+        run: cargo build --release --bin HexOverlay
+
+      - name: Report HexOverlay.exe size
+        shell: pwsh
+        run: |
+          $exe = Get-Item "target/release/HexOverlay.exe"
+          $mb = [math]::Round($exe.Length / 1MB, 2)
+          Write-Host "HexOverlay.exe size: $($exe.Length) bytes ($mb MB)"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/HexOverlay.exe
+          generate_release_notes: true

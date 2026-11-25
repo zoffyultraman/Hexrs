@@ -1,0 +1,6 @@
+/target
+*.db
+*.zst
+__pycache__/
+.DS_Store
+*.log

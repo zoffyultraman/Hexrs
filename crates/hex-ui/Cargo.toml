@@ -1,0 +1,19 @@
+[package]
+name = "hex-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "HexOverlay"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+raw-window-handle.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows.workspace = true
