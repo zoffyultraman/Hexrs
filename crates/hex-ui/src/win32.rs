@@ -15,7 +15,7 @@ mod imp {
     /// Extracts the native Win32 `HWND` from a GPUI `Window`.
     fn extract_hwnd(window: &Window) -> Result<HWND> {
         let handle = HasWindowHandle::window_handle(window)
-            .context("failed to obtain raw window handle from GPUI window")?;
+            .map_err(|e| anyhow::anyhow!("failed to obtain raw window handle from GPUI window: {e:?}"))?;
 
         match handle.as_raw() {
             RawWindowHandle::Win32(win32) => {
