@@ -2,10 +2,12 @@
 
 use hex_data::AugmentNameEntry;
 
-const BAND_X_MIN: f32 = 0.12;
-const BAND_X_MAX: f32 = 0.88;
+const BAND_X_MIN: f32 = 0.02;
+const BAND_X_MAX: f32 = 0.98;
 const BAND_Y_MIN: f32 = 0.22;
 const BAND_Y_MAX: f32 = 0.72;
+const ROW_CLUSTER_Y_TOL: f32 = 0.08;
+const CARD_SEPARATION_X_MIN: f32 = 0.12;
 
 /// Single recognized text line and its full-frame normalized center coordinates (`0.0..=1.0`).
 #[derive(Debug, Clone, PartialEq)]
@@ -22,7 +24,15 @@ struct NormalizedAugmentEntry {
     char_count: usize,
 }
 
-/// Maps WinRT OCR text hits across the 3 augment card columns to `[left, mid, right]` augment IDs.
+#[derive(Debug, Clone, Copy)]
+struct MatchedHit {
+    aug_id: i32,
+    score: i32,
+    cx: f32,
+    cy: f32,
+}
+
+/// Maps WinRT OCR text hits across the 3 augment card slots to `[left, mid, right]` augment IDs.
 #[derive(Debug, Clone, Default)]
 pub struct AugmentTextMatcher {
     entries: Vec<NormalizedAugmentEntry>,
@@ -58,31 +68,23 @@ impl AugmentTextMatcher {
             .collect();
     }
 
-    /// Matches recognized OCR lines within the augment card band into a 3-slot offer `[left, mid, right]`.
+    /// Matches recognized OCR lines aligned on a horizontal card title row into `[left, mid, right]`.
     ///
-    /// Returns `Some([left, mid, right])` with `0` placeholders for an unmatched slot only when at
-    /// least 2 columns resolve to distinct positive `augment_id`s.
+    /// Works across both centered 16:9 and left-shifted 21:9/ultrawide layouts without hardcoded
+    /// column boundaries. Returns `Some([left, mid, right])` with `0` placeholders only when at
+    /// least 2 distinct horizontally separated cards align on the same title row.
     pub fn match_ocr_lines_to_offer(&self, lines: &[OcrLineHit]) -> Option<Vec<i32>> {
         if self.entries.is_empty() || lines.is_empty() {
             return None;
         }
 
-        let mut col_candidates: [Vec<(i32, i32)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
-
+        let mut matched = Vec::new();
         for hit in lines {
             if !(BAND_X_MIN..=BAND_X_MAX).contains(&hit.center_x_norm)
                 || !(BAND_Y_MIN..=BAND_Y_MAX).contains(&hit.center_y_norm)
             {
                 continue;
             }
-
-            let col = if hit.center_x_norm < 0.40 {
-                0
-            } else if hit.center_x_norm < 0.60 {
-                1
-            } else {
-                2
-            };
 
             let hit_norm = normalize_ocr_text(&hit.text);
             let hit_len = hit_norm.chars().count();
@@ -91,53 +93,82 @@ impl AugmentTextMatcher {
             }
 
             if let Some((aug_id, score)) = self.score_line(&hit_norm, hit_len) {
-                col_candidates[col].push((aug_id, score));
+                matched.push(MatchedHit {
+                    aug_id,
+                    score,
+                    cx: hit.center_x_norm,
+                    cy: hit.center_y_norm,
+                });
             }
         }
 
-        for list in &mut col_candidates {
-            list.sort_by(|a, b| b.1.cmp(&a.1));
+        if matched.len() < 2 {
+            return None;
         }
 
-        let mut slots = vec![0_i32; 3];
-        let mut slot_scores = [0_i32; 3];
-        for (col, list) in col_candidates.iter().enumerate() {
-            if let Some(&(aug_id, score)) = list.first() {
-                slots[col] = aug_id;
-                slot_scores[col] = score;
-            }
-        }
+        let mut best_cluster: Option<(usize, i32, Vec<MatchedHit>)> = None;
 
-        // Enforce distinct augment IDs across columns, preserving the highest-confidence column.
-        for i in 0..3 {
-            if slots[i] <= 0 {
-                continue;
-            }
-            for j in (i + 1)..3 {
-                if slots[j] == slots[i] {
-                    if slot_scores[i] >= slot_scores[j] {
-                        slots[j] = col_candidates[j]
-                            .iter()
-                            .find(|&&(id, _)| id != slots[i] && !slots.contains(&id))
-                            .map(|&(id, _)| id)
-                            .unwrap_or(0);
-                    } else {
-                        let keep_id = slots[j];
-                        slots[i] = col_candidates[i]
-                            .iter()
-                            .find(|&&(id, _)| id != keep_id && !slots.contains(&id))
-                            .map(|&(id, _)| id)
-                            .unwrap_or(0);
-                    }
+        for anchor in &matched {
+            let mut row_hits: Vec<MatchedHit> = matched
+                .iter()
+                .copied()
+                .filter(|h| (h.cy - anchor.cy).abs() <= ROW_CLUSTER_Y_TOL)
+                .collect();
+
+            row_hits.sort_by(|a, b| b.score.cmp(&a.score));
+
+            let mut selected: Vec<MatchedHit> = Vec::with_capacity(3);
+            for candidate in row_hits {
+                let too_close = selected
+                    .iter()
+                    .any(|s| (s.cx - candidate.cx).abs() < CARD_SEPARATION_X_MIN);
+                let duplicate_id = selected.iter().any(|s| s.aug_id == candidate.aug_id);
+                if !too_close && !duplicate_id {
+                    selected.push(candidate);
                 }
             }
+
+            if selected.len() < 2 {
+                continue;
+            }
+
+            // Cap to the top 3 highest-scoring hits before spatial ordering if > 3 matched.
+            selected.truncate(3);
+            let total_score: i32 = selected.iter().map(|s| s.score).sum();
+            let count = selected.len();
+
+            let is_better = best_cluster
+                .as_ref()
+                .map(|(best_cnt, best_score, _)| {
+                    count > *best_cnt || (count == *best_cnt && total_score > *best_score)
+                })
+                .unwrap_or(true);
+
+            if is_better {
+                best_cluster = Some((count, total_score, selected));
+            }
         }
 
-        let matched_count = slots.iter().filter(|&&id| id > 0).count();
-        if matched_count >= 2 {
-            Some(slots)
+        let (_, _, mut winners) = best_cluster?;
+        winners.sort_by(|a, b| a.cx.total_cmp(&b.cx));
+
+        if winners.len() >= 3 {
+            Some(vec![
+                winners[0].aug_id,
+                winners[1].aug_id,
+                winners[2].aug_id,
+            ])
         } else {
-            None
+            let h0 = winners[0];
+            let h1 = winners[1];
+            let gap = h1.cx - h0.cx;
+            if gap > 0.36 {
+                Some(vec![h0.aug_id, 0, h1.aug_id])
+            } else if (h0.cx + h1.cx) * 0.5 < 0.48 {
+                Some(vec![h0.aug_id, h1.aug_id, 0])
+            } else {
+                Some(vec![0, h0.aug_id, h1.aug_id])
+            }
         }
     }
 
@@ -160,9 +191,13 @@ fn score_pair(hit_norm: &str, hit_len: usize, entry_norm: &str, entry_len: usize
         return 1000 + entry_len as i32 * 5;
     }
 
+    // Strict guard for 2-char augment names ("拯救", "灵巧") so they never false-match substrings.
+    if entry_len <= 2 {
+        return 0;
+    }
+
     if hit_norm.contains(entry_norm) {
         let extra = hit_len.saturating_sub(entry_len);
-        // Reject long chat/description sentences that merely contain a short augment name.
         if hit_len <= 14 && entry_len * 2 >= hit_len && extra <= 4 {
             return 850 - (extra as i32 * 25) + entry_len as i32 * 3;
         }
@@ -229,8 +264,8 @@ mod win_ocr {
 
     use super::OcrLineHit;
 
-    const CROP_X_START: f32 = 0.14;
-    const CROP_X_END: f32 = 0.86;
+    const CROP_X_START: f32 = 0.0;
+    const CROP_X_END: f32 = 1.0;
     const CROP_Y_START: f32 = 0.25;
     const CROP_Y_END: f32 = 0.68;
 
@@ -258,7 +293,7 @@ mod win_ocr {
             Some(Self { engine })
         }
 
-        /// Crops the augment card band (`x: 0.14..0.86, y: 0.25..0.68`), runs WinRT OCR, and
+        /// Crops the augment card band (`x: 0.0..1.0, y: 0.25..0.68`), runs WinRT OCR, and
         /// maps recognized line bounding centers back to full-frame normalized coordinates.
         pub fn recognize_augment_region(
             &self,
@@ -384,63 +419,88 @@ mod tests {
             },
             AugmentNameEntry {
                 augment_id: 104,
-                name_zh: "歌利亚巨人".to_owned(),
-                rarity: "棱彩".to_owned(),
+                name_zh: "灵巧".to_owned(),
+                rarity: "白银".to_owned(),
             },
         ]
     }
 
     #[test]
-    fn matches_three_chinese_augment_titles_across_columns() {
+    fn matches_left_shifted_ultrawide_layout_and_centered_16_9_layout() {
         let matcher = AugmentTextMatcher::new(sample_entries());
-        let hits = vec![
+
+        // Left-shifted 21:9 screenshot coordinates (x ≈ 0.11, 0.36, 0.60).
+        let ultrawide_hits = vec![
             OcrLineHit {
                 text: "急 速 之 追 求".to_owned(),
-                center_x_norm: 0.27,
+                center_x_norm: 0.11,
                 center_y_norm: 0.42,
             },
             OcrLineHit {
                 text: "杀戮时间到了！".to_owned(),
-                center_x_norm: 0.50,
-                center_y_norm: 0.42,
+                center_x_norm: 0.36,
+                center_y_norm: 0.43,
             },
             OcrLineHit {
                 text: "拯救".to_owned(),
-                center_x_norm: 0.73,
+                center_x_norm: 0.60,
                 center_y_norm: 0.42,
             },
         ];
-
         assert_eq!(
-            matcher.match_ocr_lines_to_offer(&hits),
+            matcher.match_ocr_lines_to_offer(&ultrawide_hits),
+            Some(vec![101, 102, 103])
+        );
+
+        // Centered 16:9 coordinates (x ≈ 0.32, 0.50, 0.68).
+        let centered_hits = vec![
+            OcrLineHit {
+                text: "急速之追求".to_owned(),
+                center_x_norm: 0.32,
+                center_y_norm: 0.40,
+            },
+            OcrLineHit {
+                text: "杀戮时间到了".to_owned(),
+                center_x_norm: 0.50,
+                center_y_norm: 0.40,
+            },
+            OcrLineHit {
+                text: "拯救".to_owned(),
+                center_x_norm: 0.68,
+                center_y_norm: 0.40,
+            },
+        ];
+        assert_eq!(
+            matcher.match_ocr_lines_to_offer(&centered_hits),
             Some(vec![101, 102, 103])
         );
     }
 
     #[test]
-    fn handles_partial_or_noisy_ocr_text_with_placeholder() {
+    fn handles_partial_noisy_text_and_two_hit_middle_gap() {
         let matcher = AugmentTextMatcher::new(sample_entries());
-        let hits = vec![
+
+        // 2-hit middle gap: left & right separated by > 0.36 -> [101, 0, 103].
+        let middle_gap_hits = vec![
             OcrLineHit {
                 text: "·急速之追".to_owned(),
-                center_x_norm: 0.26,
+                center_x_norm: 0.11,
                 center_y_norm: 0.44,
             },
             OcrLineHit {
-                text: "杀戮时间这了".to_owned(),
-                center_x_norm: 0.51,
+                text: "拯救".to_owned(),
+                center_x_norm: 0.60,
                 center_y_norm: 0.44,
             },
         ];
-
         assert_eq!(
-            matcher.match_ocr_lines_to_offer(&hits),
-            Some(vec![101, 102, 0])
+            matcher.match_ocr_lines_to_offer(&middle_gap_hits),
+            Some(vec![101, 0, 103])
         );
     }
 
     #[test]
-    fn rejects_random_game_hud_chat_and_killfeed_text() {
+    fn rejects_two_char_substring_noise_and_random_hud_text() {
         let matcher = AugmentTextMatcher::new(sample_entries());
         let hits = vec![
             OcrLineHit {
@@ -449,8 +509,13 @@ mod tests {
                 center_y_norm: 0.35,
             },
             OcrLineHit {
-                text: "快集合团战拯救一下残血队友".to_owned(),
-                center_x_norm: 0.50,
+                text: "拯救一下".to_owned(),
+                center_x_norm: 0.35,
+                center_y_norm: 0.45,
+            },
+            OcrLineHit {
+                text: "灵巧走位".to_owned(),
+                center_x_norm: 0.55,
                 center_y_norm: 0.45,
             },
             OcrLineHit {

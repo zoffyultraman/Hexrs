@@ -154,6 +154,7 @@ struct VisionShared {
     manifest: SharedRoiManifest,
     event_tx: Sender<AppEvent>,
     active: AtomicBool,
+    offer_active: AtomicBool,
     gate_open: AtomicBool,
     shutdown: AtomicBool,
     max_distance: AtomicU32,
@@ -169,12 +170,18 @@ impl VisionShared {
         self.wake_cv.notify_all();
     }
 
-    fn refresh_gate(&self, active_offer: bool) {
+    fn set_offer_active(&self, active_offer: bool) {
+        self.offer_active.store(active_offer, Ordering::Release);
+        self.refresh_gate();
+    }
+
+    fn refresh_gate(&self) {
         let active = self.active.load(Ordering::Acquire);
         if !active {
             self.gate_open.store(false, Ordering::Release);
             return;
         }
+        let active_offer = self.offer_active.load(Ordering::Acquire);
         let ctx = self
             .game_ctx
             .read()
@@ -214,6 +221,7 @@ impl VisionController {
             manifest,
             event_tx,
             active: AtomicBool::new(false),
+            offer_active: AtomicBool::new(false),
             gate_open: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             max_distance: AtomicU32::new(DEFAULT_MAX_HAMMING_DISTANCE),
@@ -256,11 +264,12 @@ impl VisionController {
 
         let prev = self.shared.active.swap(should_run, Ordering::AcqRel);
         if !should_run {
+            self.shared.offer_active.store(false, Ordering::Release);
             if let Ok(mut gate) = self.shared.gate.lock() {
                 gate.reset();
             }
         }
-        self.shared.refresh_gate(false);
+        self.shared.refresh_gate();
 
         if prev != should_run {
             info!(
@@ -327,6 +336,7 @@ impl VisionController {
     /// Stops any active capture session and shuts down the supervisor thread.
     pub fn shutdown(&mut self) {
         self.shared.active.store(false, Ordering::Release);
+        self.shared.offer_active.store(false, Ordering::Release);
         self.shared.gate_open.store(false, Ordering::Release);
         self.shared.shutdown.store(true, Ordering::Release);
         self.shared.notify_supervisor();
@@ -421,6 +431,7 @@ mod win_capture {
                     self.active_offer = false;
                     self.consecutive_misses = 0;
                     self.last_emitted = None;
+                    self.shared.set_offer_active(false);
                     let _ = self.shared.event_tx.send(AppEvent::AugmentOfferCleared);
                 }
                 capture_control.stop();
@@ -483,7 +494,7 @@ mod win_capture {
             if let Some((candidates, capture_ms)) = match_result {
                 self.consecutive_misses = 0;
                 self.active_offer = true;
-                self.shared.refresh_gate(true);
+                self.shared.set_offer_active(true);
 
                 let is_duplicate = self
                     .last_emitted
@@ -505,7 +516,7 @@ mod win_capture {
                     self.active_offer = false;
                     self.consecutive_misses = 0;
                     self.last_emitted = None;
-                    self.shared.refresh_gate(false);
+                    self.shared.set_offer_active(false);
                     debug!("augment offer modal dismissed; clearing strip");
                     let _ = self.shared.event_tx.send(AppEvent::AugmentOfferCleared);
                 }
