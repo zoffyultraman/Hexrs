@@ -19,6 +19,13 @@ const CARD_GAP_RATIO: f32 = 0.14;
 const STRIP_TOTAL_RATIO: f32 = 2.86;
 const AUGMENT_BAR_HEIGHT_DIP: f32 = 94.0;
 
+/// Pixel-calibrated Champ Select bench strip geometry relative to `LeagueClientUx.exe`.
+pub const BENCH_SLOT0_CX: f32 = 0.2898;
+pub const BENCH_SLOT_PITCH_FRAC: f32 = 0.0458;
+pub const BENCH_SLOT_WIDTH_FRAC: f32 = 0.0410;
+pub const BENCH_SLOT_HEIGHT_FRAC: f32 = 0.0285;
+pub const BENCH_STRIP_LEFT_FRAC: f32 = BENCH_SLOT0_CX - BENCH_SLOT_WIDTH_FRAC * 0.5;
+
 /// Corner anchor for the compact in-game HUD card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverlayCorner {
@@ -200,7 +207,8 @@ mod imp {
 
     use super::{
         compute_augment_bar_geometry, AugmentOfferLayout, OverlayCorner, Win32WindowAction,
-        Win32WindowCommand, WindowRectInfo, DIAGNOSTICS_HEIGHT_DIP, DIAGNOSTICS_WIDTH_DIP,
+        Win32WindowCommand, WindowRectInfo, BENCH_SLOT_PITCH_FRAC, BENCH_SLOT_WIDTH_FRAC,
+        BENCH_STRIP_LEFT_FRAC, DIAGNOSTICS_HEIGHT_DIP, DIAGNOSTICS_WIDTH_DIP,
         IN_GAME_HUD_HEIGHT_DIP, IN_GAME_HUD_WIDTH_DIP, SIDEBAR_WIDTH_DIP,
     };
 
@@ -729,17 +737,19 @@ mod imp {
             let target_h = target.height().max(200);
             let count = slot_count.clamp(1, 10);
 
-            let x = (target.left + (0.2735 * target_w as f32).round() as i32)
+            let x = (target.left + (BENCH_STRIP_LEFT_FRAC * target_w as f32).round() as i32)
                 .clamp(target.left, target.right.saturating_sub(1));
             let max_w = (target.right - x).max(1);
-            let raw_w = (((count - 1) as f32 * 0.0464 + 0.0450) * target_w as f32).round() as i32;
-            let w = raw_w.max((44.0 * scale).round() as i32).min(max_w);
+            let raw_w = (((count - 1) as f32 * BENCH_SLOT_PITCH_FRAC + BENCH_SLOT_WIDTH_FRAC)
+                * target_w as f32)
+                .round() as i32;
+            let w = raw_w.max((40.0 * scale).round() as i32).min(max_w);
 
             let y = (target.top + (0.0835 * target_h as f32).round() as i32)
                 .clamp(target.top, target.bottom.saturating_sub(1));
             let max_h = (target.bottom - y).max(1);
             let min_h = (18.0 * scale).round() as i32;
-            let cap_h = (32.0 * scale).round() as i32;
+            let cap_h = (40.0 * scale).round() as i32;
             let h = ((0.0290 * target_h as f32).round() as i32)
                 .clamp(min_h, cap_h)
                 .min(max_h);

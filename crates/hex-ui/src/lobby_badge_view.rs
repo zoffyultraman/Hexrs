@@ -5,10 +5,7 @@ use gpui::{div, prelude::*, px, rgba, Context, Div, FontWeight, Render};
 use hex_core::HeroTier;
 
 use crate::theme;
-
-const BENCH_SLOT_PITCH_FRAC: f32 = 0.0464;
-const BENCH_SLOT_WIDTH_FRAC: f32 = 0.0440;
-const BENCH_SLOT_HEIGHT_FRAC: f32 = 0.0285;
+use crate::win32::{BENCH_SLOT_HEIGHT_FRAC, BENCH_SLOT_PITCH_FRAC, BENCH_SLOT_WIDTH_FRAC};
 
 const TEAM_ROW_PITCH_FRAC: f32 = 0.1129;
 const TEAM_BADGE_HEIGHT_FRAC: f32 = 0.038;
@@ -63,9 +60,10 @@ impl Render for BenchBadgeOverlay {
 
         let w = self.state.client_width_dip;
         let h = self.state.client_height_dip;
-        let slot_w = (w * BENCH_SLOT_WIDTH_FRAC).clamp(44.0, 92.0);
-        let slot_h = (h * BENCH_SLOT_HEIGHT_FRAC).clamp(18.0, 30.0);
-        let bench_font_px = (slot_w * 0.175).clamp(9.0, 12.0);
+        let raw_slot_w = w * BENCH_SLOT_WIDTH_FRAC;
+        let slot_w = raw_slot_w.clamp(40.0, 140.0);
+        let slot_h = (h * BENCH_SLOT_HEIGHT_FRAC).clamp(18.0, 40.0);
+        let bench_font_px = (slot_w * 0.18).clamp(9.0, 14.0);
 
         let mut canvas: Div = div().size_full().relative().bg(rgba(0x00000000));
 
@@ -74,7 +72,7 @@ impl Render for BenchBadgeOverlay {
                 continue;
             };
             let (_bg, border_color, text_color) = theme::tier_colors(badge.tier);
-            let left = idx as f32 * (BENCH_SLOT_PITCH_FRAC * w);
+            let left = idx as f32 * (w * BENCH_SLOT_PITCH_FRAC) + (raw_slot_w - slot_w) * 0.5;
 
             canvas = canvas.child(
                 div()
@@ -152,8 +150,8 @@ impl Render for TeamBadgeOverlay {
         }
 
         let h = self.state.client_height_dip;
-        let badge_h = (h * TEAM_BADGE_HEIGHT_FRAC).clamp(22.0, 34.0);
-        let team_font_px = (badge_h * 0.46).clamp(11.0, 14.0);
+        let badge_h = (h * TEAM_BADGE_HEIGHT_FRAC).clamp(20.0, 44.0);
+        let team_font_px = (badge_h * 0.46).clamp(10.5, 16.0);
 
         let mut canvas: Div = div().size_full().relative().bg(rgba(0x00000000));
 
