@@ -8,7 +8,8 @@ use crossbeam_channel::{unbounded, Receiver};
 use gpui::{div, prelude::*, px, rgba, Context, Div, FontWeight, Render, Rgba, Window};
 use hex_core::{
     AppEvent, AppMode, AugmentOfferLayout, ChampSelectState, CoreDiagnostics, CoreHandle,
-    HeroTier, LiveGameState, RoiManifest,
+    HeroTier, LiveGameState, PremadeGroupSummary, RatingTitlesConfig, RoiManifest,
+    SummonerRatingStatus, SummonerRatingSummary, TeamRatingsSnapshot,
 };
 use hex_data::{
     spawn_background_update, AugmentEvaluation, BenchHighlight, DynamicBuildPlan, EogReporter,
@@ -19,7 +20,8 @@ use hex_vision::{SharedRoiManifest, VisionController, VisionGameContext};
 use tracing::{debug, info, warn};
 
 use crate::lobby_badge_view::{
-    BenchBadgeState, CardBadgeState, CardSlotBadgeData, SlotBadgeData, TeamBadgeState,
+    BenchBadgeState, CardBadgeState, CardSlotBadgeData, SlotBadgeData, SummonerBadgeData,
+    TeamBadgeState, TeamSlotBadgeEntry,
 };
 use crate::lobby_view;
 use crate::log_file_path;
@@ -46,6 +48,7 @@ pub struct HexrsApp {
     pub active_champ_select_hero_id: Option<i32>,
     pub live_game: Option<LiveGameState>,
     pub team_hero_stats: Vec<HeroStats>,
+    pub team_ratings: Option<TeamRatingsSnapshot>,
     pub bench_highlights: Vec<BenchHighlight>,
     pub team_recs: TeamRecommendations,
     pub current_hero_stats: Option<HeroStats>,
@@ -94,6 +97,8 @@ pub struct HexrsApp {
     auto_elevation_prompted: bool,
     last_auto_expanded_hero_id: Option<i32>,
     last_logged_hud_signature: Option<(Option<i32>, usize, bool)>,
+    rating_titles: RatingTitlesConfig,
+    rating_titles_mtime: Option<std::time::SystemTime>,
 }
 
 impl HexrsApp {
@@ -146,6 +151,10 @@ impl HexrsApp {
             tray_ctrl.update_corner_label(OverlayCorner::default());
         }
 
+        let titles_path = rating_titles_path();
+        let rating_titles = RatingTitlesConfig::load_or_init(&titles_path);
+        let rating_titles_mtime = read_file_mtime(&titles_path);
+
         Self {
             mode,
             lcu_connected,
@@ -159,6 +168,7 @@ impl HexrsApp {
             active_champ_select_hero_id: None,
             live_game: None,
             team_hero_stats: Vec::new(),
+            team_ratings: None,
             bench_highlights: Vec::new(),
             team_recs: TeamRecommendations::default(),
             current_hero_stats: None,
@@ -201,6 +211,8 @@ impl HexrsApp {
             auto_elevation_prompted: false,
             last_auto_expanded_hero_id: None,
             last_logged_hud_signature: None,
+            rating_titles,
+            rating_titles_mtime,
         }
     }
 
@@ -574,17 +586,29 @@ impl HexrsApp {
                 .take(10)
                 .map(|&id| self.lookup_slot_badge(id))
                 .collect();
+            let rating_slots = self
+                .team_ratings
+                .as_ref()
+                .map(|s| s.slots.as_slice())
+                .unwrap_or(&[]);
             let team = cs
                 .my_team
                 .iter()
                 .take(5)
-                .map(|slot| {
+                .enumerate()
+                .map(|(idx, slot)| {
                     let id = if slot.champion_id > 0 {
                         slot.champion_id
                     } else {
                         slot.pick_intent
                     };
-                    self.lookup_slot_badge(id)
+                    let hero = self.lookup_slot_badge(id);
+                    let summoner = rating_slots
+                        .iter()
+                        .find(|r| r.cell_id == slot.cell_id)
+                        .or_else(|| rating_slots.get(idx))
+                        .map(summoner_summary_to_badge);
+                    TeamSlotBadgeEntry { hero, summoner }
                 })
                 .collect();
             let cards = if cs.local_champion_id == 0 && (2..=3).contains(&cs.subset_champions.len())
@@ -605,7 +629,14 @@ impl HexrsApp {
                 &[498, 23, 36, 526, 42, 157, 145, 875, 54, 32];
             const PREVIEW_CARD_IDS: &[i32] = &[157, 432, 145, 54];
             let bench = self.collect_preview_badges(PREVIEW_BENCH_IDS, 7);
-            let team = self.collect_preview_badges(PREVIEW_TEAM_IDS, 5);
+            let team_heroes = self.collect_preview_badges(PREVIEW_TEAM_IDS, 5);
+            let preview_ratings = self.preview_team_ratings();
+            let team = (0..5)
+                .map(|idx| TeamSlotBadgeEntry {
+                    hero: team_heroes.get(idx).and_then(|x| x.clone()),
+                    summoner: preview_ratings.slots.get(idx).map(summoner_summary_to_badge),
+                })
+                .collect();
             let cards = self.collect_preview_card_badges(PREVIEW_CARD_IDS, 2);
             (bench, team, cards)
         } else {
@@ -613,7 +644,9 @@ impl HexrsApp {
         };
 
         let has_bench = bench_slots.iter().any(Option::is_some);
-        let has_team = team_slots.iter().any(Option::is_some);
+        let has_team = team_slots
+            .iter()
+            .any(|s| s.hero.is_some() || s.summoner.is_some());
         let has_cards = (2..=3).contains(&card_slots.len()) && card_slots.iter().any(Option::is_some);
 
         let bench_target = has_bench.then_some(rect);
@@ -740,6 +773,77 @@ impl HexrsApp {
             .collect()
     }
 
+    /// Builds a 5-slot `2+3` preview snapshot for demonstrating rating titles, streaks, and premade MVPs.
+    pub fn preview_team_ratings(&self) -> TeamRatingsSnapshot {
+        let specs = [
+            (0, SummonerRatingStatus::Ready, 88, 5, Some(1), true),
+            (1, SummonerRatingStatus::Ready, 76, 0, Some(1), false),
+            (2, SummonerRatingStatus::Ready, 64, -3, Some(2), false),
+            (3, SummonerRatingStatus::Ready, 83, 0, Some(2), true),
+            (4, SummonerRatingStatus::Private, 0, 0, Some(2), false),
+        ];
+
+        let slots = specs
+            .into_iter()
+            .map(
+                |(cell_id, status, score, streak, premade_group_id, is_premade_last_mvp)| {
+                    let (tier_index, title) = self.rating_titles.resolve(status, score);
+                    SummonerRatingSummary {
+                        cell_id,
+                        status,
+                        score,
+                        tier_index,
+                        title,
+                        games_count: if status == SummonerRatingStatus::Ready {
+                            12
+                        } else {
+                            0
+                        },
+                        win_rate: 55.0,
+                        avg_kda: 3.4,
+                        streak,
+                        premade_group_id,
+                        is_premade_last_mvp,
+                    }
+                },
+            )
+            .collect();
+
+        TeamRatingsSnapshot {
+            slots,
+            premade_groups: vec![
+                PremadeGroupSummary {
+                    group_id: 1,
+                    slot_indices: vec![0, 1],
+                    shared_games: 4,
+                    last_mvp_slot_index: Some(0),
+                },
+                PremadeGroupSummary {
+                    group_id: 2,
+                    slot_indices: vec![2, 3, 4],
+                    shared_games: 6,
+                    last_mvp_slot_index: Some(3),
+                },
+            ],
+        }
+    }
+
+    fn refresh_rating_titles_if_changed(&mut self) {
+        let path = rating_titles_path();
+        let next_mtime = read_file_mtime(&path);
+        if next_mtime != self.rating_titles_mtime {
+            self.rating_titles_mtime = next_mtime;
+            self.rating_titles = RatingTitlesConfig::load_or_init(&path);
+            if let Some(snapshot) = self.team_ratings.as_mut() {
+                for slot in &mut snapshot.slots {
+                    let (tier_index, title) = self.rating_titles.resolve(slot.status, slot.score);
+                    slot.tier_index = tier_index;
+                    slot.title = title;
+                }
+            }
+        }
+    }
+
     fn clear_offered_augment_state(&mut self) {
         self.offered_augments.clear();
         self.offered_augment_layout = None;
@@ -782,6 +886,7 @@ impl HexrsApp {
                     self.expanded_hero_id = None;
                     self.selected_preview = None;
                     self.last_auto_expanded_hero_id = None;
+                    self.team_ratings = None;
                 }
 
                 if next_mode == AppMode::InGameOverlay {
@@ -804,6 +909,7 @@ impl HexrsApp {
                     self.champ_select = None;
                     self.active_champ_select_hero_id = None;
                     self.team_hero_stats.clear();
+                    self.team_ratings = None;
                     self.bench_highlights.clear();
                     self.team_recs = TeamRecommendations::default();
                     self.current_hero_stats = None;
@@ -813,8 +919,18 @@ impl HexrsApp {
                 }
             }
             AppEvent::ChampSelectUpdated(state) => {
+                self.refresh_rating_titles_if_changed();
                 self.refresh_champ_select_data(&state);
                 self.champ_select = Some(state);
+            }
+            AppEvent::TeamRatingsUpdated(mut snapshot) => {
+                self.refresh_rating_titles_if_changed();
+                for slot in &mut snapshot.slots {
+                    let (tier_index, title) = self.rating_titles.resolve(slot.status, slot.score);
+                    slot.tier_index = tier_index;
+                    slot.title = title;
+                }
+                self.team_ratings = Some(snapshot);
             }
             AppEvent::LiveGameUpdated(live) => {
                 self.refresh_live_game_data(&live);
@@ -1183,6 +1299,26 @@ fn quantize_offer_layout(layout: Option<&AugmentOfferLayout>) -> Option<(usize, 
             (l.title_y * 100.0).round() as i32,
         ))
     })
+}
+
+fn summoner_summary_to_badge(summary: &SummonerRatingSummary) -> SummonerBadgeData {
+    SummonerBadgeData {
+        status: summary.status,
+        score: summary.score,
+        tier_index: summary.tier_index,
+        title: summary.title.clone(),
+        streak: summary.streak,
+        premade_group_id: summary.premade_group_id,
+        is_premade_last_mvp: summary.is_premade_last_mvp,
+    }
+}
+
+fn rating_titles_path() -> PathBuf {
+    hex_data::data_dir().join("rating_titles.json")
+}
+
+fn read_file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).ok()?.modified().ok()
 }
 
 fn live_game_to_vision_ctx(live: &LiveGameState) -> VisionGameContext {

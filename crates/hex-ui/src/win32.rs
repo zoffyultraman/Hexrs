@@ -857,8 +857,8 @@ mod imp {
             let x = (target.left + (0.2000 * target_w as f32).round() as i32)
                 .clamp(target.left, target.right.saturating_sub(1));
             let max_w = (target.right - x).max(1);
-            let w = ((target_w as f32 * 0.056).round() as i32)
-                .clamp((88.0 * scale).round() as i32, (124.0 * scale).round() as i32)
+            let w = ((target_w as f32 * 0.058).round() as i32)
+                .clamp((94.0 * scale).round() as i32, (128.0 * scale).round() as i32)
                 .min(max_w);
 
             let y = (target.top + (0.1261 * target_h as f32).round() as i32)

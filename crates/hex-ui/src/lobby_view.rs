@@ -1,7 +1,7 @@
 //! Champ Select GPUI sidebar rendering (`code_artifact.md` Section 3.1).
 
-use gpui::{div, prelude::*, px, AnyElement, Context, Div, FontWeight, SharedString};
-use hex_core::{AppMode, ChampSelectState};
+use gpui::{div, prelude::*, px, rgb, rgba, AnyElement, Context, Div, FontWeight, SharedString};
+use hex_core::{AppMode, ChampSelectState, PremadeGroupSummary};
 use hex_data::{
     AugmentEvaluation, BenchHighlight, DynamicBuildPlan, HeroPreview, HeroStats,
     SynergyRecommendation, TeamDiagnosis, TeamRecommendations,
@@ -24,6 +24,13 @@ pub fn render_lobby_sidebar(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
     let expanded_hero_id = app.expanded_hero_id;
     let selected_preview = app.selected_preview.as_ref();
     let is_preview = app.preview_mode == Some(AppMode::LobbyDocked);
+    let preview_ratings = (is_preview && champ_select.is_none()).then(|| app.preview_team_ratings());
+    let premade_groups: &[PremadeGroupSummary] = app
+        .team_ratings
+        .as_ref()
+        .or(preview_ratings.as_ref())
+        .map(|r| r.premade_groups.as_slice())
+        .unwrap_or(&[]);
 
     div()
         .size_full()
@@ -53,6 +60,9 @@ pub fn render_lobby_sidebar(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                     selected_preview,
                     cx,
                 ))
+                .when(!premade_groups.is_empty(), |parent| {
+                    parent.child(render_premade_summary_section(premade_groups))
+                })
                 .when(!team_heroes.is_empty(), |parent| {
                     parent.child(render_team_heroes_section(
                         team_heroes,
@@ -342,6 +352,79 @@ fn render_active_hero_section(
         .when_some(preview_matches, |container, preview| {
             container.child(render_hero_preview_drawer(preview))
         })
+}
+
+fn render_premade_summary_section(groups: &[PremadeGroupSummary]) -> Div {
+    let mut rows = div().flex().flex_col().gap_1();
+    for group in groups {
+        let (bg, border, text) = match group.group_id {
+            1 => (rgba(0x0AC8B924), rgba(0x0AC8B988), rgb(0x4BE8DB)),
+            2 => (rgba(0x8B5CF629), rgba(0xA78BFA88), rgb(0xDDD6FE)),
+            _ => (rgba(0x14B8A624), rgba(0x2DD4BF88), rgb(0x99F6E4)),
+        };
+
+        let members: Vec<String> = group
+            .slot_indices
+            .iter()
+            .map(|&slot_idx| {
+                let seat = slot_idx + 1;
+                if group.last_mvp_slot_index == Some(slot_idx) {
+                    format!("{seat}号位(上局MVP)")
+                } else {
+                    format!("{seat}号位")
+                }
+            })
+            .collect();
+
+        rows = rows.child(
+            div()
+                .px_2()
+                .py(px(4.0))
+                .rounded_md()
+                .bg(bg)
+                .border_1()
+                .border_color(border)
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(text)
+                .child(format!(
+                    "黑{} · {} · 同队{}场",
+                    group.group_id,
+                    members.join(" + "),
+                    group.shared_games
+                )),
+        );
+    }
+
+    div()
+        .p_3()
+        .rounded_lg()
+        .bg(theme::card_bg())
+        .border_1()
+        .border_color(theme::border_subtle())
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::gold())
+                        .child("开黑车队识别"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child("近期同队 >= 2 局"),
+                ),
+        )
+        .child(rows)
 }
 
 fn render_team_heroes_section(
