@@ -791,12 +791,20 @@ pub fn parse_lcu_matches_json(val: &serde_json::Value) -> Vec<NormalizedMatch> {
                         .get("totalDamageTaken")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
+                    damage_self_mitigated: stats
+                        .get("damageSelfMitigated")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
                     heals_on_teammates: stats
                         .get("totalHealsOnTeammates")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
                     shielded_on_teammates: stats
                         .get("totalDamageShieldedOnTeammates")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    time_ccing_others: stats
+                        .get("timeCCingOthers")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
                     gold_earned: stats

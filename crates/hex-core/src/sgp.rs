@@ -180,12 +180,20 @@ pub fn parse_sgp_matches_json(val: &serde_json::Value) -> std::result::Result<Ve
                         .get("totalDamageTaken")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
+                    damage_self_mitigated: p
+                        .get("damageSelfMitigated")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
                     heals_on_teammates: p
                         .get("totalHealsOnTeammates")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
                     shielded_on_teammates: p
                         .get("totalDamageShieldedOnTeammates")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    time_ccing_others: p
+                        .get("timeCCingOthers")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
                     gold_earned: p

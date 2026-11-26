@@ -280,19 +280,19 @@ impl Default for RatingTitlesConfig {
         Self {
             tiers: vec![
                 RatingTierRule {
-                    min_score: 85,
+                    min_score: 82,
                     label: "夯".to_owned(),
                 },
                 RatingTierRule {
-                    min_score: 72,
+                    min_score: 70,
                     label: "顶级".to_owned(),
                 },
                 RatingTierRule {
-                    min_score: 55,
+                    min_score: 58,
                     label: "人上人".to_owned(),
                 },
                 RatingTierRule {
-                    min_score: 40,
+                    min_score: 45,
                     label: "NPC".to_owned(),
                 },
                 RatingTierRule {
