@@ -351,7 +351,7 @@ mod win_ocr {
             )
             .ok()?;
 
-            let ocr_result = self.engine.RecognizeAsync(&bitmap).ok()?.join().ok()?;
+            let ocr_result = self.engine.RecognizeAsync(&bitmap).ok()?.get().ok()?;
             let lines = ocr_result.Lines().ok()?;
 
             let mut hits = Vec::new();

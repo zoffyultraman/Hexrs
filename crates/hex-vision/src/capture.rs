@@ -366,7 +366,7 @@ mod win_capture {
     use windows_capture::frame::Frame;
     use windows_capture::graphics_capture_api::InternalCaptureControl;
     use windows_capture::settings::{
-        ColorFormat, CursorCaptureSettings, DrawBorderSettings,
+        ColorFormat, CursorCaptureSettings, DirtyRegionSettings, DrawBorderSettings,
         MinimumUpdateIntervalSettings, SecondaryWindowSettings, Settings,
     };
     use windows_capture::window::Window as CaptureWindow;
