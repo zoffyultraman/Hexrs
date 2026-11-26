@@ -137,7 +137,7 @@ fn render_item_row(app: &HexOverlayApp, build: Option<&DynamicBuildPlan>) -> Div
             .child("正在加载推荐出装...");
     };
 
-    let mut row = div().flex().items_stretch().gap_1();
+    let mut row = div().flex().gap_1();
     for item in plan.items.iter().take(3) {
         let icon_path = app.item_icons.get(&item.id).cloned();
         row = row.child(render_item_slot(item, icon_path));
