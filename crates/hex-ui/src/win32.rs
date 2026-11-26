@@ -499,6 +499,58 @@ mod imp {
         Ok(())
     }
 
+    /// Anchors a permanently click-through horizontal strip strictly ABOVE the 3 augment cards.
+    pub fn set_in_game_augment_bar_mode(
+        window: &Window,
+        target_rect: Option<WindowRectInfo>,
+        visible: bool,
+    ) -> Result<()> {
+        let hwnd = extract_hwnd(window)?;
+
+        // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
+        unsafe {
+            apply_transparent_ex_style(hwnd, false);
+
+            let Some(target) = target_rect.filter(|_| visible) else {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return Ok(());
+            };
+
+            let own_dpi = GetDpiForWindow(hwnd);
+            let dpi = if own_dpi > 0 { own_dpi } else { target.dpi.max(96) };
+            let scale = dpi as f32 / 96.0;
+
+            let min_w = (560.0 * scale).round() as i32;
+            let max_w = (1180.0 * scale).round() as i32;
+            let target_w = target.width().max(320);
+            let width_px = ((target.width() as f32 * 0.64).round() as i32)
+                .clamp(min_w, max_w)
+                .min(target_w);
+            let height_px = ((116.0 * scale).round() as i32).min(target.height().max(90));
+
+            let x = (target.left + (target.width() - width_px) / 2)
+                .clamp(target.left, (target.right - width_px).max(target.left));
+            let y = (target.top + (target.height() as f32 * 0.13).round() as i32)
+                .clamp(target.top, (target.bottom - height_px).max(target.top));
+
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                width_px,
+                height_px,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            .context("SetWindowPos(in-game augment bar) failed")?;
+
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+
+        Ok(())
+    }
+
     /// Configures interactive Champ Select sidebar mode docked beside `LeagueClientUx.exe`.
     pub fn set_lobby_dock_mode(window: &Window, target_rect: Option<WindowRectInfo>) -> Result<()> {
         let hwnd = extract_hwnd(window)?;
@@ -735,6 +787,15 @@ mod imp {
         Ok(())
     }
 
+    /// Non-Windows stub for `set_in_game_augment_bar_mode`.
+    pub fn set_in_game_augment_bar_mode(
+        _window: &Window,
+        _target_rect: Option<WindowRectInfo>,
+        _visible: bool,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Non-Windows stub for `find_window_by_pid`.
     #[allow(dead_code)]
     pub fn find_window_by_pid(_pid: u32) -> Option<WindowRectInfo> {
@@ -794,6 +855,6 @@ mod imp {
 pub use imp::{
     default_preview_game_rect, default_preview_lobby_rect, find_league_game_window,
     find_league_lobby_window, hide_window, open_data_directory, open_log_file,
-    relaunch_as_administrator, set_diagnostics_window_mode, set_in_game_overlay_mode,
-    set_lobby_dock_mode,
+    relaunch_as_administrator, set_diagnostics_window_mode, set_in_game_augment_bar_mode,
+    set_in_game_overlay_mode, set_lobby_dock_mode,
 };

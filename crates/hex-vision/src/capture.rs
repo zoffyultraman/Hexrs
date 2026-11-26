@@ -11,7 +11,7 @@ use tracing::{debug, info};
 use crate::phash::AugmentMatcher;
 use crate::roi::SharedRoiManifest;
 
-const DEFAULT_MAX_HAMMING_DISTANCE: u32 = 12;
+const DEFAULT_MAX_HAMMING_DISTANCE: u32 = 14;
 
 /// Configuration snapshot controlling when and how WGC augment recognition runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,9 +32,18 @@ impl Default for VisionConfig {
 }
 
 /// Returns `true` when the active game mode supports hextech augment selection modals.
+///
+/// Empty `game_mode` returns `true` so 0:00 Level-1 augment choices before Live API responds
+/// are never missed; classic Summoner's Rift / TFT / tutorial modes return `false`.
 pub fn mode_supports_augments(game_mode: &str) -> bool {
     let upper = game_mode.trim().to_ascii_uppercase();
     if upper.is_empty() {
+        return true;
+    }
+    if matches!(
+        upper.as_str(),
+        "CLASSIC" | "TFT" | "PRACTICETOOL" | "TUTORIAL"
+    ) {
         return false;
     }
     matches!(upper.as_str(), "CHERRY" | "KIWI" | "ARAM" | "ULTBOOK")
@@ -127,6 +136,9 @@ impl VisionController {
                 game_mode,
                 "hex-vision capture state changed"
             );
+            if !should_run {
+                let _ = self.shared.event_tx.send(AppEvent::AugmentOfferCleared);
+            }
             self.shared.notify_supervisor();
         } else {
             debug!(active = should_run, game_mode, "hex-vision state unchanged");
@@ -193,6 +205,7 @@ mod win_capture {
 
     const FRAME_PROCESS_INTERVAL: Duration = Duration::from_millis(300);
     const OFFER_DEDUP_COOLDOWN: Duration = Duration::from_secs(4);
+    const CLEAR_AFTER_MISSES: u8 = 3;
     const WINDOW_RETRY_INTERVAL: Duration = Duration::from_millis(1000);
     const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -203,6 +216,8 @@ mod win_capture {
         scratch_buf: Vec<u8>,
         last_processed: Instant,
         last_emitted: Option<(Vec<i32>, Instant)>,
+        active_offer: bool,
+        consecutive_misses: u8,
     }
 
     impl GraphicsCaptureApiHandler for HexCaptureHandler {
@@ -215,6 +230,8 @@ mod win_capture {
                 scratch_buf: Vec::new(),
                 last_processed: Instant::now() - FRAME_PROCESS_INTERVAL,
                 last_emitted: None,
+                active_offer: false,
+                consecutive_misses: 0,
             })
         }
 
@@ -226,6 +243,12 @@ mod win_capture {
             if !self.shared.active.load(Ordering::Acquire)
                 || self.shared.shutdown.load(Ordering::Acquire)
             {
+                if self.active_offer {
+                    self.active_offer = false;
+                    self.consecutive_misses = 0;
+                    self.last_emitted = None;
+                    let _ = self.shared.event_tx.send(AppEvent::AugmentOfferCleared);
+                }
                 capture_control.stop();
                 return Ok(());
             }
@@ -246,18 +269,19 @@ mod win_capture {
             };
             let preset = select_preset(&manifest, width, height);
 
-            if !detect_augment_screen(rgba, width, height, preset) {
-                return Ok(());
-            }
-
-            let match_result = {
+            let match_result = if detect_augment_screen(rgba, width, height, preset) {
                 let Ok(matcher) = self.shared.matcher.read() else {
                     return Ok(());
                 };
-                matcher.match_offer(rgba, width, height, &preset.card_icons)
+                matcher.match_offer_adaptive(rgba, width, height, &preset.card_icons)
+            } else {
+                None
             };
 
             if let Some((candidates, capture_ms)) = match_result {
+                self.consecutive_misses = 0;
+                self.active_offer = true;
+
                 let is_duplicate = self
                     .last_emitted
                     .as_ref()
@@ -271,6 +295,15 @@ mod win_capture {
                         capture_ms,
                     });
                     self.last_emitted = Some((candidates, Instant::now()));
+                }
+            } else if self.active_offer {
+                self.consecutive_misses = self.consecutive_misses.saturating_add(1);
+                if self.consecutive_misses >= CLEAR_AFTER_MISSES {
+                    self.active_offer = false;
+                    self.consecutive_misses = 0;
+                    self.last_emitted = None;
+                    debug!("augment offer modal dismissed; clearing strip");
+                    let _ = self.shared.event_tx.send(AppEvent::AugmentOfferCleared);
                 }
             }
 

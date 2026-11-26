@@ -20,7 +20,7 @@ use hex_data::AugmentHashEntry;
 
 const DCT_SIZE: usize = 32;
 const LOW_FREQ_SIZE: usize = 8;
-const DEFAULT_MAX_HAMMING_DISTANCE: u32 = 12;
+const DEFAULT_MAX_HAMMING_DISTANCE: u32 = 14;
 
 static DCT_LUT: LazyLock<[[f32; DCT_SIZE]; LOW_FREQ_SIZE]> = LazyLock::new(|| {
     let mut lut = [[0.0_f32; DCT_SIZE]; LOW_FREQ_SIZE];
@@ -235,4 +235,113 @@ impl AugmentMatcher {
         let elapsed_ms = start.elapsed().as_millis() as u64;
         Some((candidates, elapsed_ms))
     }
+
+    /// Adaptive multi-offset, multi-scale pHash matcher across the 3 augment card slots.
+    ///
+    /// Probes small `(dx, dy, scale)` offsets on an anchor slot to compensate for resolution,
+    /// aspect ratio, and UI patch drift, then aligns all 3 slots (`0` placeholder if one fails)
+    /// and succeeds whenever at least 2 distinct positive augment IDs match within `max_distance`.
+    pub fn match_offer_adaptive(
+        &self,
+        frame_rgba: &[u8],
+        width: u32,
+        height: u32,
+        rois: &[RoiRect; 3],
+    ) -> Option<(Vec<i32>, u64)> {
+        if self.entries.is_empty() {
+            return None;
+        }
+
+        const DY_OFFSETS: &[f32] = &[0.0, -0.025, 0.025, -0.05, 0.05];
+        const DX_OFFSETS: &[f32] = &[0.0, -0.012, 0.012];
+        const SCALES: &[f32] = &[1.0, 0.90, 1.12];
+        const FINE_DX: &[f32] = &[0.0, -0.008, 0.008];
+        const ANCHOR_ORDER: [usize; 3] = [1, 0, 2];
+
+        let start = Instant::now();
+        let mut locked: Option<(f32, f32, f32, u32)> = None;
+
+        for &slot in &ANCHOR_ORDER {
+            let base_roi = rois[slot];
+            for &dy in DY_OFFSETS {
+                for &dx in DX_OFFSETS {
+                    for &scale in SCALES {
+                        let candidate_roi = adjust_roi(base_roi, dx, dy, scale);
+                        if let Some((_aug_id, dist)) =
+                            self.match_roi(frame_rgba, width, height, candidate_roi)
+                        {
+                            let replace = locked
+                                .map(|(_, _, _, best_dist)| dist < best_dist)
+                                .unwrap_or(true);
+                            if replace {
+                                locked = Some((dx, dy, scale, dist));
+                            }
+                            if dist <= 4 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if locked.is_some() {
+                break;
+            }
+        }
+
+        let (base_dx, base_dy, base_scale, _) = locked?;
+
+        let mut candidates = [0_i32; 3];
+        let mut used_ids = Vec::with_capacity(3);
+        let mut matched_count = 0_usize;
+
+        for (slot, base_roi) in rois.iter().enumerate() {
+            let mut best_slot: Option<(i32, u32)> = None;
+            for &fine_dx in FINE_DX {
+                let shifted = adjust_roi(*base_roi, base_dx + fine_dx, base_dy, base_scale);
+                if let Some((aug_id, dist)) = self.match_roi(frame_rgba, width, height, shifted) {
+                    if aug_id > 0
+                        && !used_ids.contains(&aug_id)
+                        && best_slot.map(|(_, b)| dist < b).unwrap_or(true)
+                    {
+                        best_slot = Some((aug_id, dist));
+                    }
+                }
+            }
+
+            if let Some((aug_id, _)) = best_slot {
+                candidates[slot] = aug_id;
+                used_ids.push(aug_id);
+                matched_count += 1;
+            }
+        }
+
+        if matched_count >= 2 {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            Some((candidates.to_vec(), elapsed_ms))
+        } else {
+            None
+        }
+    }
+
+    fn match_roi(
+        &self,
+        frame_rgba: &[u8],
+        width: u32,
+        height: u32,
+        roi: RoiRect,
+    ) -> Option<(i32, u32)> {
+        let pixel_rect = roi.to_pixel_rect(width, height);
+        let hash = compute_region_phash(frame_rgba, width, height, pixel_rect)?;
+        self.match_hash(hash)
+    }
+}
+
+fn adjust_roi(roi: RoiRect, dx: f32, dy: f32, scale: f32) -> RoiRect {
+    let cx = roi.x + roi.w * 0.5 + dx;
+    let cy = roi.y + roi.h * 0.5 + dy;
+    let new_w = (roi.w * scale).clamp(0.01, 1.0);
+    let new_h = (roi.h * scale).clamp(0.01, 1.0);
+    let new_x = (cx - new_w * 0.5).clamp(0.0, (1.0 - new_w).max(0.0));
+    let new_y = (cy - new_h * 0.5).clamp(0.0, (1.0 - new_h).max(0.0));
+    RoiRect::new(new_x, new_y, new_w, new_h)
 }

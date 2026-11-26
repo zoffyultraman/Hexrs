@@ -12,11 +12,11 @@ pub fn select_preset(manifest: &RoiManifest, width: u32, height: u32) -> &Aspect
     manifest.preset_for_resolution(width, height)
 }
 
-/// Lightweight heuristic checking whether the current frame displays the hextech augment modal.
+/// Lightweight gate checking whether the frame could display the hextech augment modal.
 ///
-/// Inspects `header_indicators` for hextech gold/teal trim over a dark translucent backdrop,
-/// plus non-flat color variance inside the 3 card icon ROIs, so normal teamfights do not
-/// trigger unnecessary pHash work or false matches.
+/// Allows Silver, Gold, Prismatic, and ARAM Mayhem modals alike by verifying at least 2 of 3
+/// card ROIs have non-flat icon content plus dark modal backdrop or header UI contrast, leaving
+/// authoritative filtering to `AugmentMatcher::match_offer_adaptive`.
 pub fn detect_augment_screen(
     frame_rgba: &[u8],
     width: u32,
@@ -32,13 +32,27 @@ pub fn detect_augment_screen(
     else {
         return false;
     };
-    if frame_rgba.len() < expected_len || preset.header_indicators.is_empty() {
+    if frame_rgba.len() < expected_len {
         return false;
     }
 
+    let content_count = preset
+        .card_icons
+        .iter()
+        .filter(|roi| has_icon_content(frame_rgba, width, height, **roi))
+        .count();
+    if content_count < 2 {
+        return false;
+    }
+
+    if preset.header_indicators.is_empty() {
+        return true;
+    }
+
     let mut total_samples = 0_u32;
-    let mut hex_accent_samples = 0_u32;
     let mut dark_backdrop_samples = 0_u32;
+    let mut min_luma = 255_u32;
+    let mut max_luma = 0_u32;
 
     for indicator in &preset.header_indicators {
         let (rx, ry, rw, rh) = indicator.to_pixel_rect(width, height);
@@ -62,23 +76,12 @@ pub fn detect_augment_screen(
 
                 total_samples += 1;
 
-                let is_gold = r >= 145
-                    && g >= 110
-                    && b <= 135
-                    && i32::from(r) - i32::from(b) >= 45;
-                let is_cyan = g >= 130
-                    && b >= 130
-                    && r <= 115
-                    && i32::from(b) - i32::from(r) >= 40;
-
-                if is_gold || is_cyan {
-                    hex_accent_samples += 1;
-                }
-
                 let luma = (u32::from(r) * 77 + u32::from(g) * 150 + u32::from(b) * 29) >> 8;
-                if luma <= 58 {
+                if luma <= 90 {
                     dark_backdrop_samples += 1;
                 }
+                min_luma = min_luma.min(luma);
+                max_luma = max_luma.max(luma);
 
                 px += step_x;
             }
@@ -87,19 +90,11 @@ pub fn detect_augment_screen(
     }
 
     if total_samples == 0 {
-        return false;
+        return true;
     }
 
-    let accent_ratio = hex_accent_samples as f32 / total_samples as f32;
     let dark_ratio = dark_backdrop_samples as f32 / total_samples as f32;
-    if accent_ratio < 0.035 || dark_ratio < 0.22 {
-        return false;
-    }
-
-    preset
-        .card_icons
-        .iter()
-        .all(|roi| has_icon_content(frame_rgba, width, height, *roi))
+    dark_ratio >= 0.20 || max_luma.saturating_sub(min_luma) >= 28
 }
 
 fn has_icon_content(frame_rgba: &[u8], width: u32, height: u32, roi: RoiRect) -> bool {

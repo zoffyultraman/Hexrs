@@ -7,11 +7,13 @@ use std::sync::{Arc, RwLock};
 use crossbeam_channel::{unbounded, Receiver};
 use gpui::{div, prelude::*, px, rgba, Context, Div, FontWeight, Render, Rgba, Window};
 use hex_core::{
-    AppEvent, AppMode, ChampSelectState, CoreDiagnostics, CoreHandle, LiveGameState, RoiManifest,
+    AppEvent, AppMode, ChampSelectState, CoreDiagnostics, CoreHandle, HeroTier, LiveGameState,
+    RoiManifest,
 };
 use hex_data::{
-    spawn_background_update, BenchHighlight, DynamicBuildPlan, EogReporter, HeroPreview, HeroStats,
-    IconCache, MetaEngine, TeamRecommendations, UpdateOutcome, UpdaterConfig,
+    spawn_background_update, AugmentEvaluation, BenchHighlight, DynamicBuildPlan, EogReporter,
+    HeroPreview, HeroStats, IconCache, MetaEngine, TeamRecommendations, UpdateOutcome,
+    UpdaterConfig,
 };
 use hex_vision::{SharedRoiManifest, VisionController};
 use tracing::{debug, info, warn};
@@ -46,6 +48,8 @@ pub struct HexOverlayApp {
     pub expanded_hero_id: Option<i32>,
     pub selected_preview: Option<HeroPreview>,
     pub owned_augment_ids: Vec<i32>,
+    pub offered_augments: Vec<AugmentEvaluation>,
+    pub last_offer_capture_ms: Option<u64>,
     pub dynamic_build: Option<DynamicBuildPlan>,
     pub active_hero_id: Option<i32>,
     pub active_hero_alias: Option<String>,
@@ -69,9 +73,10 @@ pub struct HexOverlayApp {
     vision: VisionController,
     tray: Option<TrayController>,
     last_lobby_sync: Option<(Option<WindowRectInfo>, bool)>,
-    last_overlay_sync: Option<(Option<WindowRectInfo>, OverlayCorner, bool)>,
+    last_overlay_sync: Option<(Option<WindowRectInfo>, OverlayCorner, bool, bool)>,
     last_diagnostics_sync: bool,
     last_dormant_hidden: bool,
+    auto_elevation_prompted: bool,
 }
 
 impl HexOverlayApp {
@@ -133,6 +138,8 @@ impl HexOverlayApp {
             expanded_hero_id: None,
             selected_preview: None,
             owned_augment_ids: Vec::new(),
+            offered_augments: Vec::new(),
+            last_offer_capture_ms: None,
             dynamic_build: None,
             active_hero_id: None,
             active_hero_alias: None,
@@ -159,6 +166,7 @@ impl HexOverlayApp {
             last_overlay_sync: None,
             last_diagnostics_sync: false,
             last_dormant_hidden: false,
+            auto_elevation_prompted: false,
         }
     }
 
@@ -264,6 +272,8 @@ impl HexOverlayApp {
                     TrayAction::ToggleDiagnostics => {
                         if self.preview_mode.is_some() {
                             self.preview_mode = None;
+                            self.offered_augments.clear();
+                            self.last_offer_capture_ms = None;
                             self.diagnostics_open = true;
                             if let Some(ref tray_ctrl) = self.tray {
                                 tray_ctrl.set_diagnostics_checked(true);
@@ -324,6 +334,25 @@ impl HexOverlayApp {
             }
         }
 
+        if !self.auto_elevation_prompted
+            && self.mode == AppMode::Dormant
+            && self.preview_mode.is_none()
+        {
+            let diag = self.core_handle.diagnostics();
+            if diag.lcu_pid.is_some() && diag.lcu_port.is_none() && !diag.is_elevated {
+                self.auto_elevation_prompted = true;
+                self.diagnostics_open = true;
+                if let Some(ref tray_ctrl) = self.tray {
+                    tray_ctrl.set_diagnostics_checked(true);
+                }
+                self.reset_window_sync_cache();
+                info!(
+                    "detected unprivileged LCU access gap; auto-opening diagnostics panel for UAC prompt"
+                );
+                dirty = true;
+            }
+        }
+
         if self.diagnostics_open && self.preview_mode.is_none() {
             // Keep live CoreDiagnostics values refreshed while diagnostics panel is visible.
             dirty = true;
@@ -354,6 +383,8 @@ impl HexOverlayApp {
     /// Sets or exits UI preview mode from the diagnostics panel.
     pub fn set_preview_mode(&mut self, mode: Option<AppMode>, cx: &mut Context<Self>) {
         self.preview_mode = mode;
+        self.offered_augments.clear();
+        self.last_offer_capture_ms = None;
         if mode == Some(AppMode::InGameOverlay) && self.live_game.is_none() {
             self.populate_hero_hud_state(Some(PREVIEW_YASUO_HERO_ID), None, &[]);
         } else if mode.is_none() && self.mode != AppMode::InGameOverlay {
@@ -363,10 +394,37 @@ impl HexOverlayApp {
         cx.notify();
     }
 
+    /// Previews the horizontal 3-card augment strip using real augments from `MetaEngine`.
+    pub fn preview_augment_bar(&mut self, cx: &mut Context<Self>) {
+        self.preview_mode = Some(AppMode::InGameOverlay);
+        if self.live_game.is_none() {
+            self.populate_hero_hud_state(Some(PREVIEW_YASUO_HERO_ID), None, &[]);
+        }
+        let sample_ids: Vec<i32> = self
+            .meta
+            .as_ref()
+            .map(|m| {
+                m.list_augment_hashes()
+                    .into_iter()
+                    .take(3)
+                    .map(|entry| entry.augment_id)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !sample_ids.is_empty() {
+            self.evaluate_detected_offer(&sample_ids, 1);
+        }
+        self.reset_window_sync_cache();
+        cx.notify();
+    }
+
     /// Closes the diagnostics panel and syncs the tray check item.
     pub fn close_diagnostics(&mut self, cx: &mut Context<Self>) {
         self.diagnostics_open = false;
         self.preview_mode = None;
+        self.offered_augments.clear();
+        self.last_offer_capture_ms = None;
         if let Some(ref tray_ctrl) = self.tray {
             tray_ctrl.set_diagnostics_checked(false);
         }
@@ -401,6 +459,8 @@ impl HexOverlayApp {
 
     fn clear_in_game_hud_state(&mut self) {
         self.owned_augment_ids.clear();
+        self.offered_augments.clear();
+        self.last_offer_capture_ms = None;
         self.dynamic_build = None;
         self.active_hero_id = None;
         self.active_hero_alias = None;
@@ -469,6 +529,15 @@ impl HexOverlayApp {
                 capture_ms,
             } => {
                 debug!(?candidates, capture_ms, "augment offer detected by hex-vision");
+                self.evaluate_detected_offer(&candidates, capture_ms);
+            }
+            AppEvent::AugmentOfferCleared => {
+                if !self.offered_augments.is_empty() {
+                    debug!("clearing augment offer strip");
+                    self.offered_augments.clear();
+                    self.last_offer_capture_ms = None;
+                    self.reset_window_sync_cache();
+                }
             }
             AppEvent::EndOfGameCaptured(eog) => {
                 info!(
@@ -481,6 +550,40 @@ impl HexOverlayApp {
                     self.reporter.submit_async(eog);
                 }
             }
+        }
+    }
+
+    fn evaluate_detected_offer(&mut self, candidates: &[i32], capture_ms: u64) {
+        let Some(meta) = self.meta.as_ref() else {
+            return;
+        };
+        let hero_id = self
+            .active_hero_id
+            .or(self.active_champ_select_hero_id)
+            .unwrap_or(0);
+
+        let mut slots = Vec::with_capacity(candidates.len().min(3));
+        let mut matched_any = false;
+
+        for &aug_id in candidates.iter().take(3) {
+            if aug_id > 0 {
+                if let Some(eval) = meta
+                    .evaluate_augment_offer(hero_id, &[aug_id], &self.owned_augment_ids)
+                    .into_iter()
+                    .next()
+                {
+                    matched_any = true;
+                    slots.push(eval);
+                    continue;
+                }
+            }
+            slots.push(placeholder_augment_eval());
+        }
+
+        if matched_any {
+            self.offered_augments = slots;
+            self.last_offer_capture_ms = Some(capture_ms);
+            self.reset_window_sync_cache();
         }
     }
 
@@ -655,16 +758,22 @@ impl HexOverlayApp {
                     None
                 };
                 let visible = is_preview || self.overlay_visible;
+                let has_augment_offer = !self.offered_augments.is_empty();
 
-                let state = (target_rect, self.overlay_corner, visible);
+                let state = (target_rect, self.overlay_corner, visible, has_augment_offer);
                 if self.last_overlay_sync != Some(state) {
-                    if let Err(err) = win32::set_in_game_overlay_mode(
-                        window,
-                        target_rect,
-                        self.overlay_corner,
-                        visible,
-                    ) {
-                        warn!(error = %err, "failed to update in-game corner HUD window");
+                    let res = if has_augment_offer {
+                        win32::set_in_game_augment_bar_mode(window, target_rect, visible)
+                    } else {
+                        win32::set_in_game_overlay_mode(
+                            window,
+                            target_rect,
+                            self.overlay_corner,
+                            visible,
+                        )
+                    };
+                    if let Err(err) = res {
+                        warn!(error = %err, has_augment_offer, "failed to update in-game overlay window");
                     }
                     self.last_overlay_sync = Some(state);
                 }
@@ -698,6 +807,19 @@ impl Render for HexOverlayApp {
     }
 }
 
+fn placeholder_augment_eval() -> AugmentEvaluation {
+    AugmentEvaluation {
+        augment_id: 0,
+        name_zh: String::new(),
+        rarity: String::new(),
+        desc_zh: String::new(),
+        tier: HeroTier::B,
+        win_rate: 50.0,
+        pick_rate: 0.0,
+        synergy_alert: None,
+    }
+}
+
 fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>) -> Div {
     let diag: CoreDiagnostics = app.core_handle.diagnostics();
     let lobby_rect = app
@@ -709,10 +831,12 @@ fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
 
     let lobby_rect_str = format_rect_info(lobby_rect);
     let game_rect_str = format_rect_info(game_rect);
-    let meta_status = if app.meta.is_some() {
-        "已加载内存 SQLite"
-    } else {
-        "未加载"
+    let (meta_status, counts_str) = match app.meta.as_ref() {
+        Some(engine) => {
+            let (champs, augs) = engine.stats_counts();
+            ("已加载内存 SQLite", format!("{champs} 英雄 / {augs} 海克斯"))
+        }
+        None => ("未加载", "0 英雄 / 0 海克斯".to_owned()),
     };
 
     div()
@@ -818,6 +942,7 @@ fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
                             ),
                         ))
                         .child(diag_row("MetaEngine 数据库", meta_status.to_owned()))
+                        .child(diag_row("特征库规模", counts_str))
                         .child(diag_row_colored(
                             "当前权限",
                             if diag.is_elevated {
@@ -967,6 +1092,26 @@ fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
                                         .child("预览局内悬浮窗")
                                         .on_click(cx.listener(|this, _event, _window, cx| {
                                             this.set_preview_mode(Some(AppMode::InGameOverlay), cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("preview-augment-bar-btn")
+                                        .flex_1()
+                                        .cursor_pointer()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(theme::synergy_gold_bg())
+                                        .border_1()
+                                        .border_color(theme::synergy_gold_border())
+                                        .hover(|s| s.bg(theme::card_elevated_bg()))
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::synergy_gold_text())
+                                        .child("预览海克斯识别条")
+                                        .on_click(cx.listener(|this, _event, _window, cx| {
+                                            this.preview_augment_bar(cx);
                                         })),
                                 ),
                         )

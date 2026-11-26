@@ -1,17 +1,21 @@
-//! Compact click-through corner HUD for in-game mode (`304x126` DIPs, hero portrait + 3 core items).
+//! In-game overlay views: compact `304x126` corner HUD and non-blocking 3-column S+~D augment strip.
 
 use std::path::PathBuf;
 
 use gpui::{div, img, prelude::*, px, rgba, Div, FontWeight, ObjectFit};
-use hex_data::{BuildItemInfo, DynamicBuildPlan};
+use hex_data::{AugmentEvaluation, BuildItemInfo, DynamicBuildPlan};
 
 use crate::app::HexOverlayApp;
-use crate::theme;
+use crate::theme::{self, tier_badge};
 
-/// Renders the compact `304x126` corner card showing ONLY hero portrait, hero name, and 3 recommended items.
+/// Renders either the 3-card augment strip (when an offer is active) or the compact corner equipment HUD.
 pub fn render_in_game_overlay(app: &HexOverlayApp) -> Div {
     if !app.overlay_visible {
         return div().size_full().bg(rgba(0x00000000));
+    }
+
+    if !app.offered_augments.is_empty() {
+        return render_augment_offer_bar(app);
     }
 
     let hero_name = app
@@ -51,6 +55,140 @@ pub fn render_in_game_overlay(app: &HexOverlayApp) -> Div {
             playstyle_tag,
         ))
         .child(render_item_row(app, app.dynamic_build.as_ref()))
+}
+
+fn render_augment_offer_bar(app: &HexOverlayApp) -> Div {
+    let mut columns = div().size_full().flex().gap_2().text_color(theme::text_primary());
+    for eval in app.offered_augments.iter().take(3) {
+        columns = columns.child(render_augment_slot_card(eval));
+    }
+    columns
+}
+
+fn render_augment_slot_card(eval: &AugmentEvaluation) -> Div {
+    if eval.augment_id <= 0 {
+        return div()
+            .flex_1()
+            .p_2()
+            .rounded_xl()
+            .bg(theme::overlay_card_bg())
+            .border_1()
+            .border_color(theme::border_subtle())
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text_muted())
+                    .child("未匹配卡槽"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::text_muted())
+                    .child("请按实际效果选择"),
+            );
+    }
+
+    let has_synergy = eval.synergy_alert.is_some();
+
+    div()
+        .flex_1()
+        .p_2()
+        .rounded_xl()
+        .bg(theme::overlay_card_bg())
+        .border_1()
+        .border_color(if has_synergy {
+            theme::synergy_gold_border()
+        } else {
+            theme::border_gold()
+        })
+        .flex()
+        .flex_col()
+        .justify_between()
+        .gap_1()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(tier_badge(eval.tier))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme::text_primary())
+                                .child(truncate_label(&eval.name_zh, 9)),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(5.0))
+                        .py(px(1.0))
+                        .rounded_md()
+                        .bg(theme::card_bg())
+                        .border_1()
+                        .border_color(theme::border_subtle())
+                        .text_xs()
+                        .text_color(theme::gold())
+                        .child(eval.rarity.clone()),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::cyan())
+                        .child(format!("胜率 {:.1}%", eval.win_rate)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child(format!("选取 {:.1}%", eval.pick_rate)),
+                ),
+        )
+        .when_some(eval.synergy_alert.as_ref(), |card, alert| {
+            card.child(
+                div()
+                    .px(px(5.0))
+                    .py(px(2.0))
+                    .rounded_md()
+                    .bg(theme::synergy_gold_bg())
+                    .border_1()
+                    .border_color(theme::synergy_gold_border())
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme::synergy_gold_text())
+                    .child(format!(
+                        "{} · 与【{}】Lift {:.2}",
+                        alert.badge, alert.partner_name_zh, alert.lift_score
+                    )),
+            )
+        })
+        .when(eval.synergy_alert.is_none(), |card| {
+            card.child(
+                div()
+                    .text_xs()
+                    .text_color(theme::text_muted())
+                    .child(truncate_label(&eval.desc_zh, 24)),
+            )
+        })
 }
 
 fn render_hero_header(
