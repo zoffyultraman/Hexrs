@@ -31,6 +31,8 @@ pub struct CoreDiagnostics {
     pub game_pid: Option<u32>,
     pub game_running: bool,
     pub live_api_active: bool,
+    pub is_elevated: bool,
+    pub lcu_diagnostic: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -103,6 +105,8 @@ impl CoreHandle {
                 game_pid: guard.snapshot.game_pid,
                 game_running: guard.snapshot.game_running,
                 live_api_active: guard.live_api_active,
+                is_elevated: guard.snapshot.is_elevated,
+                lcu_diagnostic: guard.snapshot.lcu_diagnostic.clone(),
             })
             .unwrap_or_default()
     }

@@ -12,7 +12,10 @@ pub use models::{
     AppEvent, AppMode, AspectRoiPreset, ChampSelectState, EndOfGameParticipant, EndOfGameStats,
     HeroTier, LiveGameState, RoiManifest, RoiRect, TeamSlot,
 };
-pub use process::{LcuCredentials, ProcessMonitor, ProcessSnapshot};
+pub use process::{
+    is_current_process_elevated, parse_raw_cmdline_credentials, LcuCredentials, ProcessMonitor,
+    ProcessSnapshot,
+};
 pub use state_machine::{spawn_core_service, CoreDiagnostics, CoreHandle, CoreRuntime};
 
 /// Crate identifier helper verifying workspace linkage.
