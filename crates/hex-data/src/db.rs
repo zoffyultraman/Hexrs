@@ -243,6 +243,19 @@ impl MetaEngine {
         query_hero_stats(&conn, hero_id)
     }
 
+    /// Returns the champion's DataDragon alias (e.g. `"Yasuo"`) for `hero_id`, if present.
+    pub fn get_hero_alias(&self, hero_id: i32) -> Option<String> {
+        let conn = self.conn.lock().ok()?;
+        conn.query_row(
+            "SELECT alias FROM champions WHERE hero_id = ?1",
+            params![hero_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     /// Returns up to `limit` highest-priority bench champions sorted by tier then win rate.
     pub fn highlight_bench(&self, bench_ids: &[i32], limit: usize) -> Vec<BenchHighlight> {
         if bench_ids.is_empty() || limit == 0 {
@@ -567,6 +580,42 @@ impl MetaEngine {
             let score_b = score_build_for_augments(b, owned_aug_ids);
             score_a.total_cmp(&score_b)
         })
+    }
+
+    /// Returns the champion's dynamic build plan, or a generic 3-item fallback when unknown.
+    pub fn get_dynamic_build_or_fallback(
+        &self,
+        hero_id: Option<i32>,
+        owned_aug_ids: &[i32],
+        owned_item_ids: &[i32],
+    ) -> DynamicBuildPlan {
+        if let Some(id) = hero_id {
+            if let Some(plan) = self.get_dynamic_build(id, owned_aug_ids, owned_item_ids) {
+                return plan;
+            }
+        }
+
+        DynamicBuildPlan {
+            playstyle_tag: "通用推荐".to_owned(),
+            win_rate: 50.0,
+            items: vec![
+                BuildItemInfo {
+                    id: 3078,
+                    name_zh: "三相之力".to_owned(),
+                    already_owned: owned_item_ids.contains(&3078),
+                },
+                BuildItemInfo {
+                    id: 3053,
+                    name_zh: "斯特拉克的挑战护手".to_owned(),
+                    already_owned: owned_item_ids.contains(&3053),
+                },
+                BuildItemInfo {
+                    id: 6333,
+                    name_zh: "死亡之舞".to_owned(),
+                    already_owned: owned_item_ids.contains(&6333),
+                },
+            ],
+        }
     }
 }
 

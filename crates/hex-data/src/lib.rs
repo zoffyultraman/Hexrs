@@ -1,6 +1,7 @@
-//! Local SQLite read-only meta queries, Zstd hot-update loader, and anonymized EOG reporting.
+//! Local SQLite read-only meta queries, Zstd hot-update loader, icon cache, and anonymized EOG reporting.
 
 pub mod db;
+pub mod icons;
 pub mod reporter;
 pub mod schema;
 pub mod seed;
@@ -11,6 +12,7 @@ pub use db::{
     BenchHighlight, BuildItemInfo, DynamicBuildPlan, HeroPreview, HeroStats, MetaEngine,
     SynergyAlert, SynergyRecommendation, TeamDiagnosis, TeamRecommendations,
 };
+pub use icons::IconCache;
 pub use reporter::{EogReporter, ReporterConfig};
 pub use schema::{init_schema, SCHEMA_VERSION};
 pub use seed::{lookup_item_name_zh, populate_seed_data};
