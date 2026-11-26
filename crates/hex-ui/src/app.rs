@@ -18,6 +18,7 @@ use hex_data::{
 use hex_vision::{SharedRoiManifest, VisionController, VisionGameContext};
 use tracing::{debug, info, warn};
 
+use crate::lobby_badge_view::{LobbyBadgeState, SlotBadgeData};
 use crate::lobby_view;
 use crate::log_file_path;
 use crate::overlay_view;
@@ -76,6 +77,7 @@ pub struct HexOverlayApp {
     vision: VisionController,
     tray: Option<TrayController>,
     last_lobby_sync: Option<(Option<WindowRectInfo>, bool)>,
+    last_badge_sync: Option<Option<WindowRectInfo>>,
     last_overlay_sync: Option<(
         Option<WindowRectInfo>,
         OverlayCorner,
@@ -186,6 +188,7 @@ impl HexOverlayApp {
             vision,
             tray,
             last_lobby_sync: None,
+            last_badge_sync: None,
             last_overlay_sync: None,
             last_diagnostics_sync: false,
             last_dormant_hidden: false,
@@ -477,9 +480,112 @@ impl HexOverlayApp {
 
     fn reset_window_sync_cache(&mut self) {
         self.last_lobby_sync = None;
+        self.last_badge_sync = None;
         self.last_overlay_sync = None;
         self.last_diagnostics_sync = false;
         self.last_dormant_hidden = false;
+    }
+
+    /// Computes live click-through client badge state and deferred Win32 sync command for `RCLIENT`.
+    pub fn build_lobby_badge_sync(
+        &mut self,
+        badge_hwnd_raw: isize,
+    ) -> (LobbyBadgeState, Option<Win32WindowCommand>) {
+        let in_diagnostics = self.diagnostics_open && self.preview_mode.is_none();
+        let effective_mode = self.preview_mode.unwrap_or(self.mode);
+        let is_preview = self.preview_mode.is_some();
+
+        let target_rect = if !in_diagnostics
+            && effective_mode == AppMode::LobbyDocked
+            && (self.overlay_visible || is_preview)
+        {
+            self.last_detected_lobby_rect
+                .or_else(|| is_preview.then(win32::default_preview_lobby_rect))
+        } else {
+            None
+        };
+
+        let badge_cmd = if badge_hwnd_raw != 0 && self.last_badge_sync != Some(target_rect) {
+            self.last_badge_sync = Some(target_rect);
+            Some(Win32WindowCommand {
+                hwnd_raw: badge_hwnd_raw,
+                action: Win32WindowAction::ClientBadgeOverlay(target_rect),
+            })
+        } else {
+            None
+        };
+
+        let Some(rect) = target_rect else {
+            return (LobbyBadgeState::default(), badge_cmd);
+        };
+
+        let scale = win32::window_scale_for_hwnd(badge_hwnd_raw, rect.scale()).max(0.5);
+        let client_width_dip = rect.width() as f32 / scale;
+        let client_height_dip = rect.height() as f32 / scale;
+
+        let (bench_slots, team_slots) = if let Some(cs) = self.champ_select.as_ref() {
+            let bench = cs
+                .bench_champions
+                .iter()
+                .take(10)
+                .map(|&id| self.lookup_slot_badge(id))
+                .collect();
+            let team = cs
+                .my_team
+                .iter()
+                .take(5)
+                .map(|slot| {
+                    let id = if slot.champion_id > 0 {
+                        slot.champion_id
+                    } else {
+                        slot.pick_intent
+                    };
+                    self.lookup_slot_badge(id)
+                })
+                .collect();
+            (bench, team)
+        } else if is_preview {
+            const PREVIEW_BENCH_IDS: &[i32] =
+                &[25, 142, 59, 78, 517, 154, 106, 157, 777, 145, 67, 875, 32, 54];
+            const PREVIEW_TEAM_IDS: &[i32] =
+                &[498, 23, 36, 526, 42, 157, 145, 875, 54, 32];
+            let bench = self.collect_preview_badges(PREVIEW_BENCH_IDS, 7);
+            let team = self.collect_preview_badges(PREVIEW_TEAM_IDS, 5);
+            (bench, team)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        (
+            LobbyBadgeState {
+                visible: true,
+                bench_slots,
+                team_slots,
+                client_width_dip,
+                client_height_dip,
+            },
+            badge_cmd,
+        )
+    }
+
+    fn lookup_slot_badge(&self, hero_id: i32) -> Option<SlotBadgeData> {
+        if hero_id <= 0 {
+            return None;
+        }
+        let stats = self.meta.as_ref()?.get_hero_stats(hero_id)?;
+        Some(SlotBadgeData {
+            tier: stats.tier,
+            win_rate: stats.win_rate,
+        })
+    }
+
+    fn collect_preview_badges(&self, candidates: &[i32], max_slots: usize) -> Vec<Option<SlotBadgeData>> {
+        candidates
+            .iter()
+            .filter_map(|&id| self.lookup_slot_badge(id))
+            .take(max_slots)
+            .map(Some)
+            .collect()
     }
 
     fn clear_offered_augment_state(&mut self) {

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod lobby_badge_view;
 mod lobby_view;
 mod overlay_view;
 mod theme;
@@ -21,6 +22,7 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::HexOverlayApp;
+use crate::lobby_badge_view::{LobbyBadgeOverlay, LobbyBadgeState};
 use crate::tray::TrayController;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(60);
@@ -100,13 +102,52 @@ fn main() {
             }
         };
 
+        let mut badge_hwnd_raw: isize = 0;
+        let badge_options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: None,
+            kind: WindowKind::PopUp,
+            window_background: WindowBackgroundAppearance::Transparent,
+            focus: false,
+            show: true,
+            ..Default::default()
+        };
+        let badge_window_handle = match cx.open_window(badge_options, |window, cx| {
+            if let Ok(raw) = win32::window_hwnd_raw(window) {
+                badge_hwnd_raw = raw;
+            }
+            cx.new(|_| LobbyBadgeOverlay::new())
+        }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                warn!(error = %err, "failed to open HexOverlay client badge window");
+                None
+            }
+        };
+
         cx.spawn(async move |cx: &mut AsyncApp| loop {
             cx.background_executor().timer(EVENT_POLL_INTERVAL).await;
-            let pending_cmd = match window_handle.update(cx, |app, window, cx| app.tick(window, cx)) {
-                Ok(cmd) => cmd,
-                Err(_) => break,
-            };
-            if let Some(cmd) = pending_cmd {
+            let (main_cmd, badge_state, badge_cmd) =
+                match window_handle.update(cx, |app, window, cx| {
+                    let main_cmd = app.tick(window, cx);
+                    let (badge_state, badge_cmd) = if badge_window_handle.is_some() {
+                        app.build_lobby_badge_sync(badge_hwnd_raw)
+                    } else {
+                        (LobbyBadgeState::default(), None)
+                    };
+                    (main_cmd, badge_state, badge_cmd)
+                }) {
+                    Ok(tuple) => tuple,
+                    Err(_) => break,
+                };
+
+            if let Some(ref badge_handle) = badge_window_handle {
+                let _ = badge_handle.update(cx, |overlay, _window, cx| {
+                    overlay.update_state(badge_state, cx);
+                });
+            }
+
+            if let Some(cmd) = main_cmd {
                 if let Err(err) = win32::apply_window_command(cmd) {
                     warn!(error = %err, ?cmd.action, "failed to apply deferred Win32 window command");
                 }
@@ -118,6 +159,18 @@ fn main() {
                     .is_err()
                 {
                     break;
+                }
+            }
+
+            if let Some(cmd) = badge_cmd {
+                if let Err(err) = win32::apply_window_command(cmd) {
+                    warn!(error = %err, ?cmd.action, "failed to apply deferred client badge window command");
+                }
+                if let Some(ref badge_handle) = badge_window_handle {
+                    let _ = badge_handle.update(cx, |_overlay, window, cx| {
+                        window.refresh();
+                        cx.notify();
+                    });
                 }
             }
         })

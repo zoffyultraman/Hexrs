@@ -33,6 +33,7 @@ pub enum Win32WindowAction {
     Hide,
     Diagnostics,
     LobbyDock(Option<WindowRectInfo>),
+    ClientBadgeOverlay(Option<WindowRectInfo>),
     InGameOverlay {
         target_rect: Option<WindowRectInfo>,
         corner: OverlayCorner,
@@ -214,6 +215,21 @@ mod imp {
     /// Extracts the raw Win32 `HWND` handle value for deferred window commands.
     pub fn window_hwnd_raw(window: &Window) -> Result<isize> {
         extract_hwnd(window).map(|hwnd| hwnd.0 as isize)
+    }
+
+    /// Returns the live DPI scale factor for `hwnd_raw`, falling back to `fallback` if unavailable.
+    pub fn window_scale_for_hwnd(hwnd_raw: isize, fallback: f32) -> f32 {
+        if hwnd_raw == 0 {
+            return fallback;
+        }
+        let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+        // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        if dpi > 0 {
+            dpi as f32 / 96.0
+        } else {
+            fallback
+        }
     }
 
     unsafe fn inspect_window_rect(hwnd: HWND, min_w: i32, min_h: i32) -> Option<WindowRectInfo> {
@@ -567,6 +583,9 @@ mod imp {
             Win32WindowAction::LobbyDock(target_rect) => {
                 set_lobby_dock_mode_hwnd(hwnd, target_rect)
             }
+            Win32WindowAction::ClientBadgeOverlay(target_rect) => {
+                set_client_badge_overlay_hwnd(hwnd, target_rect)
+            }
             Win32WindowAction::InGameOverlay {
                 target_rect,
                 corner,
@@ -669,6 +688,38 @@ mod imp {
                 SWP_NOACTIVATE | SWP_FRAMECHANGED,
             )
             .context("SetWindowPos(in-game augment bar) failed")?;
+
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+
+        Ok(())
+    }
+
+    /// Anchors a permanently click-through overlay window directly over `LeagueClientUx.exe`.
+    fn set_client_badge_overlay_hwnd(
+        hwnd: HWND,
+        target_rect: Option<WindowRectInfo>,
+    ) -> Result<()> {
+        // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
+        unsafe {
+            apply_transparent_ex_style(hwnd, false);
+
+            let Some(target) = target_rect else {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return Ok(());
+            };
+
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                target.left,
+                target.top,
+                target.width().max(100),
+                target.height().max(100),
+                SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            .context("SetWindowPos(client badge overlay) failed")?;
 
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -877,6 +928,11 @@ mod imp {
         Ok(0)
     }
 
+    /// Non-Windows stub for `window_scale_for_hwnd`.
+    pub fn window_scale_for_hwnd(_hwnd_raw: isize, fallback: f32) -> f32 {
+        fallback
+    }
+
     /// Non-Windows stub for `apply_window_command`.
     pub fn apply_window_command(_cmd: Win32WindowCommand) -> Result<()> {
         Ok(())
@@ -954,5 +1010,5 @@ mod imp {
 pub use imp::{
     apply_window_command, default_preview_game_rect, default_preview_lobby_rect,
     find_league_game_window, find_league_lobby_window, open_data_directory, open_log_file,
-    relaunch_as_administrator, window_hwnd_raw,
+    relaunch_as_administrator, window_hwnd_raw, window_scale_for_hwnd,
 };

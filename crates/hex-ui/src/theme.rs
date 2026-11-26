@@ -161,6 +161,12 @@ pub fn tier_palette(tier: HeroTier) -> TierPalette {
     }
 }
 
+/// Returns `(background, border, text)` colors matching `tier_badge(tier)`.
+pub fn tier_colors(tier: HeroTier) -> (Rgba, Rgba, Rgba) {
+    let pal = tier_palette(tier);
+    (pal.bg, pal.border, pal.text)
+}
+
 /// Renders a compact `S+`..`D` tier badge chip.
 pub fn tier_badge(tier: HeroTier) -> Div {
     let pal = tier_palette(tier);
