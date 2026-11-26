@@ -81,11 +81,18 @@ impl IconCache {
 
             if png_bytes.is_none() {
                 if let Some(alias_name) = alias_owned.as_deref() {
-                    let ver = resolve_dd_version(&http, &state).await;
-                    let dd_url = format!(
-                        "https://ddragon.leagueoflegends.com/cdn/{ver}/img/champion/{alias_name}.png"
+                    let tencent_url = format!(
+                        "https://game.gtimg.cn/images/lol/act/img/champion/{alias_name}.png"
                     );
-                    png_bytes = fetch_png_bytes(&http, &dd_url).await;
+                    png_bytes = fetch_png_bytes(&http, &tencent_url).await;
+
+                    if png_bytes.is_none() {
+                        let ver = resolve_dd_version(&http, &state).await;
+                        let dd_url = format!(
+                            "https://ddragon.leagueoflegends.com/cdn/{ver}/img/champion/{alias_name}.png"
+                        );
+                        png_bytes = fetch_png_bytes(&http, &dd_url).await;
+                    }
                 }
             }
 
@@ -112,6 +119,12 @@ impl IconCache {
         }
 
         self.spawn_icon_fetch(key, target, move |http, state| async move {
+            let tencent_url =
+                format!("https://game.gtimg.cn/images/lol/act/img/item/{item_id}.png");
+            if let Some(bytes) = fetch_png_bytes(&http, &tencent_url).await {
+                return Some(bytes);
+            }
+
             let ver = resolve_dd_version(&http, &state).await;
             let dd_url =
                 format!("https://ddragon.leagueoflegends.com/cdn/{ver}/img/item/{item_id}.png");

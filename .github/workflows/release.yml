@@ -27,18 +27,17 @@ jobs:
           cache-dependency-path: scripts/requirements.txt
 
       - name: Install Python dependencies
-        continue-on-error: true
         run: python -m pip install -r scripts/requirements.txt
 
-      - name: Bundle CDragon meta.db.zst
+      - name: Bundle aramhex+CDragon meta.db.zst
         shell: pwsh
-        continue-on-error: true
         run: |
+          $ErrorActionPreference = "Stop"
           New-Item -ItemType Directory -Force -Path dist, crates/hex-data/assets | Out-Null
           python scripts/fetch_cdragon.py --output dist/cdragon_meta.json
-          if ($LASTEXITCODE -eq 0) {
-            python scripts/calc_meta.py --input dist/cdragon_meta.json --out-dir crates/hex-data/assets
-          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/calc_meta.py --input dist/cdragon_meta.json --out-dir crates/hex-data/assets
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

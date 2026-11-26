@@ -163,6 +163,14 @@ pub struct AugmentHashEntry {
     pub phash: u64,
 }
 
+/// Augment display metadata entry returned by `MetaEngine::list_augment_names`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AugmentNameEntry {
+    pub augment_id: i32,
+    pub name_zh: String,
+    pub rarity: String,
+}
+
 /// Thread-safe in-memory SQLite engine serving sub-millisecond meta queries.
 pub struct MetaEngine {
     conn: Mutex<Connection>,
@@ -187,7 +195,26 @@ impl MetaEngine {
             let aug_count: i64 = check_conn
                 .query_row("SELECT COUNT(*) FROM augment_meta", [], |row| row.get(0))
                 .unwrap_or(0);
-            hero_count == 0 || (cfg!(has_bundled_meta_db) && aug_count < 100)
+            let data_version: String = check_conn
+                .query_row(
+                    "SELECT value FROM meta_info WHERE key = 'data_version'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or_default();
+            let builds_hero_count: i64 = check_conn
+                .query_row(
+                    "SELECT COUNT(DISTINCT hero_id) FROM hero_builds",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+
+            hero_count == 0
+                || (cfg!(has_bundled_meta_db)
+                    && (aug_count < 100
+                        || !data_version.starts_with("aramhex-")
+                        || builds_hero_count < 100))
         };
 
         if needs_init {
@@ -216,6 +243,47 @@ impl MetaEngine {
             .query_row("SELECT COUNT(*) FROM augment_meta", [], |row| row.get(0))
             .unwrap_or(0);
         (champs.max(0) as usize, augs.max(0) as usize)
+    }
+
+    /// Returns the `data_version` stored in `meta_info`, or empty string if missing.
+    pub fn data_version(&self) -> String {
+        let Ok(conn) = self.conn.lock() else {
+            return String::new();
+        };
+        conn.query_row(
+            "SELECT value FROM meta_info WHERE key = 'data_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+    }
+
+    /// Lists all non-empty augment names and rarities stored in `augment_meta`.
+    pub fn list_augment_names(&self) -> Vec<AugmentNameEntry> {
+        let Ok(conn) = self.conn.lock() else {
+            return Vec::new();
+        };
+        let Ok(mut stmt) = conn.prepare(
+            "SELECT augment_id, name_zh, rarity
+             FROM augment_meta
+             WHERE TRIM(name_zh) != ''
+             ORDER BY augment_id ASC",
+        ) else {
+            return Vec::new();
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            Ok(AugmentNameEntry {
+                augment_id: row.get(0)?,
+                name_zh: row.get(1)?,
+                rarity: row.get(2)?,
+            })
+        }) else {
+            return Vec::new();
+        };
+        rows.flatten().collect()
     }
 
     /// Loads an existing SQLite `meta.db` file read-only into an in-memory SQLite connection.
@@ -964,6 +1032,7 @@ fn query_hero_builds(
             win_rate,
             items: parse_core_items(&items_json, owned_item_ids),
         })
+        .filter(|plan| !plan.items.is_empty())
         .collect()
 }
 

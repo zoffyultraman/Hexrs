@@ -111,6 +111,10 @@ pub struct LiveGameState {
     pub level: u32,
     pub current_gold: f64,
     pub owned_item_ids: Vec<i32>,
+    #[serde(default)]
+    pub is_dead: bool,
+    #[serde(default)]
+    pub respawn_timer: f64,
 }
 
 /// Strictly anonymized end-of-game participant record (zero PII: no names, PUUIDs, or Riot IDs).

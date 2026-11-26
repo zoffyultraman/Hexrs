@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compute Bayesian smoothed win rates + Synergy Lift, build SQLite meta.db, compress via Zstd, and emit manifest.json."""
+"""Merge aramhex-data + CommunityDragon metadata, apply Bayesian smoothing, build meta.db, compress meta.db.zst, and emit manifest.json."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import requests
 import zstandard as zstd
 
 SCHEMA_VERSION = "1"
@@ -19,6 +20,20 @@ PRIOR_WEIGHT_C = 50.0
 BASE_WIN_RATE = 0.50
 MIN_SYNERGY_SAMPLES = 30
 MIN_SYNERGY_LIFT = 1.15
+DEFAULT_ARAMHEX_BASE_URL = "https://raw.githubusercontent.com/czgreat/aramhex-data/main"
+
+AD_ITEM_TYPES = {
+    "Damage",
+    "AttackDamage",
+    "CriticalStrike",
+    "AttackSpeed",
+    "ArmorPenetration",
+    "OnHit",
+    "LifeSteal",
+}
+AP_ITEM_TYPES = {"SpellDamage", "Mana", "MagicPenetration"}
+TANK_ITEM_TYPES = {"Health", "Armor", "SpellBlock"}
+CC_ITEM_TYPES = {"Slow", "Aura"}
 
 DEFAULT_ROI_MANIFEST: dict[str, Any] = {
     "version": "1.0.0",
@@ -111,7 +126,6 @@ BASELINE_DUO_SYNERGIES: list[tuple[int, int, float, float, int]] = [
     (54, 777, 57.8, 1.21, 315),
 ]
 
-# Curated marquee augments matched by Chinese name against CDragon metadata.
 CURATED_AUGMENTS_BY_NAME: dict[str, float] = {
     "珠光护手": 58.6,
     "双刀流": 58.9,
@@ -152,6 +166,14 @@ CURATED_AUGMENT_SYNERGIES_BY_NAME: list[tuple[str, str, float, int]] = [
     ("地震", "冰霜幽灵", 1.18, 165),
 ]
 
+FALLBACK_ITEM_NAMES: dict[int, str] = {
+    3031: "无尽之刃",
+    3053: "斯特拉克的挑战护手",
+    3078: "三相之力",
+    3153: "破败王者之刃",
+    6333: "死亡之舞",
+}
+
 
 def bayesian_smoothed_win_rate(
     wins: float, games: float, base_rate: float = BASE_WIN_RATE, prior_c: float = PRIOR_WEIGHT_C
@@ -163,16 +185,30 @@ def bayesian_smoothed_win_rate(
     return (wins + prior_c * base_rate) / denom
 
 
-def tier_from_win_rate_pct(win_rate_pct: float) -> str:
-    if win_rate_pct >= 57.0:
+def hero_tier_from_wr_pct(win_rate_pct: float) -> str:
+    if win_rate_pct >= 54.0:
         return "S+"
-    if win_rate_pct >= 54.5:
+    if win_rate_pct >= 52.0:
         return "S"
-    if win_rate_pct >= 52.5:
+    if win_rate_pct >= 50.5:
         return "A"
-    if win_rate_pct >= 50.0:
+    if win_rate_pct >= 48.5:
         return "B"
-    if win_rate_pct >= 47.5:
+    if win_rate_pct >= 46.5:
+        return "C"
+    return "D"
+
+
+def aug_tier_from_wr_pct(win_rate_pct: float) -> str:
+    if win_rate_pct >= 55.0:
+        return "S+"
+    if win_rate_pct >= 52.5:
+        return "S"
+    if win_rate_pct >= 50.5:
+        return "A"
+    if win_rate_pct >= 48.5:
+        return "B"
+    if win_rate_pct >= 46.5:
         return "C"
     return "D"
 
@@ -186,33 +222,137 @@ def normalize_rarity_zh(raw: str) -> str:
     return "白银"
 
 
+def _normalize_name_key(raw: str) -> str:
+    return "".join(ch for ch in str(raw or "").strip().lower() if not ch.isspace())
+
+
+def fetch_aramhex_data(aramhex_base_url: str) -> dict[str, Any]:
+    """Downloads latest patch statistics and metadata from czgreat/aramhex-data."""
+    base = aramhex_base_url.rstrip("/")
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Hexrs-MetaUpdater/1.0"})
+
+    latest_resp = session.get(f"{base}/latest.json", timeout=30)
+    latest_resp.raise_for_status()
+    latest = latest_resp.json()
+
+    patch = str(latest.get("patch") or "unknown").strip()
+    rel_path = str(latest.get("path") or "").strip("/")
+    if not rel_path:
+        raise ValueError("aramhex latest.json missing 'path'")
+
+    bundle: dict[str, Any] = {"patch": patch}
+    for key, filename in [
+        ("heroes", "heroes.json"),
+        ("augments", "augments.json"),
+        ("hero_augments", "hero_augments.json"),
+        ("core_builds", "core_builds.json"),
+        ("item_metadata", "item_metadata.json"),
+    ]:
+        url = f"{base}/{rel_path}/{filename}"
+        resp = session.get(url, timeout=45)
+        resp.raise_for_status()
+        bundle[key] = resp.json()
+
+    return bundle
+
+
 def _deterministic_baseline_hero_stats(hero_id: int) -> tuple[str, float, float]:
-    """Generates deterministic Bayesian-smoothed baseline stats in [47.5, 58.0] for any champion."""
     h = int(hashlib.sha256(f"hero:{hero_id}".encode("utf-8")).hexdigest()[:8], 16)
     games = 140 + (h % 260)
-    raw_rate = 0.460 + ((h >> 8) % 135) / 1000.0
+    raw_rate = 0.460 + ((h >> 8) % 100) / 1000.0
     wins = raw_rate * games
-    wr_pct = round(max(47.5, min(58.0, bayesian_smoothed_win_rate(wins, games) * 100.0)), 1)
-    pick_rate = round(2.5 + ((h >> 16) % 95) / 10.0, 1)
-    return tier_from_win_rate_pct(wr_pct), wr_pct, pick_rate
+    wr_pct = round(max(46.0, min(55.0, bayesian_smoothed_win_rate(wins, games) * 100.0)), 1)
+    pick_rate = round(2.5 + ((h >> 16) % 95) / 10.0, 2)
+    return hero_tier_from_wr_pct(wr_pct), wr_pct, pick_rate
 
 
 def _deterministic_baseline_aug_stats(
     aug_id: int, name_zh: str, rarity: str
 ) -> tuple[str, float, float]:
-    """Generates deterministic Bayesian-smoothed baseline stats in [47.5, 58.0] for any augment."""
     if name_zh in CURATED_AUGMENTS_BY_NAME:
         wr_pct = CURATED_AUGMENTS_BY_NAME[name_zh]
-        return tier_from_win_rate_pct(wr_pct), wr_pct, 14.0
+        return aug_tier_from_wr_pct(wr_pct), wr_pct, 14.0
 
     h = int(hashlib.sha256(f"aug:{aug_id}".encode("utf-8")).hexdigest()[:8], 16)
-    rarity_offset = {"棱彩": 0.045, "黄金": 0.015, "白银": -0.015}.get(rarity, 0.0)
+    rarity_offset = {"棱彩": 0.040, "黄金": 0.015, "白银": -0.015}.get(rarity, 0.0)
     games = 120 + (h % 240)
     raw_rate = 0.475 + rarity_offset + ((h >> 8) % 85) / 1000.0
     wins = raw_rate * games
-    wr_pct = round(max(47.5, min(58.0, bayesian_smoothed_win_rate(wins, games) * 100.0)), 1)
+    wr_pct = round(max(46.5, min(56.5, bayesian_smoothed_win_rate(wins, games) * 100.0)), 1)
     pick_rate = round(4.0 + ((h >> 16) % 130) / 10.0, 1)
-    return tier_from_win_rate_pct(wr_pct), wr_pct, pick_rate
+    return aug_tier_from_wr_pct(wr_pct), wr_pct, pick_rate
+
+
+def _infer_hero_attributes_from_builds(
+    builds: list[dict[str, Any]],
+    item_metadata: dict[str, Any],
+) -> tuple[float, float, float, float]:
+    ad_hits = 0.0
+    ap_hits = 0.0
+    tank_hits = 0.0
+    cc_hits = 0.0
+    total_items = 0
+
+    for b in builds[:3]:
+        for raw_item_id in b.get("items", []):
+            meta = item_metadata.get(str(raw_item_id))
+            if not isinstance(meta, dict):
+                continue
+            types = set(meta.get("types") or [])
+            total_items += 1
+            if types & AD_ITEM_TYPES:
+                ad_hits += 1.0
+            if types & AP_ITEM_TYPES:
+                ap_hits += 1.0
+            if types & TANK_ITEM_TYPES:
+                tank_hits += 1.0
+            if types & CC_ITEM_TYPES:
+                cc_hits += 1.0
+
+    if total_items == 0:
+        return (0.50, 0.50, 0.35, 0.35)
+
+    dmg_total = ad_hits + ap_hits
+    if dmg_total > 0.0:
+        ad_w = round(ad_hits / dmg_total, 2)
+        ap_w = round(ap_hits / dmg_total, 2)
+    else:
+        ad_w, ap_w = (0.35, 0.35)
+
+    tank_score = round(min(0.95, 0.10 + (tank_hits / total_items) * 1.15), 2)
+    cc_score = round(min(0.85, 0.25 + (cc_hits / total_items) * 0.65), 2)
+    return (ad_w, ap_w, tank_score, cc_score)
+
+
+def _infer_build_tag(
+    idx: int, item_ids: list[int], item_metadata: dict[str, Any]
+) -> str:
+    base_labels = ["高胜三件套", "热门三件套", "备选三件套"]
+    base = base_labels[idx] if idx < len(base_labels) else "核心三件套"
+
+    ad_cnt = 0
+    ap_cnt = 0
+    tank_cnt = 0
+    for item_id in item_ids:
+        meta = item_metadata.get(str(item_id))
+        if not isinstance(meta, dict):
+            continue
+        types = set(meta.get("types") or [])
+        if types & AD_ITEM_TYPES:
+            ad_cnt += 1
+        if types & AP_ITEM_TYPES:
+            ap_cnt += 1
+        if types & TANK_ITEM_TYPES:
+            tank_cnt += 1
+
+    if tank_cnt >= 2 and tank_cnt >= ad_cnt and tank_cnt >= ap_cnt:
+        return f"重装{base}"
+    if ap_cnt > ad_cnt:
+        return f"法强{base}"
+    if ad_cnt > ap_cnt:
+        return f"物理{base}"
+    return base
 
 
 def init_sqlite_schema(conn: sqlite3.Connection, data_version: str) -> None:
@@ -310,6 +450,7 @@ def init_sqlite_schema(conn: sqlite3.Connection, data_version: str) -> None:
 
 def build_meta_database(
     cdragon_meta: dict[str, Any],
+    aramhex_data: dict[str, Any] | None,
     samples: list[dict[str, Any]],
     db_out: Path,
     data_version: str,
@@ -317,11 +458,39 @@ def build_meta_database(
     if db_out.exists():
         db_out.unlink()
 
-    item_names = {int(it["id"]): str(it["name_zh"]) for it in cdragon_meta.get("items", [])}
-    champions = cdragon_meta.get("champions", [])
-    augments = cdragon_meta.get("augments", [])
+    cdragon_items = {int(it["id"]): str(it["name_zh"]) for it in cdragon_meta.get("items", [])}
+    cdragon_champs = {
+        int(ch["hero_id"]): ch for ch in cdragon_meta.get("champions", []) if int(ch.get("hero_id", 0)) > 0
+    }
+    cdragon_augs = {
+        int(a["augment_id"]): a
+        for a in cdragon_meta.get("augments", [])
+        if int(a.get("augment_id", 0)) > 0
+    }
+    cdragon_augs_by_name: dict[str, dict[str, Any]] = {}
+    for aug in cdragon_augs.values():
+        key = _normalize_name_key(aug.get("name_zh", ""))
+        if key and key not in cdragon_augs_by_name:
+            cdragon_augs_by_name[key] = aug
 
-    hero_counts: dict[int, list[int]] = defaultdict(lambda: [0, 0])  # [wins, games]
+    aramhex_heroes: dict[str, Any] = (aramhex_data or {}).get("heroes", {})
+    aramhex_augments: dict[str, Any] = (aramhex_data or {}).get("augments", {})
+    aramhex_hero_augs: dict[str, Any] = (aramhex_data or {}).get("hero_augments", {})
+    aramhex_core_builds: dict[str, Any] = (aramhex_data or {}).get("core_builds", {})
+    aramhex_item_meta: dict[str, Any] = (aramhex_data or {}).get("item_metadata", {})
+
+    def resolve_item_name(item_id: int) -> str:
+        meta = aramhex_item_meta.get(str(item_id))
+        if isinstance(meta, dict):
+            name = str(meta.get("name") or "").strip()
+            if name:
+                return name
+        cd_name = cdragon_items.get(item_id, "").strip()
+        if cd_name:
+            return cd_name
+        return FALLBACK_ITEM_NAMES.get(item_id, "核心装备")
+
+    hero_counts: dict[int, list[int]] = defaultdict(lambda: [0, 0])
     hero_aug_counts: dict[tuple[int, int], list[int]] = defaultdict(lambda: [0, 0])
     aug_pair_counts: dict[tuple[int, int, int], list[int]] = defaultdict(lambda: [0, 0])
     hero_item_builds: dict[tuple[int, tuple[int, int, int]], list[int]] = defaultdict(
@@ -354,52 +523,127 @@ def build_meta_database(
                 hero_item_builds[key][0] += win
                 hero_item_builds[key][1] += 1
 
+    all_hero_ids = sorted(
+        set(cdragon_champs.keys())
+        | {int(k) for k in aramhex_heroes.keys() if k.isdigit() and int(k) > 0}
+    )
+
     conn = sqlite3.connect(db_out)
     try:
         init_sqlite_schema(conn, data_version)
 
-        for champ in champions:
-            hero_id = int(champ["hero_id"])
+        hero_base_wr_map: dict[int, float] = {}
+        hero_games_map: dict[int, int] = {}
+
+        for hero_id in all_hero_ids:
+            cd_champ = cdragon_champs.get(hero_id, {})
+            ah_champ = aramhex_heroes.get(str(hero_id), {})
+
+            name_zh = str(ah_champ.get("name") or cd_champ.get("name_zh") or f"英雄{hero_id}").strip()
+            title_zh = str(ah_champ.get("title") or cd_champ.get("title_zh") or "").strip()
+            alias = str(cd_champ.get("alias") or f"Hero{hero_id}").strip()
+
             conn.execute(
                 "INSERT OR REPLACE INTO champions (hero_id, name_zh, title_zh, alias) VALUES (?, ?, ?, ?)",
-                (hero_id, champ["name_zh"], champ["title_zh"], champ["alias"]),
+                (hero_id, name_zh, title_zh, alias),
             )
 
-            wins, games = hero_counts.get(hero_id, [0, 0])
+            sample_w, sample_g = hero_counts.get(hero_id, [0, 0])
+            ah_games = int(ah_champ.get("games") or 0)
+            ah_wins = int(ah_champ.get("wins") or 0)
             arch = BASELINE_HERO_ARCHETYPES.get(hero_id)
-            if games > 0:
-                wr_pct = round(bayesian_smoothed_win_rate(wins, games) * 100.0, 1)
-                pick_rate = round((games / max(total_participant_games, 1)) * 100.0, 2)
-                tier = tier_from_win_rate_pct(wr_pct)
+            hero_builds_raw = aramhex_core_builds.get(str(hero_id), [])
+            if not isinstance(hero_builds_raw, list):
+                hero_builds_raw = []
+
+            if sample_g > 0:
+                wr_ratio = bayesian_smoothed_win_rate(sample_w, sample_g)
+                wr_pct = round(wr_ratio * 100.0, 1)
+                pick_rate = round((sample_g / max(total_participant_games, 1)) * 100.0, 2)
+                tier = hero_tier_from_wr_pct(wr_pct)
+                hero_games_map[hero_id] = sample_g
+            elif ah_games > 0:
+                wr_ratio = bayesian_smoothed_win_rate(ah_wins, ah_games)
+                wr_pct = round(wr_ratio * 100.0, 1)
+                pick_rate = round(float(ah_champ.get("pick_rate") or 0.0) * 100.0, 2)
+                tier = hero_tier_from_wr_pct(wr_pct)
+                hero_games_map[hero_id] = ah_games
             elif arch is not None:
                 tier = arch[0]
-                wr_pct = {"S+": 57.2, "S": 55.2, "A": 53.0, "B": 50.8}.get(tier, 50.5)
+                wr_pct = {"S+": 54.8, "S": 53.0, "A": 51.2, "B": 49.5}.get(tier, 49.5)
+                wr_ratio = wr_pct / 100.0
                 pick_rate = 8.0
+                hero_games_map[hero_id] = 100
             else:
                 tier, wr_pct, pick_rate = _deterministic_baseline_hero_stats(hero_id)
+                wr_ratio = wr_pct / 100.0
+                hero_games_map[hero_id] = 100
 
-            tag_str = json.dumps([arch[5]] if arch else ["均衡流"], ensure_ascii=False)
+            hero_base_wr_map[hero_id] = wr_ratio
+
+            if arch is not None:
+                ad_w, ap_w, tank_s, cc_s = (arch[1], arch[2], arch[3], arch[4])
+                tags_list = [arch[5]]
+            else:
+                ad_w, ap_w, tank_s, cc_s = _infer_hero_attributes_from_builds(
+                    hero_builds_raw, aramhex_item_meta
+                )
+                if tank_s >= 0.65:
+                    tags_list = ["前排承伤"]
+                elif ap_w >= 0.65:
+                    tags_list = ["法术输出"]
+                elif ad_w >= 0.65:
+                    tags_list = ["物理输出"]
+                else:
+                    tags_list = ["均衡流"]
+
             conn.execute(
                 "INSERT OR REPLACE INTO hero_tier_stats (hero_id, tier, win_rate, pick_rate, tags) VALUES (?, ?, ?, ?, ?)",
-                (hero_id, tier, wr_pct, pick_rate, tag_str),
-            )
-
-            ad_w, ap_w, tank_s, cc_s = (
-                (arch[1], arch[2], arch[3], arch[4]) if arch else (0.50, 0.50, 0.35, 0.35)
+                (hero_id, tier, wr_pct, pick_rate, json.dumps(tags_list, ensure_ascii=False)),
             )
             conn.execute(
                 "INSERT OR REPLACE INTO hero_attributes (hero_id, ad_weight, ap_weight, tank_score, cc_score) VALUES (?, ?, ?, ?, ?)",
                 (hero_id, ad_w, ap_w, tank_s, cc_s),
             )
 
-            if arch is not None:
+            # Insert up to 3 builds from aramhex core_builds.json sorted by (win, games) descending.
+            inserted_builds = 0
+            sorted_builds = sorted(
+                [b for b in hero_builds_raw if isinstance(b, dict)],
+                key=lambda b: (float(b.get("win") or 0.0), int(b.get("games") or 0)),
+                reverse=True,
+            )
+            for b in sorted_builds:
+                if inserted_builds >= 3:
+                    break
+                parsed_ids = [
+                    int(x) for x in (b.get("items") or []) if str(x).isdigit() and int(x) > 0
+                ]
+                if not parsed_ids:
+                    continue
                 items_payload = [
-                    {"id": item_id, "name_zh": item_names.get(item_id, "核心装备")}
-                    for item_id in arch[6]
+                    {"id": item_id, "name_zh": resolve_item_name(item_id)}
+                    for item_id in parsed_ids[:3]
+                ]
+                build_wr = round(float(b.get("win") or wr_ratio) * 100.0, 1)
+                tag = _infer_build_tag(inserted_builds, parsed_ids, aramhex_item_meta)
+                conn.execute(
+                    "INSERT INTO hero_builds (hero_id, playstyle_tag, core_items_json, win_rate) VALUES (?, ?, ?, ?)",
+                    (hero_id, tag, json.dumps(items_payload, ensure_ascii=False), build_wr),
+                )
+                inserted_builds += 1
+
+            # Ensure zero heroes have empty/missing hero_builds.
+            if inserted_builds == 0:
+                fallback_ids = arch[6] if arch is not None else [3078, 3053, 6333]
+                fallback_tag = arch[5] if arch is not None else "通用推荐"
+                items_payload = [
+                    {"id": item_id, "name_zh": resolve_item_name(item_id)}
+                    for item_id in fallback_ids
                 ]
                 conn.execute(
                     "INSERT INTO hero_builds (hero_id, playstyle_tag, core_items_json, win_rate) VALUES (?, ?, ?, ?)",
-                    (hero_id, arch[5], json.dumps(items_payload, ensure_ascii=False), wr_pct),
+                    (hero_id, fallback_tag, json.dumps(items_payload, ensure_ascii=False), wr_pct),
                 )
 
         for (hero_id, item_tuple), (w, g) in hero_item_builds.items():
@@ -407,7 +651,7 @@ def build_meta_database(
                 continue
             wr_pct = round(bayesian_smoothed_win_rate(w, g) * 100.0, 1)
             items_payload = [
-                {"id": item_id, "name_zh": item_names.get(item_id, "核心装备")}
+                {"id": item_id, "name_zh": resolve_item_name(item_id)}
                 for item_id in item_tuple
             ]
             conn.execute(
@@ -415,38 +659,79 @@ def build_meta_database(
                 (hero_id, "热门核心流", json.dumps(items_payload, ensure_ascii=False), wr_pct),
             )
 
+        # Union aramhex augments + CDragon augments
+        all_aug_ids = sorted(
+            set(cdragon_augs.keys())
+            | {int(k) for k in aramhex_augments.keys() if k.isdigit() and int(k) > 0}
+        )
+
+        # Aggregate weighted global stats from aramhex hero_augments
+        aug_global_counts: dict[int, list[int]] = defaultdict(lambda: [0, 0])  # [wins, games]
+        total_hero_games_sum = sum(hero_games_map.values()) or 1
+
+        for raw_hid, aug_map in aramhex_hero_augs.items():
+            if not raw_hid.isdigit() or not isinstance(aug_map, dict):
+                continue
+            hid = int(raw_hid)
+            hero_base_wr = hero_base_wr_map.get(hid, BASE_WIN_RATE)
+            hero_total_g = max(hero_games_map.get(hid, 1), 1)
+            for raw_aid, stat in aug_map.items():
+                if not raw_aid.isdigit() or not isinstance(stat, dict):
+                    continue
+                aid = int(raw_aid)
+                g = int(stat.get("games") or 0)
+                w = int(stat.get("wins") or 0)
+                if g <= 0:
+                    continue
+                aug_global_counts[aid][0] += w
+                aug_global_counts[aid][1] += g
+                wr = bayesian_smoothed_win_rate(w, g, base_rate=hero_base_wr)
+                wr_pct = round(wr * 100.0, 1)
+                pick_rate = round((g / hero_total_g) * 100.0, 1)
+                conn.execute(
+                    "INSERT OR REPLACE INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate) VALUES (?, ?, ?, ?, ?)",
+                    (hid, aid, aug_tier_from_wr_pct(wr_pct), wr_pct, pick_rate),
+                )
+
         aug_id_by_name: dict[str, int] = {}
-        aug_stats_list: list[tuple[int, str, float, float]] = []
-        for aug in augments:
-            aug_id = int(aug["augment_id"])
-            name_zh = str(aug["name_zh"] or "").strip()
-            rarity = normalize_rarity_zh(aug.get("rarity", ""))
-            phash = str(aug.get("phash") or "0000000000000000")
-            desc_zh = str(aug.get("desc_zh") or "").strip()
+        for aug_id in all_aug_ids:
+            ah_aug = aramhex_augments.get(str(aug_id), {})
+            cd_aug = cdragon_augs.get(aug_id)
+
+            ah_name = str(ah_aug.get("name") or "").strip()
+            cd_name = str((cd_aug or {}).get("name_zh") or "").strip()
+            name_zh = ah_name or cd_name
+
+            if cd_aug is None and name_zh:
+                cd_aug = cdragon_augs_by_name.get(_normalize_name_key(name_zh))
+
+            raw_rarity = ah_aug.get("rarity") or (cd_aug or {}).get("rarity") or ""
+            rarity = normalize_rarity_zh(raw_rarity)
+            phash = str((cd_aug or {}).get("phash") or "0000000000000000")
+            desc_zh = str((cd_aug or {}).get("desc_zh") or "").strip()
 
             conn.execute(
                 "INSERT OR REPLACE INTO augment_meta (augment_id, name_zh, rarity, phash, desc_zh) VALUES (?, ?, ?, ?, ?)",
                 (aug_id, name_zh, rarity, phash, desc_zh),
             )
-            if name_zh and name_zh not in aug_id_by_name:
-                aug_id_by_name[name_zh] = aug_id
+            if name_zh:
+                norm_key = _normalize_name_key(name_zh)
+                if norm_key not in aug_id_by_name:
+                    aug_id_by_name[norm_key] = aug_id
 
-            tier, wr_pct, pick_rate = _deterministic_baseline_aug_stats(aug_id, name_zh, rarity)
-            aug_stats_list.append((aug_id, tier, wr_pct, pick_rate))
-            # Store hero_id = 0 baseline so MetaEngine::evaluate_augment_offer AVG() has stats for all ~600 augments.
+            gw, gg = aug_global_counts.get(aug_id, [0, 0])
+            if gg > 0:
+                wr = bayesian_smoothed_win_rate(gw, gg, base_rate=BASE_WIN_RATE)
+                wr_pct = round(wr * 100.0, 1)
+                pick_rate = round((gg / total_hero_games_sum) * 100.0, 2)
+                tier = aug_tier_from_wr_pct(wr_pct)
+            else:
+                tier, wr_pct, pick_rate = _deterministic_baseline_aug_stats(aug_id, name_zh, rarity)
+
             conn.execute(
                 "INSERT OR REPLACE INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate) VALUES (?, ?, ?, ?, ?)",
                 (0, aug_id, tier, wr_pct, pick_rate),
             )
-
-        # Populate top 3 curated augments for each curated hero preview
-        top_curated_augs = sorted(aug_stats_list, key=lambda x: x[2], reverse=True)[:5]
-        for hero_id in BASELINE_HERO_ARCHETYPES:
-            for aug_id, tier, wr_pct, pick_rate in top_curated_augs:
-                conn.execute(
-                    "INSERT OR REPLACE INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate) VALUES (?, ?, ?, ?, ?)",
-                    (hero_id, aug_id, tier, wr_pct, pick_rate),
-                )
 
         # Overlay real crowdsourced sample stats if provided
         for (hero_id, aug_id), (w, g) in hero_aug_counts.items():
@@ -457,12 +742,12 @@ def build_meta_database(
             pick_rate = round((g / max(hg, 1)) * 100.0, 1)
             conn.execute(
                 "INSERT OR REPLACE INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate) VALUES (?, ?, ?, ?, ?)",
-                (hero_id, aug_id, tier_from_win_rate_pct(wr_pct), wr_pct, pick_rate),
+                (hero_id, aug_id, aug_tier_from_wr_pct(wr_pct), wr_pct, pick_rate),
             )
 
         for name_a, name_b, lift, n in CURATED_AUGMENT_SYNERGIES_BY_NAME:
-            id_a = aug_id_by_name.get(name_a)
-            id_b = aug_id_by_name.get(name_b)
+            id_a = aug_id_by_name.get(_normalize_name_key(name_a))
+            id_b = aug_id_by_name.get(_normalize_name_key(name_b))
             if id_a and id_b and id_a != id_b:
                 lo, hi = (id_a, id_b) if id_a <= id_b else (id_b, id_a)
                 conn.execute(
@@ -540,6 +825,17 @@ def main() -> None:
         help="Input CDragon metadata JSON from fetch_cdragon.py.",
     )
     parser.add_argument(
+        "--aramhex-url",
+        type=str,
+        default=DEFAULT_ARAMHEX_BASE_URL,
+        help="Base URL for czgreat/aramhex-data repository.",
+    )
+    parser.add_argument(
+        "--skip-aramhex",
+        action="store_true",
+        help="Skip downloading czgreat/aramhex-data.",
+    )
+    parser.add_argument(
         "--samples",
         type=Path,
         default=None,
@@ -554,8 +850,8 @@ def main() -> None:
     parser.add_argument(
         "--version",
         type=str,
-        default=f"cdragon-{datetime.now(timezone.utc).strftime('%Y%m%d')}",
-        help="Release version string for manifest.json.",
+        default=None,
+        help="Release version string for manifest.json and meta_info.data_version.",
     )
     parser.add_argument(
         "--db-url",
@@ -566,20 +862,32 @@ def main() -> None:
     args = parser.parse_args()
 
     cdragon_meta = json.loads(args.input.read_text(encoding="utf-8"))
+    aramhex_data: dict[str, Any] | None = None
+    if not args.skip_aramhex:
+        aramhex_data = fetch_aramhex_data(args.aramhex_url)
+
     samples: list[dict[str, Any]] = []
     if args.samples is not None and args.samples.exists():
         loaded = json.loads(args.samples.read_text(encoding="utf-8"))
         if isinstance(loaded, list):
             samples = loaded
 
+    today_str = datetime.now(timezone.utc).strftime("%Y%m%d")
+    if args.version:
+        version = args.version
+    elif aramhex_data is not None:
+        version = f"aramhex-{aramhex_data['patch']}-{today_str}"
+    else:
+        version = f"cdragon-{today_str}"
+
     args.out_dir.mkdir(parents=True, exist_ok=True)
     db_out = args.out_dir / "meta.db"
-    build_meta_database(cdragon_meta, samples, db_out, args.version)
+    build_meta_database(cdragon_meta, aramhex_data, samples, db_out, version)
     zst_path, manifest_path = compress_and_emit_manifest(
-        db_out, args.out_dir, args.version, args.db_url
+        db_out, args.out_dir, version, args.db_url
     )
     print(
-        f"Built {db_out} ({db_out.stat().st_size} bytes) -> "
+        f"Built {db_out} ({db_out.stat().st_size} bytes, version={version}) -> "
         f"{zst_path} ({zst_path.stat().st_size} bytes) & {manifest_path}"
     )
 

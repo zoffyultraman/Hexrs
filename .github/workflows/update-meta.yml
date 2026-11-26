@@ -28,7 +28,7 @@ jobs:
       - name: Fetch CommunityDragon metadata and compute pHashes
         run: python scripts/fetch_cdragon.py --output dist/cdragon_meta.json
 
-      - name: Build meta.db.zst and manifest.json
+      - name: Build aramhex+CDragon meta.db.zst and manifest.json
         run: python scripts/calc_meta.py --input dist/cdragon_meta.json --out-dir dist
 
       - name: Upload meta artifacts

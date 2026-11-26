@@ -9,8 +9,8 @@ pub mod updater;
 
 pub use db::{
     bayesian_smoothed_win_rate, data_dir, db_path, AugmentEvaluation, AugmentHashEntry,
-    BenchHighlight, BuildItemInfo, DynamicBuildPlan, HeroPreview, HeroStats, MetaEngine,
-    SynergyAlert, SynergyRecommendation, TeamDiagnosis, TeamRecommendations,
+    AugmentNameEntry, BenchHighlight, BuildItemInfo, DynamicBuildPlan, HeroPreview, HeroStats,
+    MetaEngine, SynergyAlert, SynergyRecommendation, TeamDiagnosis, TeamRecommendations,
 };
 pub use icons::IconCache;
 pub use reporter::{EogReporter, ReporterConfig};

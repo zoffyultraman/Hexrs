@@ -76,6 +76,9 @@ fn into_live_game_state(raw: RawAllGameData) -> LiveGameState {
         })
         .unwrap_or_default();
 
+    let is_dead = matched_player.map(|p| p.is_dead).unwrap_or(false);
+    let respawn_timer = matched_player.map(|p| p.respawn_timer).unwrap_or(0.0);
+
     LiveGameState {
         game_mode: raw.game_data.game_mode,
         game_time_secs: raw.game_data.game_time,
@@ -84,6 +87,8 @@ fn into_live_game_state(raw: RawAllGameData) -> LiveGameState {
         level: raw.active_player.level,
         current_gold: raw.active_player.current_gold,
         owned_item_ids,
+        is_dead,
+        respawn_timer,
     }
 }
 
@@ -135,6 +140,10 @@ struct RawLivePlayer {
     riot_id: String,
     #[serde(rename = "riotIdGameName")]
     riot_id_game_name: String,
+    #[serde(rename = "isDead")]
+    is_dead: bool,
+    #[serde(rename = "respawnTimer")]
+    respawn_timer: f64,
     items: Vec<RawLiveItem>,
 }
 
