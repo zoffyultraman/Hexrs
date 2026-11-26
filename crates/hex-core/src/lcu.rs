@@ -29,6 +29,9 @@ use tokio_tungstenite::{connect_async_tls_with_config, Connector};
 use tracing::{debug, warn};
 
 use crate::models::{ChampSelectState, EndOfGameParticipant, EndOfGameStats, TeamSlot};
+use crate::player_rating::{
+    is_valid_kiwi_match, MatchFetchResult, NormalizedMatch, NormalizedParticipant,
+};
 
 const WAMP_EVENT_OPCODE: i64 = 8;
 const EVENT_CHAMP_SELECT: &str = "OnJsonApiEvent_lol-champ-select_v1_session";
@@ -194,6 +197,78 @@ impl LcuClient {
             .get_json::<RawEogStatsBlock>("/lol-end-of-game/v1/eog-stats-block")
             .await?;
         Ok(raw.map(into_eog_stats))
+    }
+
+    /// Queries `/entitlements/v1/token` for SGP Bearer access token.
+    pub async fn get_entitlements_token(&self) -> Result<Option<String>> {
+        let raw = self
+            .get_json::<serde_json::Value>("/entitlements/v1/token")
+            .await?;
+        Ok(raw.and_then(|val| {
+            val.get("accessToken")
+                .or_else(|| val.get("token"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        }))
+    }
+
+    /// Queries `/riotclient/region-locale` returning `(region, optional rso_platform_id/web_region)`.
+    pub async fn get_region_locale(&self) -> Result<Option<(String, Option<String>)>> {
+        let raw = self
+            .get_json::<serde_json::Value>("/riotclient/region-locale")
+            .await?;
+        Ok(raw.and_then(|val| {
+            let region = val
+                .get("region")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)?;
+            let rso = val
+                .get("rsoPlatformId")
+                .or_else(|| val.get("webRegion"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            Some((region, rso))
+        }))
+    }
+
+    /// Queries LCU `/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex=39`
+    /// as fallback when SGP is unavailable, filtering to up to 20 valid ARAM Mayhem (`KIWI`) matches.
+    pub async fn get_kiwi_matches_fallback(&self, puuid: &str) -> MatchFetchResult {
+        let path = format!("/lol-match-history/v1/products/lol/{puuid}/matches?begIndex=0&endIndex=39");
+        let resp = match self
+            .http
+            .get(self.rest_url(&path))
+            .header(AUTHORIZATION, &self.auth_header)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => return MatchFetchResult::Unavailable(format!("LCU match history error: {err}")),
+        };
+
+        let status = resp.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return MatchFetchResult::Private;
+        }
+        if status == StatusCode::NOT_FOUND {
+            return MatchFetchResult::Ok(Vec::new());
+        }
+        if !status.is_success() {
+            return MatchFetchResult::Unavailable(format!("LCU match history HTTP {status}"));
+        }
+
+        let val: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(err) => return MatchFetchResult::Unavailable(format!("LCU match history JSON error: {err}")),
+        };
+
+        MatchFetchResult::Ok(parse_lcu_matches_json(&val))
     }
 
     /// Maintains a reconnecting WebSocket subscription for champ select, gameflow phase, and EOG events until shutdown.
@@ -510,6 +585,7 @@ fn into_champ_select_state(raw: RawChampSelectSession) -> ChampSelectState {
                 champion_id: slot.champion_id,
                 pick_intent: slot.champion_pick_intent,
                 assigned_position: slot.assigned_position,
+                puuid: slot.puuid,
             }
         })
         .collect();
@@ -635,6 +711,124 @@ fn extract_numbered_stat_ids(
     ids
 }
 
+/// Parses LCU `/lol-match-history/v1/products/lol/{puuid}/matches` JSON into up to 20 valid `KIWI` matches.
+pub fn parse_lcu_matches_json(val: &serde_json::Value) -> Vec<NormalizedMatch> {
+    let Some(games) = val
+        .get("games")
+        .and_then(|g| g.get("games").or(Some(g)))
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
+
+    let mut parsed = Vec::new();
+    for game in games {
+        let Some(game_id) = game.get("gameId").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        let game_creation = game.get("gameCreation").and_then(|v| v.as_i64()).unwrap_or(0);
+        let game_duration = game.get("gameDuration").and_then(|v| v.as_u64()).unwrap_or(0);
+        let game_mode = game
+            .get("gameMode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let queue_id = game
+            .get("queueId")
+            .and_then(|v| v.as_i64())
+            .and_then(|v| i32::try_from(v).ok());
+
+        let mut id_to_puuid: HashMap<i64, String> = HashMap::new();
+        if let Some(identities) = game.get("participantIdentities").and_then(|v| v.as_array()) {
+            for ident in identities {
+                if let Some(pid) = ident.get("participantId").and_then(|v| v.as_i64()) {
+                    if let Some(puuid) = ident
+                        .get("player")
+                        .and_then(|pl| pl.get("puuid"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        id_to_puuid.insert(pid, puuid.to_owned());
+                    }
+                }
+            }
+        }
+
+        let mut participants = Vec::new();
+        if let Some(parts) = game.get("participants").and_then(|v| v.as_array()) {
+            for p in parts {
+                let puuid = p
+                    .get("puuid")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        p.get("participantId")
+                            .and_then(|v| v.as_i64())
+                            .and_then(|pid| id_to_puuid.get(&pid).cloned())
+                    })
+                    .unwrap_or_default();
+                if puuid.is_empty() {
+                    continue;
+                }
+                let stats = p.get("stats").unwrap_or(p);
+                participants.push(NormalizedParticipant {
+                    puuid,
+                    team_id: p
+                        .get("teamId")
+                        .and_then(|v| v.as_i64())
+                        .and_then(|v| i32::try_from(v).ok())
+                        .unwrap_or(0),
+                    win: stats.get("win").and_then(|v| v.as_bool()).unwrap_or(false),
+                    kills: stats.get("kills").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    deaths: stats.get("deaths").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    assists: stats.get("assists").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+                    damage_dealt: stats
+                        .get("totalDamageDealtToChampions")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    damage_taken: stats
+                        .get("totalDamageTaken")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    heals_on_teammates: stats
+                        .get("totalHealsOnTeammates")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    shielded_on_teammates: stats
+                        .get("totalDamageShieldedOnTeammates")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    gold_earned: stats
+                        .get("goldEarned")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                });
+            }
+        }
+
+        let normalized = NormalizedMatch {
+            game_id,
+            game_creation,
+            game_duration,
+            game_mode,
+            queue_id,
+            participants,
+        };
+        if is_valid_kiwi_match(&normalized) {
+            parsed.push(normalized);
+        }
+    }
+
+    parsed.sort_by(|a, b| {
+        b.game_creation
+            .cmp(&a.game_creation)
+            .then_with(|| b.game_id.cmp(&a.game_id))
+    });
+    parsed.truncate(20);
+    parsed
+}
+
 fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
 where
     T: Default + Deserialize<'de>,
@@ -694,6 +888,8 @@ struct RawTeamSlot {
     champion_pick_intent: i32,
     #[serde(rename = "assignedPosition", deserialize_with = "deserialize_null_default")]
     assigned_position: String,
+    #[serde(default, deserialize_with = "deserialize_null_default")]
+    puuid: String,
 }
 
 #[derive(Debug, Deserialize)]

@@ -85,6 +85,8 @@ pub struct TeamSlot {
     pub champion_id: i32,
     pub pick_intent: i32,
     pub assigned_position: String,
+    #[serde(default)]
+    pub puuid: String,
 }
 
 /// Snapshot of the current LCU champ select session.
@@ -249,11 +251,150 @@ pub struct AugmentOfferLayout {
     pub title_y: f32,
 }
 
+/// Fetch/analysis readiness state for a teammate's ARAM Mayhem rating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SummonerRatingStatus {
+    Loading,
+    Ready,
+    Private,
+    InsufficientSamples,
+}
+
+/// One score-to-title threshold rule in `RatingTitlesConfig`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RatingTierRule {
+    pub min_score: u8,
+    pub label: String,
+}
+
+/// Customizable title mapping for teammate ratings (`0..=100` composite score).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RatingTitlesConfig {
+    pub tiers: Vec<RatingTierRule>,
+    pub insufficient_samples: String,
+    pub private_profile: String,
+}
+
+impl Default for RatingTitlesConfig {
+    fn default() -> Self {
+        Self {
+            tiers: vec![
+                RatingTierRule {
+                    min_score: 85,
+                    label: "夯".to_owned(),
+                },
+                RatingTierRule {
+                    min_score: 72,
+                    label: "顶级".to_owned(),
+                },
+                RatingTierRule {
+                    min_score: 55,
+                    label: "人上人".to_owned(),
+                },
+                RatingTierRule {
+                    min_score: 40,
+                    label: "NPC".to_owned(),
+                },
+                RatingTierRule {
+                    min_score: 0,
+                    label: "拉完了".to_owned(),
+                },
+            ],
+            insufficient_samples: "样本少".to_owned(),
+            private_profile: "隐藏".to_owned(),
+        }
+    }
+}
+
+impl RatingTitlesConfig {
+    /// Resolves `(tier_index: 0..=4, label)` for a status and composite score.
+    pub fn resolve(&self, status: SummonerRatingStatus, score: u8) -> (u8, String) {
+        match status {
+            SummonerRatingStatus::Loading => (2, "查询中".to_owned()),
+            SummonerRatingStatus::Private => (4, self.private_profile.clone()),
+            SummonerRatingStatus::InsufficientSamples => (3, self.insufficient_samples.clone()),
+            SummonerRatingStatus::Ready => {
+                if self.tiers.is_empty() {
+                    return Self::default().resolve(status, score);
+                }
+                let mut sorted: Vec<&RatingTierRule> = self.tiers.iter().collect();
+                sorted.sort_by(|a, b| b.min_score.cmp(&a.min_score));
+                for (idx, rule) in sorted.iter().enumerate() {
+                    if score >= rule.min_score {
+                        return (idx.min(4) as u8, rule.label.clone());
+                    }
+                }
+                let last_idx = sorted.len().saturating_sub(1).min(4) as u8;
+                let last_label = sorted
+                    .last()
+                    .map(|r| r.label.clone())
+                    .unwrap_or_else(|| "拉完了".to_owned());
+                (last_idx, last_label)
+            }
+        }
+    }
+
+    /// Loads config from `path`, or creates pretty-printed defaults if missing (falling back on errors).
+    pub fn load_or_init(path: &std::path::Path) -> Self {
+        if !path.exists() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let defaults = Self::default();
+            if let Ok(json) = serde_json::to_string_pretty(&defaults) {
+                let _ = std::fs::write(path, json);
+            }
+            return defaults;
+        }
+
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        match serde_json::from_str::<Self>(&raw) {
+            Ok(cfg) if !cfg.tiers.is_empty() => cfg,
+            _ => Self::default(),
+        }
+    }
+}
+
+/// Per-teammate ARAM Mayhem (`KIWI` / `queueId 2400`) rating and premade tag.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SummonerRatingSummary {
+    pub cell_id: i32,
+    pub status: SummonerRatingStatus,
+    pub score: u8,
+    pub tier_index: u8,
+    pub title: String,
+    pub games_count: u8,
+    pub win_rate: f64,
+    pub avg_kda: f64,
+    pub streak: i8,
+    pub premade_group_id: Option<u8>,
+    pub is_premade_last_mvp: bool,
+}
+
+/// Detected premade party group across current allied teammates.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PremadeGroupSummary {
+    pub group_id: u8,
+    pub slot_indices: Vec<usize>,
+    pub shared_games: usize,
+    pub last_mvp_slot_index: Option<usize>,
+}
+
+/// Aggregated ratings and premade/last-game-MVP groups for all allied champ select slots.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TeamRatingsSnapshot {
+    pub slots: Vec<SummonerRatingSummary>,
+    pub premade_groups: Vec<PremadeGroupSummary>,
+}
+
 /// Core events streamed from `hex-core` (and `hex-vision`) to the UI layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AppEvent {
     ModeChanged(AppMode),
     ChampSelectUpdated(ChampSelectState),
+    TeamRatingsUpdated(TeamRatingsSnapshot),
     LiveGameUpdated(LiveGameState),
     EndOfGameCaptured(EndOfGameStats),
     AugmentOfferDetected {

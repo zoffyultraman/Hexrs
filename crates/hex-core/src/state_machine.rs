@@ -1,11 +1,13 @@
 //! Background Tokio runtime & state machine coordinating process polling, LCU WS/REST, and Live API.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{unbounded, Receiver, Sender};
+use futures_util::future::join_all;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
@@ -13,12 +15,16 @@ use tracing::{debug, info, warn};
 
 use crate::lcu::{LcuClient, LcuWsEvent};
 use crate::live::LiveClient;
-use crate::models::{AppEvent, AppMode, ChampSelectState, LiveGameState};
+use crate::models::{AppEvent, AppMode, ChampSelectState, LiveGameState, RatingTitlesConfig};
+use crate::player_rating::{analyze_team_ratings, MatchFetchResult};
 use crate::process::{LcuCredentials, ProcessMonitor, ProcessSnapshot};
+use crate::sgp::{get_sgp_match_history_url, get_sgp_server_id, SgpClient};
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const CHAMP_SELECT_REST_POLL_INTERVAL: Duration = Duration::from_millis(1200);
 const LIVE_API_POLL_INTERVAL: Duration = Duration::from_millis(2000);
+const MATCH_CACHE_TTL: Duration = Duration::from_secs(600);
+const MATCH_CACHE_MAX_ENTRIES: usize = 64;
 
 /// Diagnostic snapshot exposed via `CoreHandle::diagnostics()` for UI/tray inspection.
 #[derive(Debug, Clone, Default)]
@@ -206,6 +212,9 @@ struct CoordinatorState {
     last_champ_select: Option<ChampSelectState>,
     gameflow_fetch_in_flight: bool,
     subset_fetch_in_flight: bool,
+    match_cache: HashMap<String, (Instant, MatchFetchResult)>,
+    last_rated_team_key: Vec<(i32, String)>,
+    ratings_fetch_in_flight: bool,
     champ_poll_in_flight: bool,
     live_poll_in_flight: bool,
     ws_shutdown_tx: Option<watch::Sender<bool>>,
@@ -231,6 +240,9 @@ impl CoordinatorState {
             last_champ_select: None,
             gameflow_fetch_in_flight: false,
             subset_fetch_in_flight: false,
+            match_cache: HashMap::new(),
+            last_rated_team_key: Vec::new(),
+            ratings_fetch_in_flight: false,
             champ_poll_in_flight: false,
             live_poll_in_flight: false,
             ws_shutdown_tx: None,
@@ -297,6 +309,9 @@ impl CoordinatorState {
             self.last_champ_select = None;
             self.gameflow_fetch_in_flight = false;
             self.subset_fetch_in_flight = false;
+            self.match_cache.clear();
+            self.last_rated_team_key.clear();
+            self.ratings_fetch_in_flight = false;
             self.champ_poll_in_flight = false;
             self.active_lcu = None;
             self.active_creds = self.snapshot.lcu.clone();
@@ -370,6 +385,7 @@ impl CoordinatorState {
         self.last_champ_select = None;
         self.gameflow_fetch_in_flight = false;
         self.subset_fetch_in_flight = false;
+        self.last_rated_team_key.clear();
     }
 
     fn handle_ws_event(
@@ -378,6 +394,7 @@ impl CoordinatorState {
         ws_event_tx: &mpsc::UnboundedSender<LcuWsEvent>,
         gameflow_tx: &mpsc::UnboundedSender<Option<(String, Option<i32>)>>,
         subset_tx: &mpsc::UnboundedSender<Vec<i32>>,
+        ratings_tx: &mpsc::UnboundedSender<Vec<(String, MatchFetchResult)>>,
     ) {
         match event {
             LcuWsEvent::Connected => {
@@ -457,6 +474,7 @@ impl CoordinatorState {
 
                 self.last_champ_select = Some(state.clone());
                 let _ = self.event_tx.send(AppEvent::ChampSelectUpdated(state));
+                self.maybe_refresh_team_ratings(ratings_tx);
             }
             LcuWsEvent::SubsetChampionsUpdated(ids) => {
                 self.apply_subset_champions(ids);
@@ -478,6 +496,7 @@ impl CoordinatorState {
         ws_event_tx: &mpsc::UnboundedSender<LcuWsEvent>,
         gameflow_tx: &mpsc::UnboundedSender<Option<(String, Option<i32>)>>,
         subset_tx: &mpsc::UnboundedSender<Vec<i32>>,
+        ratings_tx: &mpsc::UnboundedSender<Vec<(String, MatchFetchResult)>>,
     ) {
         self.champ_poll_in_flight = false;
         match outcome.session {
@@ -490,6 +509,7 @@ impl CoordinatorState {
                         ws_event_tx,
                         gameflow_tx,
                         subset_tx,
+                        ratings_tx,
                     );
                 }
             }
@@ -512,6 +532,7 @@ impl CoordinatorState {
                                 ws_event_tx,
                                 gameflow_tx,
                                 subset_tx,
+                                ratings_tx,
                             );
                             synced = true;
                         }
@@ -523,6 +544,7 @@ impl CoordinatorState {
                                 ws_event_tx,
                                 gameflow_tx,
                                 subset_tx,
+                                ratings_tx,
                             );
                             synced = true;
                         }
@@ -586,6 +608,198 @@ impl CoordinatorState {
                     let _ = self.event_tx.send(AppEvent::ChampSelectUpdated(session));
                 }
             }
+        }
+    }
+
+    fn prune_match_cache(&mut self, now: Instant) {
+        self.match_cache
+            .retain(|_, (ts, _)| now.saturating_duration_since(*ts) < MATCH_CACHE_TTL);
+    }
+
+    fn insert_match_cache(&mut self, puuid: String, result: MatchFetchResult, now: Instant) {
+        if !matches!(result, MatchFetchResult::Ok(_) | MatchFetchResult::Private) {
+            return;
+        }
+        self.prune_match_cache(now);
+        if !self.match_cache.contains_key(&puuid) && self.match_cache.len() >= MATCH_CACHE_MAX_ENTRIES
+        {
+            if let Some(oldest_key) = self
+                .match_cache
+                .iter()
+                .min_by_key(|(_, (ts, _))| *ts)
+                .map(|(k, _)| k.clone())
+            {
+                self.match_cache.remove(&oldest_key);
+            }
+        }
+        self.match_cache.insert(puuid, (now, result));
+    }
+
+    fn maybe_refresh_team_ratings(
+        &mut self,
+        ratings_tx: &mpsc::UnboundedSender<Vec<(String, MatchFetchResult)>>,
+    ) {
+        if !self.in_champ_select {
+            return;
+        }
+        let Some(session) = self.last_champ_select.clone() else {
+            return;
+        };
+        if session.my_team.is_empty() {
+            return;
+        }
+        let team_key: Vec<(i32, String)> = session
+            .my_team
+            .iter()
+            .map(|s| (s.cell_id, s.puuid.clone()))
+            .collect();
+        if !team_key.iter().any(|(_, p)| !p.is_empty()) || team_key == self.last_rated_team_key {
+            return;
+        }
+
+        let now = Instant::now();
+        self.prune_match_cache(now);
+
+        let mut cached_map: HashMap<String, MatchFetchResult> = HashMap::new();
+        let mut uncached_puuids: Vec<String> = Vec::new();
+        for slot in &session.my_team {
+            if slot.puuid.is_empty() {
+                continue;
+            }
+            if let Some((_, res)) = self.match_cache.get(&slot.puuid) {
+                cached_map.insert(slot.puuid.clone(), res.clone());
+            } else if !uncached_puuids.contains(&slot.puuid) {
+                uncached_puuids.push(slot.puuid.clone());
+            }
+        }
+
+        if uncached_puuids.is_empty() {
+            self.last_rated_team_key = team_key;
+            let snapshot =
+                analyze_team_ratings(&session.my_team, &cached_map, &RatingTitlesConfig::default());
+            let _ = self.event_tx.send(AppEvent::TeamRatingsUpdated(snapshot));
+            return;
+        }
+
+        if self.ratings_fetch_in_flight {
+            return;
+        }
+
+        let Some(client) = self.active_lcu.clone() else {
+            return;
+        };
+
+        self.last_rated_team_key = team_key;
+        self.ratings_fetch_in_flight = true;
+
+        let loading_snap =
+            analyze_team_ratings(&session.my_team, &cached_map, &RatingTitlesConfig::default());
+        let _ = self.event_tx.send(AppEvent::TeamRatingsUpdated(loading_snap));
+
+        let creds_region = self.active_creds.as_ref().and_then(|c| c.region.clone());
+        let creds_rso = self
+            .active_creds
+            .as_ref()
+            .and_then(|c| c.rso_platform_id.clone());
+        let tx = ratings_tx.clone();
+        let to_fetch: Vec<String> = uncached_puuids.into_iter().take(5).collect();
+
+        tokio::spawn(async move {
+            let mut region = creds_region;
+            let mut rso = creds_rso;
+            let need_locale = region.is_none()
+                || (region
+                    .as_deref()
+                    .map(|r| r.eq_ignore_ascii_case("TENCENT"))
+                    .unwrap_or(false)
+                    && rso.is_none());
+            if need_locale {
+                if let Ok(Some((loc_region, loc_rso))) = client.get_region_locale().await {
+                    if region.is_none() {
+                        region = Some(loc_region);
+                    }
+                    if rso.is_none() {
+                        rso = loc_rso;
+                    }
+                }
+            }
+
+            let sgp_base = region
+                .as_deref()
+                .and_then(|r| get_sgp_server_id(r, rso.as_deref()))
+                .and_then(|sid| get_sgp_match_history_url(&sid));
+            let token = if sgp_base.is_some() {
+                client.get_entitlements_token().await.ok().flatten()
+            } else {
+                None
+            };
+            let sgp_client = if sgp_base.is_some() && token.is_some() {
+                SgpClient::new().ok()
+            } else {
+                None
+            };
+
+            let futs = to_fetch.into_iter().map(|puuid| {
+                let lcu = client.clone();
+                let sgp = sgp_client.clone();
+                let tok = token.clone();
+                async move {
+                    let res = if let (Some(base), Some(sgp_c), Some(access_tok)) =
+                        (sgp_base, sgp.as_ref(), tok.as_deref())
+                    {
+                        match sgp_c.fetch_kiwi_matches(base, access_tok, &puuid, 20).await {
+                            MatchFetchResult::Unavailable(reason) => {
+                                debug!(%puuid, %reason, "SGP unavailable; falling back to LCU match history");
+                                lcu.get_kiwi_matches_fallback(&puuid).await
+                            }
+                            other => other,
+                        }
+                    } else {
+                        lcu.get_kiwi_matches_fallback(&puuid).await
+                    };
+                    (puuid, res)
+                }
+            });
+
+            let results = join_all(futs).await;
+            let _ = tx.send(results);
+        });
+    }
+
+    fn handle_ratings_resolved(
+        &mut self,
+        results: Vec<(String, MatchFetchResult)>,
+        ratings_tx: &mpsc::UnboundedSender<Vec<(String, MatchFetchResult)>>,
+    ) {
+        self.ratings_fetch_in_flight = false;
+        let now = Instant::now();
+        let mut fresh_results: HashMap<String, MatchFetchResult> = HashMap::new();
+        for (puuid, res) in results {
+            fresh_results.insert(puuid.clone(), res.clone());
+            self.insert_match_cache(puuid, res, now);
+        }
+
+        if self.in_champ_select {
+            if let Some(session) = self.last_champ_select.clone() {
+                let mut match_map: HashMap<String, MatchFetchResult> = HashMap::new();
+                for slot in &session.my_team {
+                    if slot.puuid.is_empty() {
+                        continue;
+                    }
+                    if let Some(res) = fresh_results.get(&slot.puuid) {
+                        match_map.insert(slot.puuid.clone(), res.clone());
+                    } else if let Some((_, res)) = self.match_cache.get(&slot.puuid) {
+                        match_map.insert(slot.puuid.clone(), res.clone());
+                    }
+                }
+                let snapshot = analyze_team_ratings(
+                    &session.my_team,
+                    &match_map,
+                    &RatingTitlesConfig::default(),
+                );
+                let _ = self.event_tx.send(AppEvent::TeamRatingsUpdated(snapshot));
+            }
+            self.maybe_refresh_team_ratings(ratings_tx);
         }
     }
 
@@ -691,6 +905,7 @@ async fn run_coordinator(
     let (ws_event_tx, mut ws_event_rx) = mpsc::unbounded_channel::<LcuWsEvent>();
     let (gameflow_tx, mut gameflow_rx) = mpsc::unbounded_channel::<Option<(String, Option<i32>)>>();
     let (subset_tx, mut subset_rx) = mpsc::unbounded_channel::<Vec<i32>>();
+    let (ratings_tx, mut ratings_rx) = mpsc::unbounded_channel::<Vec<(String, MatchFetchResult)>>();
     let (champ_poll_tx, mut champ_poll_rx) = mpsc::unbounded_channel::<ChampPollOutcome>();
     let (live_poll_tx, mut live_poll_rx) =
         mpsc::unbounded_channel::<Result<Option<LiveGameState>>>();
@@ -768,10 +983,10 @@ async fn run_coordinator(
                 }
             }
             Some(ws_event) = ws_event_rx.recv() => {
-                state.handle_ws_event(ws_event, &ws_event_tx, &gameflow_tx, &subset_tx);
+                state.handle_ws_event(ws_event, &ws_event_tx, &gameflow_tx, &subset_tx, &ratings_tx);
             }
             Some(champ_res) = champ_poll_rx.recv() => {
-                state.handle_champ_poll_result(champ_res, &ws_event_tx, &gameflow_tx, &subset_tx);
+                state.handle_champ_poll_result(champ_res, &ws_event_tx, &gameflow_tx, &subset_tx, &ratings_tx);
             }
             Some(live_res) = live_poll_rx.recv() => {
                 state.handle_live_poll_result(live_res);
@@ -781,6 +996,9 @@ async fn run_coordinator(
             }
             Some(ids) = subset_rx.recv() => {
                 state.handle_subset_resolved(ids);
+            }
+            Some(ratings_res) = ratings_rx.recv() => {
+                state.handle_ratings_resolved(ratings_res, &ratings_tx);
             }
         }
     }

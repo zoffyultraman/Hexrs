@@ -21,6 +21,8 @@ pub struct LcuCredentials {
     pub port: u16,
     pub token: String,
     pub pid: u32,
+    pub region: Option<String>,
+    pub rso_platform_id: Option<String>,
 }
 
 impl fmt::Debug for LcuCredentials {
@@ -29,6 +31,8 @@ impl fmt::Debug for LcuCredentials {
             .field("port", &self.port)
             .field("token", &"<redacted>")
             .field("pid", &self.pid)
+            .field("region", &self.region)
+            .field("rso_platform_id", &self.rso_platform_id)
             .finish()
     }
 }
@@ -140,8 +144,16 @@ impl ProcessMonitor {
         for &pid in &snapshot.lcu_pids {
             match query_process_cmdline_limited(pid) {
                 Ok(cmdline) => {
-                    if let Some((port, token)) = parse_raw_cmdline_credentials(&cmdline) {
-                        snapshot.lcu = Some(LcuCredentials { port, token, pid });
+                    if let Some((port, token, region, rso_platform_id)) =
+                        parse_raw_cmdline_credentials_full(&cmdline)
+                    {
+                        snapshot.lcu = Some(LcuCredentials {
+                            port,
+                            token,
+                            pid,
+                            region,
+                            rso_platform_id,
+                        });
                         snapshot.lcu_pid = Some(pid);
                         break;
                     }
@@ -226,14 +238,28 @@ fn matches_any_ignore_case(candidate: &str, targets: &[&str]) -> bool {
 
 /// Extracts `(--app-port, --remoting-auth-token)` from a raw command-line string.
 pub fn parse_raw_cmdline_credentials(cmdline: &str) -> Option<(u16, String)> {
+    let (port, token, _, _) = parse_raw_cmdline_credentials_full(cmdline)?;
+    Some((port, token))
+}
+
+/// Extracts `(--app-port, --remoting-auth-token, --region, --rso_platform_id)` from a raw command line.
+pub fn parse_raw_cmdline_credentials_full(
+    cmdline: &str,
+) -> Option<(u16, String, Option<String>, Option<String>)> {
     let port = extract_flag_value(cmdline, "--app-port=")
         .and_then(|val| val.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse::<u16>().ok());
     let token = extract_flag_value(cmdline, "--remoting-auth-token=")
         .map(|val| val.to_owned())
         .filter(|s| !s.is_empty());
+    let region = extract_flag_value(cmdline, "--region=")
+        .map(|val| val.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let rso_platform_id = extract_flag_value(cmdline, "--rso_platform_id=")
+        .map(|val| val.trim().to_owned())
+        .filter(|s| !s.is_empty());
 
     match (port, token) {
-        (Some(p), Some(t)) => Some((p, t)),
+        (Some(p), Some(t)) => Some((p, t, region, rso_platform_id)),
         _ => None,
     }
 }
@@ -241,10 +267,21 @@ pub fn parse_raw_cmdline_credentials(cmdline: &str) -> Option<(u16, String)> {
 fn extract_flag_value<'a>(cmdline: &'a str, flag: &str) -> Option<&'a str> {
     let start = cmdline.find(flag)? + flag.len();
     let rest = &cmdline[start..];
-    let end = rest
-        .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
-        .unwrap_or(rest.len());
-    let slice = &rest[..end];
+    let (quote_char, content) = if let Some(stripped) = rest.strip_prefix('"') {
+        (Some('"'), stripped)
+    } else if let Some(stripped) = rest.strip_prefix('\'') {
+        (Some('\''), stripped)
+    } else {
+        (None, rest)
+    };
+
+    let end = match quote_char {
+        Some(q) => content.find(q).unwrap_or(content.len()),
+        None => content
+            .find(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+            .unwrap_or(content.len()),
+    };
+    let slice = content[..end].trim_matches(|c| c == '"' || c == '\'');
     if slice.is_empty() {
         None
     } else {
@@ -525,6 +562,8 @@ fn try_lockfile_fallback(
                             port,
                             token,
                             pid: observed_pid.unwrap_or(lock_pid),
+                            region: None,
+                            rso_platform_id: None,
                         }),
                         checked_count,
                     );
@@ -651,4 +690,38 @@ fn query_registry_install_paths() -> Vec<PathBuf> {
 #[cfg(not(target_os = "windows"))]
 fn query_registry_install_paths() -> Vec<PathBuf> {
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_raw_cmdline_credentials_with_region_and_rso() {
+        let cmdline = r#""LeagueClientUx.exe" "--app-port=54321" "--remoting-auth-token=secret_tok" --region=TENCENT --rso_platform_id=HN1"#;
+        assert_eq!(
+            parse_raw_cmdline_credentials(cmdline),
+            Some((54321, "secret_tok".to_owned()))
+        );
+        assert_eq!(
+            parse_raw_cmdline_credentials_full(cmdline),
+            Some((
+                54321,
+                "secret_tok".to_owned(),
+                Some("TENCENT".to_owned()),
+                Some("HN1".to_owned()),
+            ))
+        );
+
+        let quoted = r#"LeagueClientUx.exe --app-port="1234" --remoting-auth-token="abc" --region="EUW1" --rso_platform_id="EUW1""#;
+        assert_eq!(
+            parse_raw_cmdline_credentials_full(quoted),
+            Some((
+                1234,
+                "abc".to_owned(),
+                Some("EUW1".to_owned()),
+                Some("EUW1".to_owned()),
+            ))
+        );
+    }
 }
