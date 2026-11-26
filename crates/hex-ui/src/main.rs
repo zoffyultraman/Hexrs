@@ -7,6 +7,9 @@ mod theme;
 mod tray;
 mod win32;
 
+use std::fs::{self, OpenOptions};
+use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use gpui::{
@@ -14,6 +17,7 @@ use gpui::{
     WindowBounds, WindowKind, WindowOptions,
 };
 use tracing::{error, info, warn};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::HexOverlayApp;
@@ -21,9 +25,33 @@ use crate::tray::TrayController;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(60);
 
+/// Returns `%LOCALAPPDATA%/Hexrs/hexoverlay.log` (or platform equivalent).
+pub fn log_file_path() -> PathBuf {
+    hex_data::data_dir().join("hexoverlay.log")
+}
+
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    let data_dir = hex_data::data_dir();
+    let _ = fs::create_dir_all(&data_dir);
+    let log_path = log_file_path();
+
+    match OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(file) => {
+            let writer = std::io::stderr.and(Mutex::new(file));
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .with_writer(writer)
+                .try_init();
+        }
+        Err(_) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .try_init();
+        }
+    }
 }
 
 fn main() {
@@ -37,7 +65,10 @@ fn main() {
         }
     };
 
-    info!("HexOverlay starting GPUI event loop");
+    info!(
+        log_path = %log_file_path().display(),
+        "HexOverlay starting GPUI event loop"
+    );
 
     Application::new().run(move |cx: &mut App| {
         let tray = match TrayController::new() {
@@ -55,7 +86,7 @@ fn main() {
             kind: WindowKind::PopUp,
             window_background: WindowBackgroundAppearance::Transparent,
             focus: false,
-            show: false,
+            show: true,
             ..Default::default()
         };
 

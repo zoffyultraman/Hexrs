@@ -1,7 +1,7 @@
 //! Champ Select GPUI sidebar rendering (`code_artifact.md` Section 3.1).
 
 use gpui::{div, prelude::*, px, AnyElement, Context, Div, FontWeight, SharedString};
-use hex_core::ChampSelectState;
+use hex_core::{AppMode, ChampSelectState};
 use hex_data::{
     AugmentEvaluation, BenchHighlight, DynamicBuildPlan, HeroPreview, HeroStats,
     SynergyRecommendation, TeamDiagnosis, TeamRecommendations,
@@ -17,10 +17,12 @@ pub fn render_lobby_sidebar(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
     let champ_select = app.champ_select.as_ref();
     let lcu_connected = app.lcu_connected;
     let current_hero = app.current_hero_stats.as_ref();
+    let active_hero_id = app.active_champ_select_hero_id;
     let bench = &app.bench_highlights;
     let recs = &app.team_recs;
     let expanded_hero_id = app.expanded_hero_id;
     let selected_preview = app.selected_preview.as_ref();
+    let is_preview = app.preview_mode == Some(AppMode::LobbyDocked);
 
     div()
         .size_full()
@@ -30,6 +32,9 @@ pub fn render_lobby_sidebar(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
         .border_1()
         .border_color(theme::border_gold())
         .text_color(theme::text_primary())
+        .when(is_preview, |root| {
+            root.child(render_preview_banner(cx))
+        })
         .child(render_header(lcu_connected, champ_select))
         .child(
             div()
@@ -42,6 +47,7 @@ pub fn render_lobby_sidebar(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
                 .gap_3()
                 .child(render_active_hero_section(
                     current_hero,
+                    active_hero_id,
                     expanded_hero_id,
                     selected_preview,
                     cx,
@@ -61,6 +67,44 @@ pub fn render_lobby_sidebar(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
                     selected_preview,
                     cx,
                 )),
+        )
+}
+
+fn render_preview_banner(cx: &mut Context<HexOverlayApp>) -> Div {
+    div()
+        .px_3()
+        .py_1()
+        .bg(theme::cyan_dim())
+        .border_b_1()
+        .border_color(theme::border_cyan())
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::cyan())
+                .child("UI 预览模式 · 选人侧边栏"),
+        )
+        .child(
+            div()
+                .id("exit-lobby-preview")
+                .cursor_pointer()
+                .px_2()
+                .py(px(1.0))
+                .rounded_md()
+                .bg(theme::card_bg())
+                .border_1()
+                .border_color(theme::border_cyan())
+                .hover(|s| s.bg(theme::card_elevated_bg()))
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::text_primary())
+                .child("退出预览")
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.set_preview_mode(None, cx);
+                })),
         )
 }
 
@@ -136,11 +180,55 @@ fn render_header(lcu_connected: bool, champ_select: Option<&ChampSelectState>) -
 
 fn render_active_hero_section(
     current_hero: Option<&HeroStats>,
+    active_hero_id: Option<i32>,
     expanded_hero_id: Option<i32>,
     selected_preview: Option<&HeroPreview>,
     cx: &mut Context<HexOverlayApp>,
 ) -> Div {
     let Some(hero) = current_hero else {
+        if let Some(hero_id) = active_hero_id.filter(|&id| id > 0) {
+            return div()
+                .p_3()
+                .rounded_lg()
+                .bg(theme::card_bg())
+                .border_1()
+                .border_color(theme::border_gold())
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme::text_primary())
+                                .child(format!("英雄 #{hero_id}")),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(2.0))
+                                .rounded_md()
+                                .bg(theme::gold_dim())
+                                .border_1()
+                                .border_color(theme::border_subtle())
+                                .text_xs()
+                                .text_color(theme::gold())
+                                .child("冷启动库未收录"),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child("仍为您实时计算阵容短板并推荐高胜搭档，可点击托盘“检查数据热更新”同步全量英雄。"),
+                );
+        }
+
         return div()
             .p_3()
             .rounded_lg()

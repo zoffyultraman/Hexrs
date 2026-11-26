@@ -1,7 +1,7 @@
 //! In-game transparent overlay rendering: floating augment badges, synergy alerts, and dynamic build strip.
 
 use gpui::{div, prelude::*, px, rgba, Context, Div, FontWeight, Window};
-use hex_core::{LiveGameState, RoiManifest};
+use hex_core::{AppMode, LiveGameState, RoiManifest};
 use hex_data::{AugmentEvaluation, DynamicBuildPlan};
 
 use crate::app::HexOverlayApp;
@@ -23,13 +23,14 @@ pub fn render_in_game_overlay(
     let viewport = window.viewport_size();
     let vp_w = f32::from(viewport.width).max(1280.0);
     let vp_h = f32::from(viewport.height).max(720.0);
+    let is_preview = app.preview_mode == Some(AppMode::InGameOverlay);
 
     let mut root = div()
         .size_full()
         .relative()
         .bg(rgba(0x00000000))
         .text_color(theme::text_primary())
-        .child(render_hotkey_pill(app.hotkey_interactive));
+        .child(render_hotkey_pill(app.hotkey_interactive, is_preview, cx));
 
     if !app.offered_augments.is_empty() {
         let manifest = app
@@ -41,14 +42,15 @@ pub fn render_in_game_overlay(
 
         for (eval, roi) in app.offered_augments.iter().zip(preset.card_icons.iter()) {
             let center_x = (roi.x + roi.w * 0.5) * vp_w;
-            let left_px =
-                (center_x - AUGMENT_BADGE_WIDTH_PX * 0.5).clamp(12.0, (vp_w - AUGMENT_BADGE_WIDTH_PX - 12.0).max(12.0));
-            let top_px = (roi.y * vp_h - AUGMENT_BADGE_HEIGHT_OFFSET_PX).clamp(52.0, (vp_h - 180.0).max(52.0));
+            let left_px = (center_x - AUGMENT_BADGE_WIDTH_PX * 0.5)
+                .clamp(12.0, (vp_w - AUGMENT_BADGE_WIDTH_PX - 12.0).max(12.0));
+            let top_px = (roi.y * vp_h - AUGMENT_BADGE_HEIGHT_OFFSET_PX)
+                .clamp(52.0, (vp_h - 180.0).max(52.0));
 
             root = root.child(render_augment_floating_badge(eval, left_px, top_px));
         }
 
-        if app.hotkey_interactive {
+        if app.hotkey_interactive || is_preview {
             root = root.child(render_offer_dismiss_button(app.last_offer_capture_ms, cx));
         }
     }
@@ -59,13 +61,26 @@ pub fn render_in_game_overlay(
             app.active_hero_name_zh.as_deref(),
             app.dynamic_build.as_ref(),
         ));
+    } else {
+        root = root.child(render_live_standby_chip(is_preview));
     }
 
     root
 }
 
-fn render_hotkey_pill(interactive: bool) -> Div {
-    let (bg, border, text_color, label) = if interactive {
+fn render_hotkey_pill(
+    interactive: bool,
+    is_preview: bool,
+    cx: &mut Context<HexOverlayApp>,
+) -> Div {
+    let (bg, border, text_color, label) = if is_preview {
+        (
+            theme::cyan_dim(),
+            theme::border_cyan(),
+            theme::cyan(),
+            "UI 预览模式 · 局内透明悬浮窗（DirectComposition）",
+        )
+    } else if interactive {
         (
             theme::cyan_dim(),
             theme::border_cyan(),
@@ -88,6 +103,7 @@ fn render_hotkey_pill(interactive: bool) -> Div {
         .right(px(0.0))
         .flex()
         .justify_center()
+        .gap_2()
         .child(
             div()
                 .px_3()
@@ -99,6 +115,64 @@ fn render_hotkey_pill(interactive: bool) -> Div {
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(text_color)
+                .child(label),
+        )
+        .when(is_preview, |row| {
+            row.child(
+                div()
+                    .id("exit-overlay-preview")
+                    .cursor_pointer()
+                    .px_3()
+                    .py(px(4.0))
+                    .rounded_full()
+                    .bg(theme::card_elevated_bg())
+                    .border_1()
+                    .border_color(theme::border_gold())
+                    .hover(|s| s.bg(theme::gold_dim()))
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme::gold())
+                    .child("退出预览")
+                    .on_click(cx.listener(|this, _event, _window, cx| {
+                        this.set_preview_mode(None, cx);
+                    })),
+            )
+        })
+}
+
+fn render_live_standby_chip(is_preview: bool) -> Div {
+    let label = if is_preview {
+        "局内预览就绪 · 识别到三选一海克斯后将在此显示出装与协同提示"
+    } else {
+        "局内模式已就绪 · 等待 Live API (2999)..."
+    };
+
+    div()
+        .absolute()
+        .right(px(18.0))
+        .bottom(px(22.0))
+        .px_3()
+        .py_2()
+        .rounded_xl()
+        .bg(theme::overlay_card_bg())
+        .border_1()
+        .border_color(theme::border_gold())
+        .shadow_lg()
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .w(px(8.0))
+                .h(px(8.0))
+                .rounded_full()
+                .bg(theme::cyan()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::text_primary())
                 .child(label),
         )
 }

@@ -9,22 +9,27 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
     ToggleOverlay,
+    ToggleDiagnostics,
     CheckDataUpdate,
     ToggleTelemetry,
     OpenDataDir,
+    OpenLogFile,
     Quit,
 }
 
 /// Owns the Windows/macOS system tray icon and menu items on the main UI thread.
 pub struct TrayController {
-    _tray_icon: TrayIcon,
+    tray_icon: TrayIcon,
     status_item: MenuItem,
     toggle_overlay_item: CheckMenuItem,
+    toggle_diagnostics_item: CheckMenuItem,
     toggle_telemetry_item: CheckMenuItem,
     toggle_overlay_id: MenuId,
+    toggle_diagnostics_id: MenuId,
     toggle_telemetry_id: MenuId,
     check_update_id: MenuId,
     open_dir_id: MenuId,
+    open_log_id: MenuId,
     quit_id: MenuId,
 }
 
@@ -35,9 +40,11 @@ impl TrayController {
 
         let status_item = MenuItem::new("状态: 休眠中", false, None);
         let toggle_overlay_item = CheckMenuItem::new("显示悬浮窗", true, true, None);
+        let toggle_diagnostics_item = CheckMenuItem::new("显示诊断面板", true, false, None);
         let toggle_telemetry_item = CheckMenuItem::new("匿名众包战绩上报", true, true, None);
         let check_update_item = MenuItem::new("检查数据热更新", true, None);
         let open_dir_item = MenuItem::new("打开数据目录", true, None);
+        let open_log_item = MenuItem::new("打开运行日志", true, None);
         let quit_item = MenuItem::new("退出 HexOverlay", true, None);
 
         let sep1 = PredefinedMenuItem::separator();
@@ -49,40 +56,49 @@ impl TrayController {
             .context("failed to append separator")?;
         menu.append(&toggle_overlay_item)
             .context("failed to append overlay toggle item")?;
+        menu.append(&toggle_diagnostics_item)
+            .context("failed to append diagnostics toggle item")?;
         menu.append(&toggle_telemetry_item)
             .context("failed to append telemetry toggle item")?;
         menu.append(&check_update_item)
             .context("failed to append check-update item")?;
         menu.append(&open_dir_item)
             .context("failed to append open-dir item")?;
+        menu.append(&open_log_item)
+            .context("failed to append open-log item")?;
         menu.append(&sep2)
             .context("failed to append separator")?;
         menu.append(&quit_item)
             .context("failed to append quit item")?;
 
         let toggle_overlay_id = toggle_overlay_item.id().clone();
+        let toggle_diagnostics_id = toggle_diagnostics_item.id().clone();
         let toggle_telemetry_id = toggle_telemetry_item.id().clone();
         let check_update_id = check_update_item.id().clone();
         let open_dir_id = open_dir_item.id().clone();
+        let open_log_id = open_log_item.id().clone();
         let quit_id = quit_item.id().clone();
 
         let icon = build_hextech_icon()?;
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("HexOverlay · 海克斯对局助手")
+            .with_tooltip("HexOverlay · 休眠中")
             .with_icon(icon)
             .build()
             .context("failed to build TrayIcon")?;
 
         Ok(Self {
-            _tray_icon: tray_icon,
+            tray_icon,
             status_item,
             toggle_overlay_item,
+            toggle_diagnostics_item,
             toggle_telemetry_item,
             toggle_overlay_id,
+            toggle_diagnostics_id,
             toggle_telemetry_id,
             check_update_id,
             open_dir_id,
+            open_log_id,
             quit_id,
         })
     }
@@ -94,12 +110,16 @@ impl TrayController {
             let id = event.id;
             if id == self.toggle_overlay_id {
                 actions.push(TrayAction::ToggleOverlay);
+            } else if id == self.toggle_diagnostics_id {
+                actions.push(TrayAction::ToggleDiagnostics);
             } else if id == self.toggle_telemetry_id {
                 actions.push(TrayAction::ToggleTelemetry);
             } else if id == self.check_update_id {
                 actions.push(TrayAction::CheckDataUpdate);
             } else if id == self.open_dir_id {
                 actions.push(TrayAction::OpenDataDir);
+            } else if id == self.open_log_id {
+                actions.push(TrayAction::OpenLogFile);
             } else if id == self.quit_id {
                 actions.push(TrayAction::Quit);
             }
@@ -107,19 +127,30 @@ impl TrayController {
         actions
     }
 
-    /// Updates the disabled status line at the top of the tray menu.
+    /// Updates the disabled status line and tooltip to reflect the active mode.
     pub fn update_status(&self, mode: AppMode) {
-        let label = match mode {
-            AppMode::Dormant => "状态: 休眠中",
-            AppMode::LobbyDocked => "状态: 选人侧边栏",
-            AppMode::InGameOverlay => "状态: 局内悬浮窗",
+        let (status_label, tooltip) = match mode {
+            AppMode::Dormant => ("状态: 休眠中", "HexOverlay · 休眠中"),
+            AppMode::LobbyDocked => ("状态: 选人侧边栏", "HexOverlay · 选人侧边栏"),
+            AppMode::InGameOverlay => ("状态: 局内悬浮窗", "HexOverlay · 局内悬浮窗"),
         };
-        self.status_item.set_text(label);
+        self.status_item.set_text(status_label);
+        let _ = self.tray_icon.set_tooltip(Some(tooltip));
     }
 
     /// Returns whether the overlay visibility check item is currently checked.
     pub fn is_overlay_checked(&self) -> bool {
         self.toggle_overlay_item.is_checked()
+    }
+
+    /// Returns whether the diagnostics panel check item is currently checked.
+    pub fn is_diagnostics_checked(&self) -> bool {
+        self.toggle_diagnostics_item.is_checked()
+    }
+
+    /// Programmatically syncs the diagnostics panel check item state.
+    pub fn set_diagnostics_checked(&self, checked: bool) {
+        self.toggle_diagnostics_item.set_checked(checked);
     }
 
     /// Returns whether anonymized EOG telemetry is currently checked.

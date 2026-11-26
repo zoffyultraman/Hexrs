@@ -1,7 +1,12 @@
-//! Win32 window handle lookup, lobby auto-docking, in-game overlay transparency, and Alt hotkey polling.
+//! Win32 window handle lookup (`RCLIENT`/`RiotWindowClass`/PID/title), DirectComposition transparency,
+//! lobby auto-docking, Alt hotkey polling, and diagnostics window management.
 
 /// Logical sidebar width in DIPs (`code_artifact.md` Section 3.1).
 pub const SIDEBAR_WIDTH_DIP: f32 = 320.0;
+
+/// Logical diagnostics floating panel width and height in DIPs.
+pub const DIAGNOSTICS_WIDTH_DIP: f32 = 380.0;
+pub const DIAGNOSTICS_HEIGHT_DIP: f32 = 500.0;
 
 /// Screen-space window geometry and DPI metadata for a target client window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,21 +48,24 @@ mod imp {
     use anyhow::{Context, Result};
     use gpui::Window;
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::core::BOOL;
-    use windows::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows::core::{w, BOOL, PCWSTR};
+    use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT};
+    use windows::Win32::Graphics::Gdi::InvalidateRect;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-        GetWindowThreadProcessId, IsIconic, IsWindowVisible, SetWindowLongPtrW, SetWindowPos,
-        ShowWindow, SystemParametersInfoW, GWL_EXSTYLE, HWND_TOPMOST, SM_CXVIRTUALSCREEN,
+        EnumWindows, FindWindowW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
+        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+        SystemParametersInfoW, GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, SM_CXVIRTUALSCREEN,
         SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SWP_FRAMECHANGED,
         SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WS_EX_APPWINDOW, WS_EX_LAYERED,
-        WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+        WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_EX_TRANSPARENT,
     };
 
-    use super::{WindowRectInfo, SIDEBAR_WIDTH_DIP};
+    use super::{WindowRectInfo, DIAGNOSTICS_HEIGHT_DIP, DIAGNOSTICS_WIDTH_DIP, SIDEBAR_WIDTH_DIP};
 
     const MIN_TARGET_WINDOW_DIM: i32 = 200;
 
@@ -73,14 +81,50 @@ mod imp {
         }
     }
 
-    struct EnumTargetState {
+    unsafe fn inspect_window_rect(hwnd: HWND, min_w: i32, min_h: i32) -> Option<WindowRectInfo> {
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return None;
+        }
+
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return None;
+        }
+
+        let width = rect.right - rect.left;
+        let height = rect.bottom - rect.top;
+        if width < min_w || height < min_h {
+            return None;
+        }
+
+        let dpi = GetDpiForWindow(hwnd);
+        Some(WindowRectInfo {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: rect.bottom,
+            dpi: if dpi == 0 { 96 } else { dpi },
+        })
+    }
+
+    unsafe fn read_window_title(hwnd: HWND) -> String {
+        let mut buf = [0_u16; 256];
+        let len = GetWindowTextW(hwnd, &mut buf);
+        if len <= 0 {
+            String::new()
+        } else {
+            String::from_utf16_lossy(&buf[..len as usize])
+        }
+    }
+
+    struct EnumPidState {
         target_pid: u32,
         best_area: i64,
         best_rect: Option<WindowRectInfo>,
     }
 
-    unsafe extern "system" fn enum_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let state = &mut *(lparam.0 as *mut EnumTargetState);
+    unsafe extern "system" fn enum_pid_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam.0 as *mut EnumPidState);
 
         let mut win_pid: u32 = 0;
         let _ = GetWindowThreadProcessId(hwnd, Some(&mut win_pid));
@@ -88,32 +132,12 @@ mod imp {
             return BOOL::from(true);
         }
 
-        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
-            return BOOL::from(true);
-        }
-
-        let mut rect = RECT::default();
-        if GetWindowRect(hwnd, &mut rect).is_err() {
-            return BOOL::from(true);
-        }
-
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-        if width < MIN_TARGET_WINDOW_DIM || height < MIN_TARGET_WINDOW_DIM {
-            return BOOL::from(true);
-        }
-
-        let area = i64::from(width) * i64::from(height);
-        if area > state.best_area {
-            let dpi = GetDpiForWindow(hwnd);
-            state.best_area = area;
-            state.best_rect = Some(WindowRectInfo {
-                left: rect.left,
-                top: rect.top,
-                right: rect.right,
-                bottom: rect.bottom,
-                dpi: if dpi == 0 { 96 } else { dpi },
-            });
+        if let Some(info) = inspect_window_rect(hwnd, MIN_TARGET_WINDOW_DIM, MIN_TARGET_WINDOW_DIM) {
+            let area = i64::from(info.width()) * i64::from(info.height());
+            if area > state.best_area {
+                state.best_area = area;
+                state.best_rect = Some(info);
+            }
         }
 
         BOOL::from(true)
@@ -121,17 +145,16 @@ mod imp {
 
     /// Finds the largest visible, non-minimized top-level window belonging to `pid`.
     pub fn find_window_by_pid(pid: u32) -> Option<WindowRectInfo> {
-        let mut state = EnumTargetState {
+        let mut state = EnumPidState {
             target_pid: pid,
             best_area: 0,
             best_rect: None,
         };
 
-        // SAFETY: `enum_windows_proc` only reads `state` through the stack-pinned `LPARAM`
-        // pointer for the synchronous duration of `EnumWindows`.
+        // SAFETY: `enum_pid_windows_proc` only accesses `state` for the synchronous `EnumWindows` call.
         unsafe {
             let _ = EnumWindows(
-                Some(enum_windows_proc),
+                Some(enum_pid_windows_proc),
                 LPARAM((&raw mut state) as isize),
             );
         }
@@ -139,7 +162,123 @@ mod imp {
         state.best_rect
     }
 
-    fn clamp_bounds_for_target(target: WindowRectInfo) -> RECT {
+    #[derive(Clone, Copy)]
+    enum TitleMatchKind {
+        Lobby,
+        Game,
+    }
+
+    struct EnumTitleState {
+        kind: TitleMatchKind,
+        best_area: i64,
+        best_rect: Option<WindowRectInfo>,
+    }
+
+    unsafe extern "system" fn enum_title_windows_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam.0 as *mut EnumTitleState);
+
+        let (min_w, min_h) = match state.kind {
+            TitleMatchKind::Lobby => (800, 500),
+            TitleMatchKind::Game => (640, 480),
+        };
+
+        let Some(info) = inspect_window_rect(hwnd, min_w, min_h) else {
+            return BOOL::from(true);
+        };
+
+        let title = read_window_title(hwnd);
+        if title.is_empty() {
+            return BOOL::from(true);
+        }
+
+        let matched = match state.kind {
+            TitleMatchKind::Lobby => {
+                (title.contains("League of Legends") || title.contains("英雄联盟"))
+                    && !title.contains("Client")
+                    && !title.contains("(TM)")
+            }
+            TitleMatchKind::Game => {
+                title.contains("League of Legends (TM) Client")
+                    || title.contains("League of Legends (TM)")
+            }
+        };
+
+        if matched {
+            let area = i64::from(info.width()) * i64::from(info.height());
+            if area > state.best_area {
+                state.best_area = area;
+                state.best_rect = Some(info);
+            }
+        }
+
+        BOOL::from(true)
+    }
+
+    /// Finds the League client lobby window via `RCLIENT` class, PID fallback, or title match.
+    pub fn find_league_lobby_window(pid: Option<u32>) -> Option<WindowRectInfo> {
+        // SAFETY: `FindWindowW` and `inspect_window_rect` only inspect top-level window handles.
+        unsafe {
+            if let Ok(hwnd) = FindWindowW(w!("RCLIENT"), PCWSTR::null()) {
+                if let Some(info) = inspect_window_rect(hwnd, 600, 400) {
+                    return Some(info);
+                }
+            }
+        }
+
+        if let Some(info) = pid.and_then(find_window_by_pid) {
+            if info.width() >= 600 && info.height() >= 400 {
+                return Some(info);
+            }
+        }
+
+        let mut state = EnumTitleState {
+            kind: TitleMatchKind::Lobby,
+            best_area: 0,
+            best_rect: None,
+        };
+        // SAFETY: `enum_title_windows_proc` accesses `state` synchronously during `EnumWindows`.
+        unsafe {
+            let _ = EnumWindows(
+                Some(enum_title_windows_proc),
+                LPARAM((&raw mut state) as isize),
+            );
+        }
+        state.best_rect
+    }
+
+    /// Finds the active in-game League window via `RiotWindowClass`, PID fallback, or title match.
+    pub fn find_league_game_window(pid: Option<u32>) -> Option<WindowRectInfo> {
+        // SAFETY: `FindWindowW` and `inspect_window_rect` only inspect top-level window handles.
+        unsafe {
+            if let Ok(hwnd) = FindWindowW(w!("RiotWindowClass"), PCWSTR::null()) {
+                if let Some(info) = inspect_window_rect(hwnd, 640, 480) {
+                    return Some(info);
+                }
+            }
+        }
+
+        if let Some(info) = pid.and_then(find_window_by_pid) {
+            if info.width() >= 640 && info.height() >= 480 {
+                return Some(info);
+            }
+        }
+
+        let mut state = EnumTitleState {
+            kind: TitleMatchKind::Game,
+            best_area: 0,
+            best_rect: None,
+        };
+        // SAFETY: `enum_title_windows_proc` accesses `state` synchronously during `EnumWindows`.
+        unsafe {
+            let _ = EnumWindows(
+                Some(enum_title_windows_proc),
+                LPARAM((&raw mut state) as isize),
+            );
+        }
+        state.best_rect
+    }
+
+    fn primary_work_area() -> RECT {
         let mut work_rect = RECT::default();
         // SAFETY: `work_rect` is a valid out-pointer to `RECT`.
         let has_work = unsafe {
@@ -151,11 +290,23 @@ mod imp {
             )
             .is_ok()
         };
+        if has_work {
+            work_rect
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            }
+        }
+    }
 
+    fn clamp_bounds_for_target(target: WindowRectInfo) -> RECT {
+        let work_rect = primary_work_area();
         let center_x = target.left + target.width() / 2;
         let center_y = target.top + target.height() / 2;
-        if has_work
-            && center_x >= work_rect.left
+        if center_x >= work_rect.left
             && center_x <= work_rect.right
             && center_y >= work_rect.top
             && center_y <= work_rect.bottom
@@ -176,16 +327,37 @@ mod imp {
                     right: vx + vw,
                     bottom: vy + vh,
                 }
-            } else if has_work {
-                work_rect
             } else {
-                RECT {
-                    left: 0,
-                    top: 0,
-                    right: 1920,
-                    bottom: 1080,
-                }
+                work_rect
             }
+        }
+    }
+
+    /// Returns a work-area rect suitable for previewing UI modes when League is not running.
+    pub fn default_preview_lobby_rect() -> WindowRectInfo {
+        let work = primary_work_area();
+        let w = (work.right - work.left).min(1280);
+        let h = (work.bottom - work.top).min(760);
+        let left = work.left + ((work.right - work.left - w) / 2).max(0);
+        let top = work.top + ((work.bottom - work.top - h) / 2).max(0);
+        WindowRectInfo {
+            left,
+            top,
+            right: left + w - 340,
+            bottom: top + h,
+            dpi: 96,
+        }
+    }
+
+    /// Returns a work-area rect suitable for previewing the full-screen overlay when League is not running.
+    pub fn default_preview_game_rect() -> WindowRectInfo {
+        let work = primary_work_area();
+        WindowRectInfo {
+            left: work.left,
+            top: work.top,
+            right: work.right,
+            bottom: work.bottom,
+            dpi: 96,
         }
     }
 
@@ -195,22 +367,49 @@ mod imp {
         unsafe { GetAsyncKeyState(i32::from(VK_MENU.0)) < 0 }
     }
 
-    /// Applies topmost, layered, click-through, and tool-window extended styles for in-game overlay mode.
+    unsafe fn apply_transparent_ex_style(hwnd: HWND, interactive: bool) {
+        let current = WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32);
+        let uses_dcomp = current.contains(WS_EX_NOREDIRECTIONBITMAP);
+
+        let mut next = if uses_dcomp {
+            // DirectComposition (`WS_EX_NOREDIRECTIONBITMAP`) MUST NOT have `WS_EX_LAYERED`
+            // set, otherwise Windows compositing turns the window surface invisible.
+            (current & !WS_EX_LAYERED & !WS_EX_APPWINDOW)
+                | WS_EX_NOREDIRECTIONBITMAP
+                | WS_EX_TOPMOST
+                | WS_EX_TOOLWINDOW
+                | WS_EX_NOACTIVATE
+        } else {
+            (current & !WS_EX_APPWINDOW)
+                | WS_EX_LAYERED
+                | WS_EX_TOPMOST
+                | WS_EX_TOOLWINDOW
+                | WS_EX_NOACTIVATE
+        };
+
+        next = if interactive {
+            next & !WS_EX_TRANSPARENT
+        } else {
+            next | WS_EX_TRANSPARENT
+        };
+
+        if next != current {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next.0 as isize);
+        }
+
+        if !uses_dcomp {
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+        }
+    }
+
+    /// Applies topmost, click-through, and tool-window extended styles (DirectComposition-safe).
     #[allow(dead_code)]
     pub fn apply_overlay_styles(window: &Window) -> Result<()> {
         let hwnd = extract_hwnd(window)?;
 
-        // SAFETY: `hwnd` belongs to the live GPUI window on the UI thread; we only update
-        // standard extended window styles, Z-order, and non-activating visibility.
+        // SAFETY: `hwnd` belongs to the live GPUI window on the UI thread.
         unsafe {
-            let current_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let overlay_style = (WINDOW_EX_STYLE(current_style as u32) & !WS_EX_APPWINDOW)
-                | WS_EX_TOPMOST
-                | WS_EX_LAYERED
-                | WS_EX_TRANSPARENT
-                | WS_EX_TOOLWINDOW;
-
-            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, overlay_style.0 as isize);
+            apply_transparent_ex_style(hwnd, false);
 
             SetWindowPos(
                 hwnd,
@@ -224,6 +423,7 @@ mod imp {
             .context("SetWindowPos(HWND_TOPMOST) failed")?;
 
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
 
         Ok(())
@@ -240,20 +440,7 @@ mod imp {
 
         // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
         unsafe {
-            let current = WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32);
-            let base = (current & !WS_EX_APPWINDOW)
-                | WS_EX_TOPMOST
-                | WS_EX_LAYERED
-                | WS_EX_TOOLWINDOW;
-            let next = if interactive {
-                base & !WS_EX_TRANSPARENT
-            } else {
-                base | WS_EX_TRANSPARENT
-            };
-
-            if next != current {
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next.0 as isize);
-            }
+            apply_transparent_ex_style(hwnd, interactive);
 
             let Some(target) = target_rect.filter(|_| visible) else {
                 let _ = ShowWindow(hwnd, SW_HIDE);
@@ -272,6 +459,7 @@ mod imp {
             .context("SetWindowPos(in-game overlay) failed")?;
 
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
 
         Ok(())
@@ -284,9 +472,10 @@ mod imp {
         // SAFETY: `hwnd` is owned by the active GPUI window on the UI thread.
         unsafe {
             let current = WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32);
-            let next = (current & !WS_EX_TRANSPARENT & !WS_EX_APPWINDOW)
+            let next = (current & !WS_EX_TRANSPARENT & !WS_EX_LAYERED & !WS_EX_APPWINDOW)
                 | WS_EX_TOPMOST
-                | WS_EX_TOOLWINDOW;
+                | WS_EX_TOOLWINDOW
+                | WS_EX_NOACTIVATE;
 
             if next != current {
                 SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next.0 as isize);
@@ -337,6 +526,52 @@ mod imp {
             .context("SetWindowPos(lobby dock) failed")?;
 
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+
+        Ok(())
+    }
+
+    /// Positions an interactive floating diagnostics panel near the top-right of the primary work area.
+    pub fn set_diagnostics_window_mode(window: &Window) -> Result<()> {
+        let hwnd = extract_hwnd(window)?;
+
+        // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
+        unsafe {
+            let current = WINDOW_EX_STYLE(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32);
+            let next = (current & !WS_EX_TRANSPARENT & !WS_EX_LAYERED & !WS_EX_APPWINDOW)
+                | WS_EX_TOPMOST
+                | WS_EX_TOOLWINDOW;
+
+            if next != current {
+                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, next.0 as isize);
+            }
+
+            let dpi = GetDpiForWindow(hwnd);
+            let scale = if dpi == 0 { 1.0 } else { dpi as f32 / 96.0 };
+            let width_px = (DIAGNOSTICS_WIDTH_DIP * scale).round() as i32;
+            let height_px = (DIAGNOSTICS_HEIGHT_DIP * scale).round() as i32;
+            let margin_px = (24.0 * scale).round() as i32;
+
+            let work = primary_work_area();
+            let x = (work.right - width_px - margin_px).max(work.left);
+            let y = (work.top + margin_px).min((work.bottom - height_px).max(work.top));
+            let final_w = width_px.min((work.right - work.left).max(240));
+            let final_h = height_px.min((work.bottom - work.top).max(240));
+
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                final_w,
+                final_h,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            .context("SetWindowPos(diagnostics) failed")?;
+
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
         }
 
         Ok(())
@@ -372,6 +607,21 @@ mod imp {
             .with_context(|| format!("failed to open data directory {}", path.display()))?;
         Ok(())
     }
+
+    /// Opens the runtime log file (`hexoverlay.log`) in Notepad.
+    pub fn open_log_file(path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if !path.exists() {
+            let _ = std::fs::File::create(path);
+        }
+        Command::new("notepad.exe")
+            .arg(path)
+            .spawn()
+            .with_context(|| format!("failed to open log file {}", path.display()))?;
+        Ok(())
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -382,6 +632,28 @@ mod imp {
     use gpui::Window;
 
     use super::WindowRectInfo;
+
+    /// Non-Windows stub for `default_preview_lobby_rect`.
+    pub fn default_preview_lobby_rect() -> WindowRectInfo {
+        WindowRectInfo {
+            left: 100,
+            top: 100,
+            right: 1060,
+            bottom: 820,
+            dpi: 96,
+        }
+    }
+
+    /// Non-Windows stub for `default_preview_game_rect`.
+    pub fn default_preview_game_rect() -> WindowRectInfo {
+        WindowRectInfo {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+            dpi: 96,
+        }
+    }
 
     /// Non-Windows stub for `is_alt_hotkey_pressed`.
     pub fn is_alt_hotkey_pressed() -> bool {
@@ -405,12 +677,28 @@ mod imp {
     }
 
     /// Non-Windows stub for `find_window_by_pid`.
+    #[allow(dead_code)]
     pub fn find_window_by_pid(_pid: u32) -> Option<WindowRectInfo> {
+        None
+    }
+
+    /// Non-Windows stub for `find_league_lobby_window`.
+    pub fn find_league_lobby_window(_pid: Option<u32>) -> Option<WindowRectInfo> {
+        None
+    }
+
+    /// Non-Windows stub for `find_league_game_window`.
+    pub fn find_league_game_window(_pid: Option<u32>) -> Option<WindowRectInfo> {
         None
     }
 
     /// Non-Windows stub for `set_lobby_dock_mode`.
     pub fn set_lobby_dock_mode(_window: &Window, _target_rect: Option<WindowRectInfo>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Non-Windows stub for `set_diagnostics_window_mode`.
+    pub fn set_diagnostics_window_mode(_window: &Window) -> Result<()> {
         Ok(())
     }
 
@@ -430,9 +718,16 @@ mod imp {
         tracing::info!(path = %path.display(), "open_data_directory requested on non-Windows");
         Ok(())
     }
+
+    /// Non-Windows stub for `open_log_file`.
+    pub fn open_log_file(path: &Path) -> Result<()> {
+        tracing::info!(path = %path.display(), "open_log_file requested on non-Windows");
+        Ok(())
+    }
 }
 
 pub use imp::{
-    find_window_by_pid, hide_window, is_alt_hotkey_pressed, open_data_directory,
-    set_in_game_overlay_mode, set_lobby_dock_mode,
+    default_preview_game_rect, default_preview_lobby_rect, find_league_game_window,
+    find_league_lobby_window, hide_window, is_alt_hotkey_pressed, open_data_directory,
+    open_log_file, set_diagnostics_window_mode, set_in_game_overlay_mode, set_lobby_dock_mode,
 };

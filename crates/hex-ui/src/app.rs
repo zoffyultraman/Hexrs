@@ -1,10 +1,12 @@
-//! Root GPUI application entity, event-loop polling, WGC vision wiring, tray menu, and Win32 orchestration.
+//! Root GPUI application entity, event-loop polling, WGC vision wiring, diagnostics panel, and Win32 orchestration.
 
 use std::sync::{Arc, RwLock};
 
 use crossbeam_channel::{unbounded, Receiver};
-use gpui::{div, prelude::*, rgba, Context, Render, Window};
-use hex_core::{AppEvent, AppMode, ChampSelectState, CoreHandle, LiveGameState, RoiManifest};
+use gpui::{div, prelude::*, px, rgba, Context, Div, FontWeight, Render, Window};
+use hex_core::{
+    AppEvent, AppMode, ChampSelectState, CoreDiagnostics, CoreHandle, LiveGameState, RoiManifest,
+};
 use hex_data::{
     spawn_background_update, AugmentEvaluation, BenchHighlight, DynamicBuildPlan, EogReporter,
     HeroPreview, HeroStats, MetaEngine, TeamRecommendations, UpdateOutcome, UpdaterConfig,
@@ -13,7 +15,9 @@ use hex_vision::{SharedRoiManifest, VisionController};
 use tracing::{debug, info, warn};
 
 use crate::lobby_view;
+use crate::log_file_path;
 use crate::overlay_view;
+use crate::theme;
 use crate::tray::{TrayAction, TrayController};
 use crate::win32::{self, WindowRectInfo};
 
@@ -28,7 +32,10 @@ pub struct HexOverlayApp {
     pub hotkey_interactive: bool,
     pub telemetry_enabled: bool,
     pub updater_refresh_requested: bool,
+    pub diagnostics_open: bool,
+    pub preview_mode: Option<AppMode>,
     pub champ_select: Option<ChampSelectState>,
+    pub active_champ_select_hero_id: Option<i32>,
     pub live_game: Option<LiveGameState>,
     pub bench_highlights: Vec<BenchHighlight>,
     pub team_recs: TeamRecommendations,
@@ -41,6 +48,8 @@ pub struct HexOverlayApp {
     pub dynamic_build: Option<DynamicBuildPlan>,
     pub active_hero_name_zh: Option<String>,
     pub roi_manifest: SharedRoiManifest,
+    pub last_detected_lobby_rect: Option<WindowRectInfo>,
+    pub last_detected_game_rect: Option<WindowRectInfo>,
     meta: Option<MetaEngine>,
     event_rx: Receiver<AppEvent>,
     vision_rx: Receiver<AppEvent>,
@@ -54,6 +63,7 @@ pub struct HexOverlayApp {
     tray: Option<TrayController>,
     last_lobby_sync: Option<(Option<WindowRectInfo>, bool)>,
     last_overlay_sync: Option<(Option<WindowRectInfo>, bool, bool)>,
+    last_diagnostics_sync: bool,
     last_dormant_hidden: bool,
 }
 
@@ -101,7 +111,10 @@ impl HexOverlayApp {
             hotkey_interactive: false,
             telemetry_enabled: true,
             updater_refresh_requested: false,
+            diagnostics_open: false,
+            preview_mode: None,
             champ_select: None,
+            active_champ_select_hero_id: None,
             live_game: None,
             bench_highlights: Vec::new(),
             team_recs: TeamRecommendations::default(),
@@ -114,6 +127,8 @@ impl HexOverlayApp {
             dynamic_build: None,
             active_hero_name_zh: None,
             roi_manifest,
+            last_detected_lobby_rect: None,
+            last_detected_game_rect: None,
             meta,
             event_rx,
             vision_rx,
@@ -127,6 +142,7 @@ impl HexOverlayApp {
             tray,
             last_lobby_sync: None,
             last_overlay_sync: None,
+            last_diagnostics_sync: false,
             last_dormant_hidden: false,
         }
     }
@@ -206,6 +222,20 @@ impl HexOverlayApp {
                                 .unwrap_or("");
                             self.vision.set_active(self.overlay_visible, mode_str);
                         }
+                        self.reset_window_sync_cache();
+                        dirty = true;
+                    }
+                    TrayAction::ToggleDiagnostics => {
+                        self.diagnostics_open = self
+                            .tray
+                            .as_ref()
+                            .map(TrayController::is_diagnostics_checked)
+                            .unwrap_or(!self.diagnostics_open);
+                        if !self.diagnostics_open {
+                            self.preview_mode = None;
+                        }
+                        info!(diagnostics_open = self.diagnostics_open, "diagnostics panel toggled via tray");
+                        self.reset_window_sync_cache();
                         dirty = true;
                     }
                     TrayAction::ToggleTelemetry => {
@@ -233,6 +263,11 @@ impl HexOverlayApp {
                             warn!(error = %err, "failed to open local data directory");
                         }
                     }
+                    TrayAction::OpenLogFile => {
+                        if let Err(err) = win32::open_log_file(&log_file_path()) {
+                            warn!(error = %err, "failed to open runtime log file");
+                        }
+                    }
                     TrayAction::Quit => {
                         info!("exit requested from system tray; shutting down services");
                         self.vision.shutdown();
@@ -244,7 +279,8 @@ impl HexOverlayApp {
             }
         }
 
-        if self.mode == AppMode::InGameOverlay && self.overlay_visible {
+        if self.mode == AppMode::InGameOverlay && self.overlay_visible && self.preview_mode.is_none()
+        {
             let alt_pressed = win32::is_alt_hotkey_pressed();
             if alt_pressed != self.hotkey_interactive {
                 self.hotkey_interactive = alt_pressed;
@@ -252,6 +288,11 @@ impl HexOverlayApp {
             }
         } else if self.hotkey_interactive {
             self.hotkey_interactive = false;
+            dirty = true;
+        }
+
+        if self.diagnostics_open && self.preview_mode.is_none() {
+            // Keep live CoreDiagnostics values refreshed in the UI while diagnostics panel is visible.
             dirty = true;
         }
 
@@ -284,14 +325,37 @@ impl HexOverlayApp {
         cx.notify();
     }
 
+    /// Sets or exits UI preview mode from the diagnostics panel.
+    pub fn set_preview_mode(&mut self, mode: Option<AppMode>, cx: &mut Context<Self>) {
+        self.preview_mode = mode;
+        self.reset_window_sync_cache();
+        cx.notify();
+    }
+
+    /// Closes the diagnostics panel and syncs the tray check item.
+    pub fn close_diagnostics(&mut self, cx: &mut Context<Self>) {
+        self.diagnostics_open = false;
+        self.preview_mode = None;
+        if let Some(ref tray_ctrl) = self.tray {
+            tray_ctrl.set_diagnostics_checked(false);
+        }
+        self.reset_window_sync_cache();
+        cx.notify();
+    }
+
+    fn reset_window_sync_cache(&mut self) {
+        self.last_lobby_sync = None;
+        self.last_overlay_sync = None;
+        self.last_diagnostics_sync = false;
+        self.last_dormant_hidden = false;
+    }
+
     fn handle_app_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::ModeChanged(next_mode) => {
                 info!(?next_mode, "overlay mode transitioned");
                 self.mode = next_mode;
-                self.last_lobby_sync = None;
-                self.last_overlay_sync = None;
-                self.last_dormant_hidden = false;
+                self.reset_window_sync_cache();
 
                 if let Some(ref tray_ctrl) = self.tray {
                     tray_ctrl.update_status(next_mode);
@@ -323,6 +387,7 @@ impl HexOverlayApp {
                 self.lcu_connected = connected;
                 if !connected {
                     self.champ_select = None;
+                    self.active_champ_select_hero_id = None;
                     self.bench_highlights.clear();
                     self.team_recs = TeamRecommendations::default();
                     self.current_hero_stats = None;
@@ -382,8 +447,10 @@ impl HexOverlayApp {
     }
 
     fn refresh_live_game_data(&mut self, live: &LiveGameState) {
-        self.vision
-            .set_active(self.mode == AppMode::InGameOverlay && self.overlay_visible, &live.game_mode);
+        self.vision.set_active(
+            self.mode == AppMode::InGameOverlay && self.overlay_visible,
+            &live.game_mode,
+        );
 
         let Some(meta) = self.meta.as_ref() else {
             return;
@@ -415,14 +482,19 @@ impl HexOverlayApp {
     }
 
     fn refresh_champ_select_data(&mut self, state: &ChampSelectState) {
-        let Some(meta) = self.meta.as_ref() else {
-            return;
-        };
-
         let active_hero_id = if state.local_champion_id > 0 {
             state.local_champion_id
         } else {
             state.local_intent_id
+        };
+        self.active_champ_select_hero_id = if active_hero_id > 0 {
+            Some(active_hero_id)
+        } else {
+            None
+        };
+
+        let Some(meta) = self.meta.as_ref() else {
+            return;
         };
 
         self.current_hero_stats = if active_hero_id > 0 {
@@ -459,14 +531,43 @@ impl HexOverlayApp {
     }
 
     fn sync_window_mode(&mut self, window: &Window) {
-        match self.mode {
+        if self.diagnostics_open && self.preview_mode.is_none() {
+            if !self.last_diagnostics_sync {
+                if let Err(err) = win32::set_diagnostics_window_mode(window) {
+                    warn!(error = %err, "failed to show diagnostics window");
+                }
+                self.last_diagnostics_sync = true;
+                self.last_dormant_hidden = false;
+            }
+            return;
+        }
+        self.last_diagnostics_sync = false;
+
+        let effective_mode = self.preview_mode.unwrap_or(self.mode);
+        let is_preview = self.preview_mode.is_some();
+
+        match effective_mode {
             AppMode::LobbyDocked => {
-                let target_rect = if self.overlay_visible {
-                    self.core_handle.lcu_pid().and_then(win32::find_window_by_pid)
+                let detected_rect = win32::find_league_lobby_window(self.core_handle.lcu_pid());
+                if detected_rect != self.last_detected_lobby_rect {
+                    match (self.last_detected_lobby_rect, detected_rect) {
+                        (None, Some(rect)) => info!(?rect, "detected League lobby window"),
+                        (Some(_), None) => info!("League lobby window no longer visible"),
+                        (Some(_), Some(rect)) => debug!(?rect, "League lobby window moved/resized"),
+                        (None, None) => {}
+                    }
+                    self.last_detected_lobby_rect = detected_rect;
+                }
+
+                let target_rect = if is_preview {
+                    detected_rect.or_else(|| Some(win32::default_preview_lobby_rect()))
+                } else if self.overlay_visible {
+                    detected_rect
                 } else {
                     None
                 };
-                let state = (target_rect, self.overlay_visible);
+
+                let state = (target_rect, is_preview || self.overlay_visible);
                 if self.last_lobby_sync != Some(state) {
                     if let Err(err) = win32::set_lobby_dock_mode(window, target_rect) {
                         warn!(error = %err, "failed to dock lobby sidebar");
@@ -475,19 +576,32 @@ impl HexOverlayApp {
                 }
             }
             AppMode::InGameOverlay => {
-                let target_rect = if self.overlay_visible {
-                    self.core_handle.game_pid().and_then(win32::find_window_by_pid)
+                let detected_rect = win32::find_league_game_window(self.core_handle.game_pid());
+                if detected_rect != self.last_detected_game_rect {
+                    match (self.last_detected_game_rect, detected_rect) {
+                        (None, Some(rect)) => info!(?rect, "detected League in-game window"),
+                        (Some(_), None) => info!("League in-game window no longer visible"),
+                        (Some(_), Some(rect)) => debug!(?rect, "League in-game window moved/resized"),
+                        (None, None) => {}
+                    }
+                    self.last_detected_game_rect = detected_rect;
+                }
+
+                let target_rect = if is_preview {
+                    detected_rect.or_else(|| Some(win32::default_preview_game_rect()))
+                } else if self.overlay_visible {
+                    detected_rect
                 } else {
                     None
                 };
-                let state = (target_rect, self.hotkey_interactive, self.overlay_visible);
+                let interactive = is_preview || self.hotkey_interactive;
+                let visible = is_preview || self.overlay_visible;
+
+                let state = (target_rect, interactive, visible);
                 if self.last_overlay_sync != Some(state) {
-                    if let Err(err) = win32::set_in_game_overlay_mode(
-                        window,
-                        target_rect,
-                        self.hotkey_interactive,
-                        self.overlay_visible,
-                    ) {
+                    if let Err(err) =
+                        win32::set_in_game_overlay_mode(window, target_rect, interactive, visible)
+                    {
                         warn!(error = %err, "failed to update in-game overlay window");
                     }
                     self.last_overlay_sync = Some(state);
@@ -507,7 +621,11 @@ impl HexOverlayApp {
 
 impl Render for HexOverlayApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        match self.mode {
+        if self.diagnostics_open && self.preview_mode.is_none() {
+            return render_diagnostics_panel(self, cx).into_any_element();
+        }
+
+        match self.preview_mode.unwrap_or(self.mode) {
             AppMode::LobbyDocked => lobby_view::render_lobby_sidebar(self, cx).into_any_element(),
             AppMode::InGameOverlay => {
                 overlay_view::render_in_game_overlay(self, window, cx).into_any_element()
@@ -517,5 +635,283 @@ impl Render for HexOverlayApp {
                 .bg(rgba(0x00000000))
                 .into_any_element(),
         }
+    }
+}
+
+fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>) -> Div {
+    let diag: CoreDiagnostics = app.core_handle.diagnostics();
+    let lobby_rect = app
+        .last_detected_lobby_rect
+        .or_else(|| win32::find_league_lobby_window(diag.lcu_pid));
+    let game_rect = app
+        .last_detected_game_rect
+        .or_else(|| win32::find_league_game_window(diag.game_pid));
+
+    let lobby_rect_str = format_rect_info(lobby_rect);
+    let game_rect_str = format_rect_info(game_rect);
+    let meta_status = if app.meta.is_some() {
+        "已加载内存 SQLite"
+    } else {
+        "未加载"
+    };
+
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(theme::canvas_bg())
+        .border_1()
+        .border_color(theme::border_gold())
+        .text_color(theme::text_primary())
+        .child(
+            div()
+                .px_3()
+                .py_2()
+                .bg(theme::card_bg())
+                .border_b_1()
+                .border_color(theme::border_subtle())
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::gold())
+                        .child("HexOverlay · 运行诊断面板"),
+                )
+                .child(
+                    div()
+                        .id("close-diagnostics-btn")
+                        .cursor_pointer()
+                        .px_2()
+                        .py(px(2.0))
+                        .rounded_md()
+                        .bg(theme::card_elevated_bg())
+                        .border_1()
+                        .border_color(theme::border_subtle())
+                        .hover(|s| s.bg(theme::warning_bg()))
+                        .text_xs()
+                        .text_color(theme::text_primary())
+                        .child("关闭 [×]")
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            this.close_diagnostics(cx);
+                        })),
+                ),
+        )
+        .child(
+            div()
+                .id("diagnostics-scroll")
+                .flex_1()
+                .overflow_y_scroll()
+                .p_3()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .p_2()
+                        .rounded_lg()
+                        .bg(theme::card_bg())
+                        .border_1()
+                        .border_color(theme::border_subtle())
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme::cyan())
+                                .child("核心连接与状态机"),
+                        )
+                        .child(diag_row("当前模式", format!("{:?}", diag.mode)))
+                        .child(diag_row(
+                            "LCU PID / Port",
+                            format!(
+                                "{} / {}",
+                                diag.lcu_pid
+                                    .map(|p| p.to_string())
+                                    .unwrap_or_else(|| "未检测到".to_owned()),
+                                diag.lcu_port
+                                    .map(|p| p.to_string())
+                                    .unwrap_or_else(|| "-".to_owned())
+                            ),
+                        ))
+                        .child(diag_row(
+                            "LCU WS / 选人态",
+                            format!(
+                                "{} / {}",
+                                if diag.lcu_connected_ws { "已连接" } else { "未连接" },
+                                if diag.in_champ_select { "选人中" } else { "否" }
+                            ),
+                        ))
+                        .child(diag_row(
+                            "游戏进程 / Live 2999",
+                            format!(
+                                "{} (PID {}) / {}",
+                                if diag.game_running { "运行中" } else { "未运行" },
+                                diag.game_pid
+                                    .map(|p| p.to_string())
+                                    .unwrap_or_else(|| "-".to_owned()),
+                                if diag.live_api_active { "活跃" } else { "等待中" }
+                            ),
+                        ))
+                        .child(diag_row("MetaEngine 数据库", meta_status.to_owned())),
+                )
+                .child(
+                    div()
+                        .p_2()
+                        .rounded_lg()
+                        .bg(theme::card_bg())
+                        .border_1()
+                        .border_color(theme::border_subtle())
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme::cyan())
+                                .child("Win32 目标窗口定位"),
+                        )
+                        .child(diag_row("大厅窗口 (RCLIENT)", lobby_rect_str))
+                        .child(diag_row("局内窗口 (RiotWindowClass)", game_rect_str)),
+                )
+                .child(
+                    div()
+                        .p_2()
+                        .rounded_lg()
+                        .bg(theme::card_bg())
+                        .border_1()
+                        .border_color(theme::border_gold())
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme::gold())
+                                .child("UI 渲染快速预览（无需对局即可测试）"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("preview-lobby-btn")
+                                        .flex_1()
+                                        .cursor_pointer()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(theme::gold_dim())
+                                        .border_1()
+                                        .border_color(theme::border_gold())
+                                        .hover(|s| s.bg(theme::card_elevated_bg()))
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::gold())
+                                        .child("预览选人侧边栏")
+                                        .on_click(cx.listener(|this, _event, _window, cx| {
+                                            this.set_preview_mode(Some(AppMode::LobbyDocked), cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("preview-overlay-btn")
+                                        .flex_1()
+                                        .cursor_pointer()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(theme::cyan_dim())
+                                        .border_1()
+                                        .border_color(theme::border_cyan())
+                                        .hover(|s| s.bg(theme::card_elevated_bg()))
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::cyan())
+                                        .child("预览局内悬浮窗")
+                                        .on_click(cx.listener(|this, _event, _window, cx| {
+                                            this.set_preview_mode(Some(AppMode::InGameOverlay), cx);
+                                        })),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .p_2()
+                        .rounded_lg()
+                        .bg(theme::card_bg())
+                        .border_1()
+                        .border_color(theme::border_subtle())
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme::gold())
+                                .child("排查建议"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::text_muted())
+                                .child("1. 局内请使用“无边框窗口化”而非全屏独占，否则系统级置顶悬浮窗将被独占画面遮挡。"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::text_muted())
+                                .child("2. 若 WeGame / 客户端以管理员身份运行导致无法识别，请右键“以管理员身份运行 HexOverlay.exe”。"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::text_muted())
+                                .child(format!("3. 完整运行日志位于：{}", log_file_path().display())),
+                        ),
+                ),
+        )
+}
+
+fn diag_row(label: &str, value: String) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .child(
+            div()
+                .text_xs()
+                .text_color(theme::text_muted())
+                .child(label.to_owned()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::text_primary())
+                .child(value),
+        )
+}
+
+fn format_rect_info(rect: Option<WindowRectInfo>) -> String {
+    match rect {
+        Some(r) => format!(
+            "{}x{} @ ({},{}) {}DPI",
+            r.width(),
+            r.height(),
+            r.left,
+            r.top,
+            r.dpi
+        ),
+        None => "未找到可见窗口".to_owned(),
     }
 }
