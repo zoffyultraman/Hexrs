@@ -18,7 +18,7 @@ use hex_data::{
 use hex_vision::{SharedRoiManifest, VisionController, VisionGameContext};
 use tracing::{debug, info, warn};
 
-use crate::lobby_badge_view::{LobbyBadgeState, SlotBadgeData};
+use crate::lobby_badge_view::{BenchBadgeState, SlotBadgeData, TeamBadgeState};
 use crate::lobby_view;
 use crate::log_file_path;
 use crate::overlay_view;
@@ -77,7 +77,8 @@ pub struct HexOverlayApp {
     vision: VisionController,
     tray: Option<TrayController>,
     last_lobby_sync: Option<(Option<WindowRectInfo>, bool)>,
-    last_badge_sync: Option<Option<WindowRectInfo>>,
+    last_bench_badge_sync: Option<(Option<WindowRectInfo>, usize)>,
+    last_team_badge_sync: Option<Option<WindowRectInfo>>,
     last_overlay_sync: Option<(
         Option<WindowRectInfo>,
         OverlayCorner,
@@ -188,7 +189,8 @@ impl HexOverlayApp {
             vision,
             tray,
             last_lobby_sync: None,
-            last_badge_sync: None,
+            last_bench_badge_sync: None,
+            last_team_badge_sync: None,
             last_overlay_sync: None,
             last_diagnostics_sync: false,
             last_dormant_hidden: false,
@@ -480,17 +482,24 @@ impl HexOverlayApp {
 
     fn reset_window_sync_cache(&mut self) {
         self.last_lobby_sync = None;
-        self.last_badge_sync = None;
+        self.last_bench_badge_sync = None;
+        self.last_team_badge_sync = None;
         self.last_overlay_sync = None;
         self.last_diagnostics_sync = false;
         self.last_dormant_hidden = false;
     }
 
-    /// Computes live click-through client badge state and deferred Win32 sync command for `RCLIENT`.
+    /// Computes non-blocking bench and team strip badge states + deferred Win32 window commands.
     pub fn build_lobby_badge_sync(
         &mut self,
-        badge_hwnd_raw: isize,
-    ) -> (LobbyBadgeState, Option<Win32WindowCommand>) {
+        bench_hwnd_raw: isize,
+        team_hwnd_raw: isize,
+    ) -> (
+        BenchBadgeState,
+        Option<Win32WindowCommand>,
+        TeamBadgeState,
+        Option<Win32WindowCommand>,
+    ) {
         let in_diagnostics = self.diagnostics_open && self.preview_mode.is_none();
         let effective_mode = self.preview_mode.unwrap_or(self.mode);
         let is_preview = self.preview_mode.is_some();
@@ -505,23 +514,36 @@ impl HexOverlayApp {
             None
         };
 
-        let badge_cmd = if badge_hwnd_raw != 0 && self.last_badge_sync != Some(target_rect) {
-            self.last_badge_sync = Some(target_rect);
-            Some(Win32WindowCommand {
-                hwnd_raw: badge_hwnd_raw,
-                action: Win32WindowAction::ClientBadgeOverlay(target_rect),
-            })
-        } else {
-            None
-        };
-
         let Some(rect) = target_rect else {
-            return (LobbyBadgeState::default(), badge_cmd);
+            let bench_cmd =
+                if bench_hwnd_raw != 0 && self.last_bench_badge_sync != Some((None, 0)) {
+                    self.last_bench_badge_sync = Some((None, 0));
+                    Some(Win32WindowCommand {
+                        hwnd_raw: bench_hwnd_raw,
+                        action: Win32WindowAction::BenchBadgeStrip {
+                            target_rect: None,
+                            slot_count: 0,
+                        },
+                    })
+                } else {
+                    None
+                };
+            let team_cmd = if team_hwnd_raw != 0 && self.last_team_badge_sync != Some(None) {
+                self.last_team_badge_sync = Some(None);
+                Some(Win32WindowCommand {
+                    hwnd_raw: team_hwnd_raw,
+                    action: Win32WindowAction::TeamBadgeStrip { target_rect: None },
+                })
+            } else {
+                None
+            };
+            return (
+                BenchBadgeState::default(),
+                bench_cmd,
+                TeamBadgeState::default(),
+                team_cmd,
+            );
         };
-
-        let scale = win32::window_scale_for_hwnd(badge_hwnd_raw, rect.scale()).max(0.5);
-        let client_width_dip = rect.width() as f32 / scale;
-        let client_height_dip = rect.height() as f32 / scale;
 
         let (bench_slots, team_slots) = if let Some(cs) = self.champ_select.as_ref() {
             let bench = cs
@@ -556,16 +578,55 @@ impl HexOverlayApp {
             (Vec::new(), Vec::new())
         };
 
-        (
-            LobbyBadgeState {
-                visible: true,
-                bench_slots,
-                team_slots,
-                client_width_dip,
-                client_height_dip,
-            },
-            badge_cmd,
-        )
+        let has_bench = bench_slots.iter().any(Option::is_some);
+        let has_team = team_slots.iter().any(Option::is_some);
+
+        let bench_target = has_bench.then_some(rect);
+        let bench_slot_count = if has_bench { bench_slots.len().min(10) } else { 0 };
+        let bench_cmd = if bench_hwnd_raw != 0
+            && self.last_bench_badge_sync != Some((bench_target, bench_slot_count))
+        {
+            self.last_bench_badge_sync = Some((bench_target, bench_slot_count));
+            Some(Win32WindowCommand {
+                hwnd_raw: bench_hwnd_raw,
+                action: Win32WindowAction::BenchBadgeStrip {
+                    target_rect: bench_target,
+                    slot_count: bench_slot_count,
+                },
+            })
+        } else {
+            None
+        };
+
+        let team_target = has_team.then_some(rect);
+        let team_cmd = if team_hwnd_raw != 0 && self.last_team_badge_sync != Some(team_target) {
+            self.last_team_badge_sync = Some(team_target);
+            Some(Win32WindowCommand {
+                hwnd_raw: team_hwnd_raw,
+                action: Win32WindowAction::TeamBadgeStrip {
+                    target_rect: team_target,
+                },
+            })
+        } else {
+            None
+        };
+
+        let bench_scale = win32::window_scale_for_hwnd(bench_hwnd_raw, rect.scale()).max(0.5);
+        let team_scale = win32::window_scale_for_hwnd(team_hwnd_raw, rect.scale()).max(0.5);
+
+        let bench_state = BenchBadgeState {
+            visible: has_bench,
+            slots: bench_slots,
+            client_width_dip: rect.width() as f32 / bench_scale,
+            client_height_dip: rect.height() as f32 / bench_scale,
+        };
+        let team_state = TeamBadgeState {
+            visible: has_team,
+            slots: team_slots,
+            client_height_dip: rect.height() as f32 / team_scale,
+        };
+
+        (bench_state, bench_cmd, team_state, team_cmd)
     }
 
     fn lookup_slot_badge(&self, hero_id: i32) -> Option<SlotBadgeData> {

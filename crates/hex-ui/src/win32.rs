@@ -33,7 +33,13 @@ pub enum Win32WindowAction {
     Hide,
     Diagnostics,
     LobbyDock(Option<WindowRectInfo>),
-    ClientBadgeOverlay(Option<WindowRectInfo>),
+    BenchBadgeStrip {
+        target_rect: Option<WindowRectInfo>,
+        slot_count: usize,
+    },
+    TeamBadgeStrip {
+        target_rect: Option<WindowRectInfo>,
+    },
     InGameOverlay {
         target_rect: Option<WindowRectInfo>,
         corner: OverlayCorner,
@@ -583,8 +589,12 @@ mod imp {
             Win32WindowAction::LobbyDock(target_rect) => {
                 set_lobby_dock_mode_hwnd(hwnd, target_rect)
             }
-            Win32WindowAction::ClientBadgeOverlay(target_rect) => {
-                set_client_badge_overlay_hwnd(hwnd, target_rect)
+            Win32WindowAction::BenchBadgeStrip {
+                target_rect,
+                slot_count,
+            } => set_bench_badge_strip_hwnd(hwnd, target_rect, slot_count),
+            Win32WindowAction::TeamBadgeStrip { target_rect } => {
+                set_team_badge_strip_hwnd(hwnd, target_rect)
             }
             Win32WindowAction::InGameOverlay {
                 target_rect,
@@ -696,11 +706,64 @@ mod imp {
         Ok(())
     }
 
-    /// Anchors a permanently click-through overlay window directly over `LeagueClientUx.exe`.
-    fn set_client_badge_overlay_hwnd(
+    /// Anchors the narrow horizontal bench badge strip strictly below the 10 bench portraits.
+    fn set_bench_badge_strip_hwnd(
         hwnd: HWND,
         target_rect: Option<WindowRectInfo>,
+        slot_count: usize,
     ) -> Result<()> {
+        // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
+        unsafe {
+            apply_transparent_ex_style(hwnd, false);
+
+            let Some(target) = target_rect.filter(|_| slot_count > 0) else {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return Ok(());
+            };
+
+            let own_dpi = GetDpiForWindow(hwnd);
+            let dpi = if own_dpi > 0 { own_dpi } else { target.dpi.max(96) };
+            let scale = dpi as f32 / 96.0;
+
+            let target_w = target.width().max(320);
+            let target_h = target.height().max(200);
+            let count = slot_count.clamp(1, 10);
+
+            let x = (target.left + (0.2735 * target_w as f32).round() as i32)
+                .clamp(target.left, target.right.saturating_sub(1));
+            let max_w = (target.right - x).max(1);
+            let raw_w = (((count - 1) as f32 * 0.0464 + 0.0450) * target_w as f32).round() as i32;
+            let w = raw_w.max((44.0 * scale).round() as i32).min(max_w);
+
+            let y = (target.top + (0.0835 * target_h as f32).round() as i32)
+                .clamp(target.top, target.bottom.saturating_sub(1));
+            let max_h = (target.bottom - y).max(1);
+            let min_h = (18.0 * scale).round() as i32;
+            let cap_h = (32.0 * scale).round() as i32;
+            let h = ((0.0290 * target_h as f32).round() as i32)
+                .clamp(min_h, cap_h)
+                .min(max_h);
+
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            .context("SetWindowPos(bench badge strip) failed")?;
+
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+
+        Ok(())
+    }
+
+    /// Anchors the narrow vertical allied badge strip strictly to the right of the 5 hero cards.
+    fn set_team_badge_strip_hwnd(hwnd: HWND, target_rect: Option<WindowRectInfo>) -> Result<()> {
         // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
         unsafe {
             apply_transparent_ex_style(hwnd, false);
@@ -710,16 +773,38 @@ mod imp {
                 return Ok(());
             };
 
+            let own_dpi = GetDpiForWindow(hwnd);
+            let dpi = if own_dpi > 0 { own_dpi } else { target.dpi.max(96) };
+            let scale = dpi as f32 / 96.0;
+
+            let target_w = target.width().max(320);
+            let target_h = target.height().max(200);
+
+            let x = (target.left + (0.2980 * target_w as f32).round() as i32)
+                .clamp(target.left, target.right.saturating_sub(1));
+            let max_w = (target.right - x).max(1);
+            let w = ((88.0 * scale).round() as i32)
+                .min((target_w as f32 * 0.09).round() as i32)
+                .max((68.0 * scale).round() as i32)
+                .min(max_w);
+
+            let y = (target.top + (0.1261 * target_h as f32).round() as i32)
+                .clamp(target.top, target.bottom.saturating_sub(1));
+            let max_h = (target.bottom - y).max(1);
+            let h = ((0.5647 * target_h as f32).round() as i32)
+                .max((120.0 * scale).round() as i32)
+                .min(max_h);
+
             SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
-                target.left,
-                target.top,
-                target.width().max(100),
-                target.height().max(100),
+                x,
+                y,
+                w,
+                h,
                 SWP_NOACTIVATE | SWP_FRAMECHANGED,
             )
-            .context("SetWindowPos(client badge overlay) failed")?;
+            .context("SetWindowPos(team badge strip) failed")?;
 
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = InvalidateRect(Some(hwnd), None, false);

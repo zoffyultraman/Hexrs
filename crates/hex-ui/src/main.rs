@@ -22,7 +22,9 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::HexOverlayApp;
-use crate::lobby_badge_view::{LobbyBadgeOverlay, LobbyBadgeState};
+use crate::lobby_badge_view::{
+    BenchBadgeOverlay, BenchBadgeState, TeamBadgeOverlay, TeamBadgeState,
+};
 use crate::tray::TrayController;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(60);
@@ -102,8 +104,8 @@ fn main() {
             }
         };
 
-        let mut badge_hwnd_raw: isize = 0;
-        let badge_options = WindowOptions {
+        let mut bench_hwnd_raw: isize = 0;
+        let bench_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             titlebar: None,
             kind: WindowKind::PopUp,
@@ -112,38 +114,84 @@ fn main() {
             show: true,
             ..Default::default()
         };
-        let badge_window_handle = match cx.open_window(badge_options, |window, cx| {
+        let bench_window_handle = match cx.open_window(bench_options, |window, cx| {
             if let Ok(raw) = win32::window_hwnd_raw(window) {
-                badge_hwnd_raw = raw;
+                bench_hwnd_raw = raw;
             }
-            cx.new(|_| LobbyBadgeOverlay::new())
+            cx.new(|_| BenchBadgeOverlay::new())
         }) {
             Ok(handle) => Some(handle),
             Err(err) => {
-                warn!(error = %err, "failed to open HexOverlay client badge window");
+                warn!(error = %err, "failed to open HexOverlay bench badge strip window");
+                None
+            }
+        };
+
+        let mut team_hwnd_raw: isize = 0;
+        let team_options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: None,
+            kind: WindowKind::PopUp,
+            window_background: WindowBackgroundAppearance::Transparent,
+            focus: false,
+            show: true,
+            ..Default::default()
+        };
+        let team_window_handle = match cx.open_window(team_options, |window, cx| {
+            if let Ok(raw) = win32::window_hwnd_raw(window) {
+                team_hwnd_raw = raw;
+            }
+            cx.new(|_| TeamBadgeOverlay::new())
+        }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                warn!(error = %err, "failed to open HexOverlay team badge strip window");
                 None
             }
         };
 
         cx.spawn(async move |cx: &mut AsyncApp| loop {
             cx.background_executor().timer(EVENT_POLL_INTERVAL).await;
-            let (main_cmd, badge_state, badge_cmd) =
+            let (main_cmd, bench_state, bench_cmd, team_state, team_cmd) =
                 match window_handle.update(cx, |app, window, cx| {
                     let main_cmd = app.tick(window, cx);
-                    let (badge_state, badge_cmd) = if badge_window_handle.is_some() {
-                        app.build_lobby_badge_sync(badge_hwnd_raw)
+                    let active_bench_hwnd = if bench_window_handle.is_some() {
+                        bench_hwnd_raw
                     } else {
-                        (LobbyBadgeState::default(), None)
+                        0
                     };
-                    (main_cmd, badge_state, badge_cmd)
+                    let active_team_hwnd = if team_window_handle.is_some() {
+                        team_hwnd_raw
+                    } else {
+                        0
+                    };
+                    if active_bench_hwnd == 0 && active_team_hwnd == 0 {
+                        (
+                            main_cmd,
+                            BenchBadgeState::default(),
+                            None,
+                            TeamBadgeState::default(),
+                            None,
+                        )
+                    } else {
+                        let (bench_state, bench_cmd, team_state, team_cmd) =
+                            app.build_lobby_badge_sync(active_bench_hwnd, active_team_hwnd);
+                        (main_cmd, bench_state, bench_cmd, team_state, team_cmd)
+                    }
                 }) {
                     Ok(tuple) => tuple,
                     Err(_) => break,
                 };
 
-            if let Some(ref badge_handle) = badge_window_handle {
-                let _ = badge_handle.update(cx, |overlay, _window, cx| {
-                    overlay.update_state(badge_state, cx);
+            if let Some(ref bench_handle) = bench_window_handle {
+                let _ = bench_handle.update(cx, |overlay, _window, cx| {
+                    overlay.update_state(bench_state, cx);
+                });
+            }
+
+            if let Some(ref team_handle) = team_window_handle {
+                let _ = team_handle.update(cx, |overlay, _window, cx| {
+                    overlay.update_state(team_state, cx);
                 });
             }
 
@@ -162,12 +210,24 @@ fn main() {
                 }
             }
 
-            if let Some(cmd) = badge_cmd {
+            if let Some(cmd) = bench_cmd {
                 if let Err(err) = win32::apply_window_command(cmd) {
-                    warn!(error = %err, ?cmd.action, "failed to apply deferred client badge window command");
+                    warn!(error = %err, ?cmd.action, "failed to apply deferred bench badge strip command");
                 }
-                if let Some(ref badge_handle) = badge_window_handle {
-                    let _ = badge_handle.update(cx, |_overlay, window, cx| {
+                if let Some(ref bench_handle) = bench_window_handle {
+                    let _ = bench_handle.update(cx, |_overlay, window, cx| {
+                        window.refresh();
+                        cx.notify();
+                    });
+                }
+            }
+
+            if let Some(cmd) = team_cmd {
+                if let Err(err) = win32::apply_window_command(cmd) {
+                    warn!(error = %err, ?cmd.action, "failed to apply deferred team badge strip command");
+                }
+                if let Some(ref team_handle) = team_window_handle {
+                    let _ = team_handle.update(cx, |_overlay, window, cx| {
                         window.refresh();
                         cx.notify();
                     });

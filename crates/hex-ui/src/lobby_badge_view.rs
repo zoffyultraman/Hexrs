@@ -1,51 +1,49 @@
-//! Click-through, DirectComposition-safe in-place Champ Select hero tier + win-rate badges
-//! overlaid directly onto `LeagueClientUx.exe` (`RCLIENT`).
+//! Click-through, DirectComposition-safe razor-thin strip overlays anchored strictly to
+//! non-interactive regions of `LeagueClientUx.exe` (`RCLIENT`) during Champ Select.
 
 use gpui::{div, prelude::*, px, rgba, Context, Div, FontWeight, Render};
 use hex_core::HeroTier;
 
 use crate::theme;
 
-const BENCH_SLOT0_CX: f32 = 0.2960;
-const BENCH_SLOT_PITCH: f32 = 0.0464;
-const BENCH_BADGE_TOP_Y: f32 = 0.0835;
+const BENCH_SLOT_PITCH_FRAC: f32 = 0.0464;
+const BENCH_SLOT_WIDTH_FRAC: f32 = 0.0440;
+const BENCH_SLOT_HEIGHT_FRAC: f32 = 0.0285;
 
-const TEAM_BADGE_LEFT_X: f32 = 0.2980;
-const TEAM_ROW0_CY: f32 = 0.1826;
-const TEAM_ROW_PITCH: f32 = 0.1129;
+const TEAM_ROW_PITCH_FRAC: f32 = 0.1129;
+const TEAM_BADGE_HEIGHT_FRAC: f32 = 0.038;
 
-/// Single champion strength badge rendered onto the League client window.
+/// Single champion strength badge rendered onto a Champ Select strip overlay.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlotBadgeData {
     pub tier: HeroTier,
     pub win_rate: f64,
 }
 
-/// Immutable frame snapshot synced from `HexOverlayApp` to `LobbyBadgeOverlay`.
+/// Immutable frame snapshot synced from `HexOverlayApp` to `BenchBadgeOverlay`.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub struct LobbyBadgeState {
+pub struct BenchBadgeState {
     pub visible: bool,
-    pub bench_slots: Vec<Option<SlotBadgeData>>,
-    pub team_slots: Vec<Option<SlotBadgeData>>,
+    pub slots: Vec<Option<SlotBadgeData>>,
     pub client_width_dip: f32,
     pub client_height_dip: f32,
 }
 
-/// Transparent secondary GPUI window entity rendering in-place Champ Select badges.
-pub struct LobbyBadgeOverlay {
-    state: LobbyBadgeState,
+/// Narrow horizontal strip window strictly below the top 10 bench portraits.
+pub struct BenchBadgeOverlay {
+    state: BenchBadgeState,
 }
 
-impl LobbyBadgeOverlay {
-    /// Creates an initially hidden badge overlay.
+impl BenchBadgeOverlay {
+    /// Creates an initially hidden bench badge strip overlay.
     pub fn new() -> Self {
         Self {
-            state: LobbyBadgeState::default(),
+            state: BenchBadgeState::default(),
         }
     }
 
     /// Replaces `state` and notifies GPUI only when geometry, visibility, or slot values changed.
-    pub fn update_state(&mut self, next: LobbyBadgeState, cx: &mut Context<Self>) {
+    pub fn update_state(&mut self, next: BenchBadgeState, cx: &mut Context<Self>) {
         if self.state != next {
             self.state = next;
             cx.notify();
@@ -53,37 +51,36 @@ impl LobbyBadgeOverlay {
     }
 }
 
-impl Render for LobbyBadgeOverlay {
+impl Render for BenchBadgeOverlay {
     fn render(&mut self, _window: &mut gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
         if !self.state.visible
             || self.state.client_width_dip <= 100.0
             || self.state.client_height_dip <= 100.0
+            || self.state.slots.iter().all(Option::is_none)
         {
             return div().size_full().bg(rgba(0x00000000));
         }
 
         let w = self.state.client_width_dip;
         let h = self.state.client_height_dip;
+        let slot_w = (w * BENCH_SLOT_WIDTH_FRAC).clamp(44.0, 92.0);
+        let slot_h = (h * BENCH_SLOT_HEIGHT_FRAC).clamp(18.0, 30.0);
+        let bench_font_px = (slot_w * 0.175).clamp(9.0, 12.0);
 
         let mut canvas: Div = div().size_full().relative().bg(rgba(0x00000000));
 
-        let slot_w = (w * 0.0440).clamp(44.0, 92.0);
-        let slot_h = (h * 0.0285).clamp(18.0, 30.0);
-        let bench_font_px = (slot_w * 0.175).clamp(9.0, 12.0);
-
-        for (idx, slot) in self.state.bench_slots.iter().take(10).enumerate() {
+        for (idx, slot) in self.state.slots.iter().take(10).enumerate() {
             let Some(badge) = slot.as_ref() else {
                 continue;
             };
             let (_bg, border_color, text_color) = theme::tier_colors(badge.tier);
-            let left = w * (BENCH_SLOT0_CX + idx as f32 * BENCH_SLOT_PITCH) - slot_w * 0.5;
-            let top = h * BENCH_BADGE_TOP_Y;
+            let left = idx as f32 * (BENCH_SLOT_PITCH_FRAC * w);
 
             canvas = canvas.child(
                 div()
                     .absolute()
                     .left(px(left))
-                    .top(px(top))
+                    .top(px(0.0))
                     .w(px(slot_w))
                     .h(px(slot_h))
                     .rounded_md()
@@ -111,21 +108,66 @@ impl Render for LobbyBadgeOverlay {
             );
         }
 
-        let badge_h = (h * 0.038).clamp(22.0, 34.0);
+        canvas
+    }
+}
+
+/// Immutable frame snapshot synced from `HexOverlayApp` to `TeamBadgeOverlay`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct TeamBadgeState {
+    pub visible: bool,
+    pub slots: Vec<Option<SlotBadgeData>>,
+    pub client_height_dip: f32,
+}
+
+/// Narrow vertical strip window strictly to the right of the 5 allied hero cards.
+pub struct TeamBadgeOverlay {
+    state: TeamBadgeState,
+}
+
+impl TeamBadgeOverlay {
+    /// Creates an initially hidden allied team badge strip overlay.
+    pub fn new() -> Self {
+        Self {
+            state: TeamBadgeState::default(),
+        }
+    }
+
+    /// Replaces `state` and notifies GPUI only when geometry, visibility, or slot values changed.
+    pub fn update_state(&mut self, next: TeamBadgeState, cx: &mut Context<Self>) {
+        if self.state != next {
+            self.state = next;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for TeamBadgeOverlay {
+    fn render(&mut self, _window: &mut gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.state.visible
+            || self.state.client_height_dip <= 100.0
+            || self.state.slots.iter().all(Option::is_none)
+        {
+            return div().size_full().bg(rgba(0x00000000));
+        }
+
+        let h = self.state.client_height_dip;
+        let badge_h = (h * TEAM_BADGE_HEIGHT_FRAC).clamp(22.0, 34.0);
         let team_font_px = (badge_h * 0.46).clamp(11.0, 14.0);
 
-        for (idx, slot) in self.state.team_slots.iter().take(5).enumerate() {
+        let mut canvas: Div = div().size_full().relative().bg(rgba(0x00000000));
+
+        for (idx, slot) in self.state.slots.iter().take(5).enumerate() {
             let Some(badge) = slot.as_ref() else {
                 continue;
             };
             let (bg, border, text) = theme::tier_colors(badge.tier);
-            let left = w * TEAM_BADGE_LEFT_X;
-            let top = h * (TEAM_ROW0_CY + idx as f32 * TEAM_ROW_PITCH) - badge_h * 0.5;
+            let top = ((idx as f32 + 0.5) * (TEAM_ROW_PITCH_FRAC * h)) - badge_h * 0.5;
 
             canvas = canvas.child(
                 div()
                     .absolute()
-                    .left(px(left))
+                    .left(px(0.0))
                     .top(px(top))
                     .h(px(badge_h))
                     .px(px(6.0))
