@@ -31,7 +31,7 @@ const TEAM_RECOMMENDATION_LIMIT: usize = 5;
 const PREVIEW_YASUO_HERO_ID: i32 = 157;
 
 /// Root GPUI state and controller bridging `hex-core`, `hex-vision`, `hex-data`, `tray-icon`, and Win32.
-pub struct HexOverlayApp {
+pub struct HexrsApp {
     pub mode: AppMode,
     pub lcu_connected: bool,
     pub overlay_visible: bool,
@@ -93,7 +93,7 @@ pub struct HexOverlayApp {
     last_logged_hud_signature: Option<(Option<i32>, usize, bool)>,
 }
 
-impl HexOverlayApp {
+impl HexrsApp {
     /// Constructs the GPUI root entity, initializing `MetaEngine`, `IconCache`, `VisionController`, and tray status.
     pub fn new(
         event_rx: Receiver<AppEvent>,
@@ -469,13 +469,13 @@ impl HexOverlayApp {
     pub fn relaunch_as_admin(&mut self, cx: &mut Context<Self>) {
         match win32::relaunch_as_administrator() {
             Ok(()) => {
-                info!("relaunching HexOverlay with UAC elevation; shutting down current instance");
+                info!("relaunching Hexrs with UAC elevation; shutting down current instance");
                 self.vision.shutdown();
                 self.core_handle.shutdown();
                 cx.quit();
             }
             Err(err) => {
-                warn!(error = %err, "failed to relaunch HexOverlay as administrator");
+                warn!(error = %err, "failed to relaunch Hexrs as administrator");
             }
         }
     }
@@ -1098,7 +1098,7 @@ fn live_game_to_vision_ctx(live: &LiveGameState) -> VisionGameContext {
     }
 }
 
-impl Render for HexOverlayApp {
+impl Render for HexrsApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.diagnostics_open && self.preview_mode.is_none() {
             return render_diagnostics_panel(self, cx).into_any_element();
@@ -1128,7 +1128,7 @@ fn placeholder_augment_eval() -> AugmentEvaluation {
     }
 }
 
-fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>) -> Div {
+fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
     let diag: CoreDiagnostics = app.core_handle.diagnostics();
     let lobby_rect = app
         .last_detected_lobby_rect
@@ -1183,7 +1183,7 @@ fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
                         .text_sm()
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme::gold())
-                        .child("HexOverlay · 运行诊断面板"),
+                        .child("Hexrs · 运行诊断面板"),
                 )
                 .child(
                     div()

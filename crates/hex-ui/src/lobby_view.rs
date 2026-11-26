@@ -7,13 +7,13 @@ use hex_data::{
     SynergyRecommendation, TeamDiagnosis, TeamRecommendations,
 };
 
-use crate::app::HexOverlayApp;
+use crate::app::HexrsApp;
 use crate::theme::{self, tier_badge};
 
 const SPLIT_BAR_WIDTH_PX: f32 = 268.0;
 
 /// Renders the interactive 320px-wide Champ Select sidebar docked beside `LeagueClientUx.exe`.
-pub fn render_lobby_sidebar(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>) -> Div {
+pub fn render_lobby_sidebar(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
     let champ_select = app.champ_select.as_ref();
     let lcu_connected = app.lcu_connected;
     let current_hero = app.current_hero_stats.as_ref();
@@ -80,7 +80,7 @@ pub fn render_lobby_sidebar(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
         )
 }
 
-fn render_preview_banner(cx: &mut Context<HexOverlayApp>) -> Div {
+fn render_preview_banner(cx: &mut Context<HexrsApp>) -> Div {
     div()
         .px_3()
         .py_1()
@@ -158,7 +158,7 @@ fn render_header(lcu_connected: bool, champ_select: Option<&ChampSelectState>) -
                         .text_sm()
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme::gold())
-                        .child("HEXOVERLAY"),
+                        .child("HEXRS"),
                 ),
         )
         .child(
@@ -193,7 +193,7 @@ fn render_active_hero_section(
     active_hero_id: Option<i32>,
     expanded_hero_id: Option<i32>,
     selected_preview: Option<&HeroPreview>,
-    cx: &mut Context<HexOverlayApp>,
+    cx: &mut Context<HexrsApp>,
 ) -> Div {
     let Some(hero) = current_hero else {
         if let Some(hero_id) = active_hero_id.filter(|&id| id > 0) {
@@ -349,7 +349,7 @@ fn render_team_heroes_section(
     active_hero_id: Option<i32>,
     expanded_hero_id: Option<i32>,
     selected_preview: Option<&HeroPreview>,
-    cx: &mut Context<HexOverlayApp>,
+    cx: &mut Context<HexrsApp>,
 ) -> Div {
     let mut pills = div().flex().flex_wrap().gap_1();
     for hero in team_heroes {
@@ -441,7 +441,7 @@ fn render_bench_section(
     bench: &[BenchHighlight],
     expanded_hero_id: Option<i32>,
     selected_preview: Option<&HeroPreview>,
-    cx: &mut Context<HexOverlayApp>,
+    cx: &mut Context<HexrsApp>,
 ) -> Div {
     let mut pills = div().flex().flex_wrap().gap_1();
     for item in bench {
@@ -630,7 +630,7 @@ fn render_recommendations_section(
     recs: &TeamRecommendations,
     expanded_hero_id: Option<i32>,
     selected_preview: Option<&HeroPreview>,
-    cx: &mut Context<HexOverlayApp>,
+    cx: &mut Context<HexrsApp>,
 ) -> Div {
     let mut list = div().flex().flex_col().gap_2();
 
@@ -682,7 +682,7 @@ fn render_recommendation_row(
     rec: &SynergyRecommendation,
     expanded_hero_id: Option<i32>,
     selected_preview: Option<&HeroPreview>,
-    cx: &mut Context<HexOverlayApp>,
+    cx: &mut Context<HexrsApp>,
 ) -> AnyElement {
     let hero_id = rec.hero_id;
     let is_expanded = expanded_hero_id == Some(hero_id);

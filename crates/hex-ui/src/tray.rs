@@ -58,7 +58,7 @@ impl TrayController {
             !hex_core::is_current_process_elevated(),
             None,
         );
-        let quit_item = MenuItem::new("退出 HexOverlay", true, None);
+        let quit_item = MenuItem::new("退出 Hexrs", true, None);
 
         let sep1 = PredefinedMenuItem::separator();
         let sep2 = PredefinedMenuItem::separator();
@@ -101,7 +101,7 @@ impl TrayController {
         let icon = build_hextech_icon()?;
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("HexOverlay · 休眠中")
+            .with_tooltip("Hexrs · 休眠中")
             .with_icon(icon)
             .build()
             .context("failed to build TrayIcon")?;
@@ -156,9 +156,9 @@ impl TrayController {
     /// Updates the disabled status line and tooltip to reflect the active mode.
     pub fn update_status(&self, mode: AppMode) {
         let (status_label, tooltip) = match mode {
-            AppMode::Dormant => ("状态: 休眠中", "HexOverlay · 休眠中"),
-            AppMode::LobbyDocked => ("状态: 选人侧边栏", "HexOverlay · 选人侧边栏"),
-            AppMode::InGameOverlay => ("状态: 局内悬浮窗", "HexOverlay · 局内悬浮窗"),
+            AppMode::Dormant => ("状态: 休眠中", "Hexrs · 休眠中"),
+            AppMode::LobbyDocked => ("状态: 选人侧边栏", "Hexrs · 选人侧边栏"),
+            AppMode::InGameOverlay => ("状态: 局内悬浮窗", "Hexrs · 局内悬浮窗"),
         };
         self.status_item.set_text(status_label);
         let _ = self.tray_icon.set_tooltip(Some(tooltip));

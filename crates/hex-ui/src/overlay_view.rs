@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use gpui::{div, img, prelude::*, px, rgba, Div, FontWeight, ObjectFit};
 use hex_data::{AugmentEvaluation, BuildItemInfo, DynamicBuildPlan};
 
-use crate::app::HexOverlayApp;
+use crate::app::HexrsApp;
 use crate::theme::{self, tier_badge};
 
 /// Renders either the 3-card augment strip (when an offer is active) or the compact corner equipment HUD.
-pub fn render_in_game_overlay(app: &HexOverlayApp) -> Div {
+pub fn render_in_game_overlay(app: &HexrsApp) -> Div {
     if !app.overlay_visible {
         return div().size_full().bg(rgba(0x00000000));
     }
@@ -57,7 +57,7 @@ pub fn render_in_game_overlay(app: &HexOverlayApp) -> Div {
         .child(render_item_grid(app, app.dynamic_build.as_ref()))
 }
 
-fn render_augment_offer_bar(app: &HexOverlayApp) -> Div {
+fn render_augment_offer_bar(app: &HexrsApp) -> Div {
     let mut columns = div()
         .size_full()
         .flex()
@@ -312,7 +312,7 @@ fn render_hero_header(
         })
 }
 
-fn render_item_grid(app: &HexOverlayApp, build: Option<&DynamicBuildPlan>) -> Div {
+fn render_item_grid(app: &HexrsApp, build: Option<&DynamicBuildPlan>) -> Div {
     let Some(plan) = build else {
         return div()
             .w_full()

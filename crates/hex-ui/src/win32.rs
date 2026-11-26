@@ -953,7 +953,7 @@ mod imp {
         Ok(())
     }
 
-    /// Opens the runtime log file (`hexoverlay.log`) in Notepad.
+    /// Opens the runtime log file (`hexrs.log`) in Notepad.
     pub fn open_log_file(path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -968,9 +968,9 @@ mod imp {
         Ok(())
     }
 
-    /// Relaunches the current `HexOverlay.exe` elevated via Windows UAC (`runas`).
+    /// Relaunches the current `Hexrs.exe` elevated via Windows UAC (`runas`).
     pub fn relaunch_as_administrator() -> Result<()> {
-        let exe = std::env::current_exe().context("failed to resolve current HexOverlay.exe path")?;
+        let exe = std::env::current_exe().context("failed to resolve current Hexrs.exe path")?;
         let exe_w: Vec<u16> = exe
             .as_os_str()
             .encode_wide()

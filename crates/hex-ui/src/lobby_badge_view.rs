@@ -20,7 +20,7 @@ pub struct SlotBadgeData {
     pub win_rate: f64,
 }
 
-/// Immutable frame snapshot synced from `HexOverlayApp` to `BenchBadgeOverlay`.
+/// Immutable frame snapshot synced from `HexrsApp` to `BenchBadgeOverlay`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct BenchBadgeState {
     pub visible: bool,
@@ -112,7 +112,7 @@ impl Render for BenchBadgeOverlay {
     }
 }
 
-/// Immutable frame snapshot synced from `HexOverlayApp` to `TeamBadgeOverlay`.
+/// Immutable frame snapshot synced from `HexrsApp` to `TeamBadgeOverlay`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TeamBadgeState {
     pub visible: bool,

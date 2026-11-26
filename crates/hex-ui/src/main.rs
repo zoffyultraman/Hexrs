@@ -21,7 +21,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::EnvFilter;
 
-use crate::app::HexOverlayApp;
+use crate::app::HexrsApp;
 use crate::lobby_badge_view::{
     BenchBadgeOverlay, BenchBadgeState, TeamBadgeOverlay, TeamBadgeState,
 };
@@ -29,9 +29,9 @@ use crate::tray::TrayController;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(60);
 
-/// Returns `%LOCALAPPDATA%/Hexrs/hexoverlay.log` (or platform equivalent).
+/// Returns `%LOCALAPPDATA%/Hexrs/hexrs.log` (or platform equivalent).
 pub fn log_file_path() -> PathBuf {
-    hex_data::data_dir().join("hexoverlay.log")
+    hex_data::data_dir().join("hexrs.log")
 }
 
 fn init_tracing() {
@@ -71,7 +71,7 @@ fn main() {
 
     info!(
         log_path = %log_file_path().display(),
-        "HexOverlay starting GPUI event loop"
+        "Hexrs starting GPUI event loop"
     );
 
     Application::new().run(move |cx: &mut App| {
@@ -95,11 +95,11 @@ fn main() {
         };
 
         let window_handle = match cx.open_window(options, |_window, cx| {
-            cx.new(|_| HexOverlayApp::new(event_rx, core_handle, tray))
+            cx.new(|_| HexrsApp::new(event_rx, core_handle, tray))
         }) {
             Ok(handle) => handle,
             Err(err) => {
-                error!(error = %err, "failed to open HexOverlay window");
+                error!(error = %err, "failed to open Hexrs window");
                 return;
             }
         };
@@ -122,7 +122,7 @@ fn main() {
         }) {
             Ok(handle) => Some(handle),
             Err(err) => {
-                warn!(error = %err, "failed to open HexOverlay bench badge strip window");
+                warn!(error = %err, "failed to open Hexrs bench badge strip window");
                 None
             }
         };
@@ -145,7 +145,7 @@ fn main() {
         }) {
             Ok(handle) => Some(handle),
             Err(err) => {
-                warn!(error = %err, "failed to open HexOverlay team badge strip window");
+                warn!(error = %err, "failed to open Hexrs team badge strip window");
                 None
             }
         };
