@@ -6,3 +6,6 @@ __pycache__/
 *.log
 crates/hex-data/assets/
 dist/
+code_artifact.md
+*_plan.md
+
