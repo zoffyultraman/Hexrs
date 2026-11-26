@@ -5,10 +5,13 @@ use hex_core::AppMode;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+use crate::win32::OverlayCorner;
+
 /// User action triggered from the system tray context menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
     ToggleOverlay,
+    ToggleOverlayCorner,
     ToggleDiagnostics,
     CheckDataUpdate,
     ToggleTelemetry,
@@ -23,9 +26,11 @@ pub struct TrayController {
     tray_icon: TrayIcon,
     status_item: MenuItem,
     toggle_overlay_item: CheckMenuItem,
+    toggle_corner_item: MenuItem,
     toggle_diagnostics_item: CheckMenuItem,
     toggle_telemetry_item: CheckMenuItem,
     toggle_overlay_id: MenuId,
+    toggle_corner_id: MenuId,
     toggle_diagnostics_id: MenuId,
     toggle_telemetry_id: MenuId,
     check_update_id: MenuId,
@@ -42,6 +47,7 @@ impl TrayController {
 
         let status_item = MenuItem::new("状态: 休眠中", false, None);
         let toggle_overlay_item = CheckMenuItem::new("显示悬浮窗", true, true, None);
+        let toggle_corner_item = MenuItem::new("局内位置: 左上角 (点击切右上角)", true, None);
         let toggle_diagnostics_item = CheckMenuItem::new("显示诊断面板", true, false, None);
         let toggle_telemetry_item = CheckMenuItem::new("匿名众包战绩上报", true, true, None);
         let check_update_item = MenuItem::new("检查数据热更新", true, None);
@@ -63,6 +69,8 @@ impl TrayController {
             .context("failed to append separator")?;
         menu.append(&toggle_overlay_item)
             .context("failed to append overlay toggle item")?;
+        menu.append(&toggle_corner_item)
+            .context("failed to append corner toggle item")?;
         menu.append(&toggle_diagnostics_item)
             .context("failed to append diagnostics toggle item")?;
         menu.append(&toggle_telemetry_item)
@@ -81,6 +89,7 @@ impl TrayController {
             .context("failed to append quit item")?;
 
         let toggle_overlay_id = toggle_overlay_item.id().clone();
+        let toggle_corner_id = toggle_corner_item.id().clone();
         let toggle_diagnostics_id = toggle_diagnostics_item.id().clone();
         let toggle_telemetry_id = toggle_telemetry_item.id().clone();
         let check_update_id = check_update_item.id().clone();
@@ -101,9 +110,11 @@ impl TrayController {
             tray_icon,
             status_item,
             toggle_overlay_item,
+            toggle_corner_item,
             toggle_diagnostics_item,
             toggle_telemetry_item,
             toggle_overlay_id,
+            toggle_corner_id,
             toggle_diagnostics_id,
             toggle_telemetry_id,
             check_update_id,
@@ -121,6 +132,8 @@ impl TrayController {
             let id = event.id;
             if id == self.toggle_overlay_id {
                 actions.push(TrayAction::ToggleOverlay);
+            } else if id == self.toggle_corner_id {
+                actions.push(TrayAction::ToggleOverlayCorner);
             } else if id == self.toggle_diagnostics_id {
                 actions.push(TrayAction::ToggleDiagnostics);
             } else if id == self.toggle_telemetry_id {
@@ -149,6 +162,15 @@ impl TrayController {
         };
         self.status_item.set_text(status_label);
         let _ = self.tray_icon.set_tooltip(Some(tooltip));
+    }
+
+    /// Updates the in-game corner menu label cleanly when flipped between TopLeft and TopRight.
+    pub fn update_corner_label(&self, corner: OverlayCorner) {
+        let label = match corner {
+            OverlayCorner::TopLeft => "局内位置: 左上角 (点击切右上角)",
+            OverlayCorner::TopRight => "局内位置: 右上角 (点击切左上角)",
+        };
+        self.toggle_corner_item.set_text(label);
     }
 
     /// Returns whether the overlay visibility check item is currently checked.

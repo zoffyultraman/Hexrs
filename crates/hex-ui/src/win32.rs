@@ -8,6 +8,18 @@ pub const SIDEBAR_WIDTH_DIP: f32 = 320.0;
 pub const DIAGNOSTICS_WIDTH_DIP: f32 = 440.0;
 pub const DIAGNOSTICS_HEIGHT_DIP: f32 = 560.0;
 
+/// Compact in-game corner HUD dimensions in DIPs.
+pub const IN_GAME_HUD_WIDTH_DIP: f32 = 304.0;
+pub const IN_GAME_HUD_HEIGHT_DIP: f32 = 126.0;
+
+/// Corner anchor for the compact in-game HUD card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverlayCorner {
+    #[default]
+    TopLeft,
+    TopRight,
+}
+
 /// Screen-space window geometry and DPI metadata for a target client window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowRectInfo {
@@ -53,7 +65,6 @@ mod imp {
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT};
     use windows::Win32::Graphics::Gdi::InvalidateRect;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, FindWindowW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
@@ -67,7 +78,10 @@ mod imp {
         WS_EX_TRANSPARENT,
     };
 
-    use super::{WindowRectInfo, DIAGNOSTICS_HEIGHT_DIP, DIAGNOSTICS_WIDTH_DIP, SIDEBAR_WIDTH_DIP};
+    use super::{
+        OverlayCorner, WindowRectInfo, DIAGNOSTICS_HEIGHT_DIP, DIAGNOSTICS_WIDTH_DIP,
+        IN_GAME_HUD_HEIGHT_DIP, IN_GAME_HUD_WIDTH_DIP, SIDEBAR_WIDTH_DIP,
+    };
 
     const MIN_TARGET_WINDOW_DIM: i32 = 200;
 
@@ -351,7 +365,7 @@ mod imp {
         }
     }
 
-    /// Returns a work-area rect suitable for previewing the full-screen overlay when League is not running.
+    /// Returns a work-area rect suitable for previewing the corner HUD when League is not running.
     pub fn default_preview_game_rect() -> WindowRectInfo {
         let work = primary_work_area();
         WindowRectInfo {
@@ -361,12 +375,6 @@ mod imp {
             bottom: work.bottom,
             dpi: 96,
         }
-    }
-
-    /// Returns `true` while the Alt key (`VK_MENU`) is currently held down (compliant polling, zero hooks).
-    pub fn is_alt_hotkey_pressed() -> bool {
-        // SAFETY: `GetAsyncKeyState` is a standard stateless Win32 key state query.
-        unsafe { GetAsyncKeyState(i32::from(VK_MENU.0)) < 0 }
     }
 
     unsafe fn apply_transparent_ex_style(hwnd: HWND, interactive: bool) {
@@ -431,34 +439,58 @@ mod imp {
         Ok(())
     }
 
-    /// Aligns the full-window transparent overlay over `League of Legends.exe` and toggles click-through.
+    /// Anchors the compact `304x126` click-through corner HUD onto `League of Legends.exe`.
     pub fn set_in_game_overlay_mode(
         window: &Window,
         target_rect: Option<WindowRectInfo>,
-        interactive: bool,
+        corner: OverlayCorner,
         visible: bool,
     ) -> Result<()> {
         let hwnd = extract_hwnd(window)?;
 
         // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
         unsafe {
-            apply_transparent_ex_style(hwnd, interactive);
+            apply_transparent_ex_style(hwnd, false);
 
             let Some(target) = target_rect.filter(|_| visible) else {
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 return Ok(());
             };
 
+            let own_dpi = GetDpiForWindow(hwnd);
+            let dpi = if own_dpi > 0 { own_dpi } else { target.dpi.max(96) };
+            let scale = dpi as f32 / 96.0;
+
+            let target_w = target.width().max(160);
+            let target_h = target.height().max(80);
+            let width_px = ((IN_GAME_HUD_WIDTH_DIP * scale).round() as i32).min(target_w);
+            let height_px = ((IN_GAME_HUD_HEIGHT_DIP * scale).round() as i32).min(target_h);
+            let margin_x = (14.0 * scale).round() as i32;
+
+            let (raw_x, raw_y) = match corner {
+                OverlayCorner::TopLeft => (
+                    target.left + margin_x,
+                    target.top + (14.0 * scale).round() as i32,
+                ),
+                OverlayCorner::TopRight => (
+                    target.right - width_px - margin_x,
+                    target.top + (56.0 * scale).round() as i32,
+                ),
+            };
+
+            let x = raw_x.clamp(target.left, (target.right - width_px).max(target.left));
+            let y = raw_y.clamp(target.top, (target.bottom - height_px).max(target.top));
+
             SetWindowPos(
                 hwnd,
                 Some(HWND_TOPMOST),
-                target.left,
-                target.top,
-                target.width(),
-                target.height(),
+                x,
+                y,
+                width_px,
+                height_px,
                 SWP_NOACTIVATE | SWP_FRAMECHANGED,
             )
-            .context("SetWindowPos(in-game overlay) failed")?;
+            .context("SetWindowPos(in-game corner HUD) failed")?;
 
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -663,7 +695,7 @@ mod imp {
     use anyhow::Result;
     use gpui::Window;
 
-    use super::WindowRectInfo;
+    use super::{OverlayCorner, WindowRectInfo};
 
     /// Non-Windows stub for `default_preview_lobby_rect`.
     pub fn default_preview_lobby_rect() -> WindowRectInfo {
@@ -687,11 +719,6 @@ mod imp {
         }
     }
 
-    /// Non-Windows stub for `is_alt_hotkey_pressed`.
-    pub fn is_alt_hotkey_pressed() -> bool {
-        false
-    }
-
     /// Non-Windows stub for `apply_overlay_styles`.
     #[allow(dead_code)]
     pub fn apply_overlay_styles(_window: &Window) -> Result<()> {
@@ -702,7 +729,7 @@ mod imp {
     pub fn set_in_game_overlay_mode(
         _window: &Window,
         _target_rect: Option<WindowRectInfo>,
-        _interactive: bool,
+        _corner: OverlayCorner,
         _visible: bool,
     ) -> Result<()> {
         Ok(())
@@ -766,7 +793,7 @@ mod imp {
 
 pub use imp::{
     default_preview_game_rect, default_preview_lobby_rect, find_league_game_window,
-    find_league_lobby_window, hide_window, is_alt_hotkey_pressed, open_data_directory,
-    open_log_file, relaunch_as_administrator, set_diagnostics_window_mode,
-    set_in_game_overlay_mode, set_lobby_dock_mode,
+    find_league_lobby_window, hide_window, open_data_directory, open_log_file,
+    relaunch_as_administrator, set_diagnostics_window_mode, set_in_game_overlay_mode,
+    set_lobby_dock_mode,
 };

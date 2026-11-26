@@ -1,15 +1,17 @@
-//! Root GPUI application entity, event-loop polling, WGC vision wiring, diagnostics panel, and Win32 orchestration.
+//! Root GPUI application entity, event-loop polling, WGC vision wiring, icon cache, diagnostics, and Win32 orchestration.
 
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use crossbeam_channel::{unbounded, Receiver};
-use gpui::{div, prelude::*, px, rgba, Context, Div, FontWeight, Render, Window};
+use gpui::{div, prelude::*, px, rgba, Context, Div, FontWeight, Render, Rgba, Window};
 use hex_core::{
     AppEvent, AppMode, ChampSelectState, CoreDiagnostics, CoreHandle, LiveGameState, RoiManifest,
 };
 use hex_data::{
-    spawn_background_update, AugmentEvaluation, BenchHighlight, DynamicBuildPlan, EogReporter,
-    HeroPreview, HeroStats, MetaEngine, TeamRecommendations, UpdateOutcome, UpdaterConfig,
+    spawn_background_update, BenchHighlight, DynamicBuildPlan, EogReporter, HeroPreview, HeroStats,
+    IconCache, MetaEngine, TeamRecommendations, UpdateOutcome, UpdaterConfig,
 };
 use hex_vision::{SharedRoiManifest, VisionController};
 use tracing::{debug, info, warn};
@@ -19,17 +21,18 @@ use crate::log_file_path;
 use crate::overlay_view;
 use crate::theme;
 use crate::tray::{TrayAction, TrayController};
-use crate::win32::{self, WindowRectInfo};
+use crate::win32::{self, OverlayCorner, WindowRectInfo};
 
 const BENCH_HIGHLIGHT_LIMIT: usize = 3;
 const TEAM_RECOMMENDATION_LIMIT: usize = 5;
+const PREVIEW_YASUO_HERO_ID: i32 = 157;
 
 /// Root GPUI state and controller bridging `hex-core`, `hex-vision`, `hex-data`, `tray-icon`, and Win32.
 pub struct HexOverlayApp {
     pub mode: AppMode,
     pub lcu_connected: bool,
     pub overlay_visible: bool,
-    pub hotkey_interactive: bool,
+    pub overlay_corner: OverlayCorner,
     pub telemetry_enabled: bool,
     pub updater_refresh_requested: bool,
     pub diagnostics_open: bool,
@@ -43,14 +46,18 @@ pub struct HexOverlayApp {
     pub expanded_hero_id: Option<i32>,
     pub selected_preview: Option<HeroPreview>,
     pub owned_augment_ids: Vec<i32>,
-    pub offered_augments: Vec<AugmentEvaluation>,
-    pub last_offer_capture_ms: Option<u64>,
     pub dynamic_build: Option<DynamicBuildPlan>,
+    pub active_hero_id: Option<i32>,
+    pub active_hero_alias: Option<String>,
     pub active_hero_name_zh: Option<String>,
+    pub active_hero_icon: Option<PathBuf>,
+    pub item_icons: HashMap<i32, PathBuf>,
     pub roi_manifest: SharedRoiManifest,
     pub last_detected_lobby_rect: Option<WindowRectInfo>,
     pub last_detected_game_rect: Option<WindowRectInfo>,
     meta: Option<MetaEngine>,
+    icon_cache: IconCache,
+    icon_ready_rx: Receiver<()>,
     event_rx: Receiver<AppEvent>,
     vision_rx: Receiver<AppEvent>,
     updater_config: UpdaterConfig,
@@ -62,13 +69,13 @@ pub struct HexOverlayApp {
     vision: VisionController,
     tray: Option<TrayController>,
     last_lobby_sync: Option<(Option<WindowRectInfo>, bool)>,
-    last_overlay_sync: Option<(Option<WindowRectInfo>, bool, bool)>,
+    last_overlay_sync: Option<(Option<WindowRectInfo>, OverlayCorner, bool)>,
     last_diagnostics_sync: bool,
     last_dormant_hidden: bool,
 }
 
 impl HexOverlayApp {
-    /// Constructs the GPUI root entity, initializing `MetaEngine`, `VisionController`, and tray status.
+    /// Constructs the GPUI root entity, initializing `MetaEngine`, `IconCache`, `VisionController`, and tray status.
     pub fn new(
         event_rx: Receiver<AppEvent>,
         core_handle: CoreHandle,
@@ -84,6 +91,9 @@ impl HexOverlayApp {
                 None
             }
         };
+
+        let (icon_ready_tx, icon_ready_rx) = unbounded::<()>();
+        let icon_cache = IconCache::new(icon_ready_tx);
 
         let hashes = meta
             .as_ref()
@@ -102,13 +112,14 @@ impl HexOverlayApp {
         let lcu_connected = core_handle.is_lcu_connected();
         if let Some(ref tray_ctrl) = tray {
             tray_ctrl.update_status(mode);
+            tray_ctrl.update_corner_label(OverlayCorner::default());
         }
 
         Self {
             mode,
             lcu_connected,
             overlay_visible: true,
-            hotkey_interactive: false,
+            overlay_corner: OverlayCorner::default(),
             telemetry_enabled: true,
             updater_refresh_requested: false,
             diagnostics_open: false,
@@ -122,14 +133,18 @@ impl HexOverlayApp {
             expanded_hero_id: None,
             selected_preview: None,
             owned_augment_ids: Vec::new(),
-            offered_augments: Vec::new(),
-            last_offer_capture_ms: None,
             dynamic_build: None,
+            active_hero_id: None,
+            active_hero_alias: None,
             active_hero_name_zh: None,
+            active_hero_icon: None,
+            item_icons: HashMap::new(),
             roi_manifest,
             last_detected_lobby_rect: None,
             last_detected_game_rect: None,
             meta,
+            icon_cache,
+            icon_ready_rx,
             event_rx,
             vision_rx,
             updater_config,
@@ -147,7 +162,7 @@ impl HexOverlayApp {
         }
     }
 
-    /// Drains pending `hex-core` & `hex-vision` events, polls Alt hotkey + tray, and syncs Win32 state.
+    /// Drains pending `hex-core`, `hex-vision`, icon cache, and tray events, then syncs Win32 state.
     pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut dirty = false;
 
@@ -159,6 +174,15 @@ impl HexOverlayApp {
         while let Ok(event) = self.vision_rx.try_recv() {
             dirty = true;
             self.handle_app_event(event);
+        }
+
+        let mut icons_ready = false;
+        while self.icon_ready_rx.try_recv().is_ok() {
+            icons_ready = true;
+        }
+        if icons_ready {
+            self.refresh_active_icons();
+            dirty = true;
         }
 
         while let Ok(outcome) = self.update_rx.try_recv() {
@@ -225,14 +249,31 @@ impl HexOverlayApp {
                         self.reset_window_sync_cache();
                         dirty = true;
                     }
+                    TrayAction::ToggleOverlayCorner => {
+                        self.overlay_corner = match self.overlay_corner {
+                            OverlayCorner::TopLeft => OverlayCorner::TopRight,
+                            OverlayCorner::TopRight => OverlayCorner::TopLeft,
+                        };
+                        if let Some(ref tray_ctrl) = self.tray {
+                            tray_ctrl.update_corner_label(self.overlay_corner);
+                        }
+                        info!(corner = ?self.overlay_corner, "in-game corner HUD position toggled");
+                        self.reset_window_sync_cache();
+                        dirty = true;
+                    }
                     TrayAction::ToggleDiagnostics => {
-                        self.diagnostics_open = self
-                            .tray
-                            .as_ref()
-                            .map(TrayController::is_diagnostics_checked)
-                            .unwrap_or(!self.diagnostics_open);
-                        if !self.diagnostics_open {
+                        if self.preview_mode.is_some() {
                             self.preview_mode = None;
+                            self.diagnostics_open = true;
+                            if let Some(ref tray_ctrl) = self.tray {
+                                tray_ctrl.set_diagnostics_checked(true);
+                            }
+                        } else {
+                            self.diagnostics_open = self
+                                .tray
+                                .as_ref()
+                                .map(TrayController::is_diagnostics_checked)
+                                .unwrap_or(!self.diagnostics_open);
                         }
                         info!(diagnostics_open = self.diagnostics_open, "diagnostics panel toggled via tray");
                         self.reset_window_sync_cache();
@@ -283,20 +324,8 @@ impl HexOverlayApp {
             }
         }
 
-        if self.mode == AppMode::InGameOverlay && self.overlay_visible && self.preview_mode.is_none()
-        {
-            let alt_pressed = win32::is_alt_hotkey_pressed();
-            if alt_pressed != self.hotkey_interactive {
-                self.hotkey_interactive = alt_pressed;
-                dirty = true;
-            }
-        } else if self.hotkey_interactive {
-            self.hotkey_interactive = false;
-            dirty = true;
-        }
-
         if self.diagnostics_open && self.preview_mode.is_none() {
-            // Keep live CoreDiagnostics values refreshed in the UI while diagnostics panel is visible.
+            // Keep live CoreDiagnostics values refreshed while diagnostics panel is visible.
             dirty = true;
         }
 
@@ -322,16 +351,14 @@ impl HexOverlayApp {
         cx.notify();
     }
 
-    /// Dismisses the currently displayed floating augment offer badges.
-    pub fn dismiss_augment_offer(&mut self, cx: &mut Context<Self>) {
-        self.offered_augments.clear();
-        self.last_offer_capture_ms = None;
-        cx.notify();
-    }
-
     /// Sets or exits UI preview mode from the diagnostics panel.
     pub fn set_preview_mode(&mut self, mode: Option<AppMode>, cx: &mut Context<Self>) {
         self.preview_mode = mode;
+        if mode == Some(AppMode::InGameOverlay) && self.live_game.is_none() {
+            self.populate_hero_hud_state(Some(PREVIEW_YASUO_HERO_ID), None, &[]);
+        } else if mode.is_none() && self.mode != AppMode::InGameOverlay {
+            self.clear_in_game_hud_state();
+        }
         self.reset_window_sync_cache();
         cx.notify();
     }
@@ -342,6 +369,9 @@ impl HexOverlayApp {
         self.preview_mode = None;
         if let Some(ref tray_ctrl) = self.tray {
             tray_ctrl.set_diagnostics_checked(false);
+        }
+        if self.mode != AppMode::InGameOverlay {
+            self.clear_in_game_hud_state();
         }
         self.reset_window_sync_cache();
         cx.notify();
@@ -367,6 +397,16 @@ impl HexOverlayApp {
         self.last_overlay_sync = None;
         self.last_diagnostics_sync = false;
         self.last_dormant_hidden = false;
+    }
+
+    fn clear_in_game_hud_state(&mut self) {
+        self.owned_augment_ids.clear();
+        self.dynamic_build = None;
+        self.active_hero_id = None;
+        self.active_hero_alias = None;
+        self.active_hero_name_zh = None;
+        self.active_hero_icon = None;
+        self.item_icons.clear();
     }
 
     fn handle_app_event(&mut self, event: AppEvent) {
@@ -395,20 +435,15 @@ impl HexOverlayApp {
                 }
 
                 if next_mode == AppMode::InGameOverlay {
-                    let game_mode = self
-                        .live_game
-                        .as_ref()
-                        .map(|l| l.game_mode.as_str())
-                        .unwrap_or("");
-                    self.vision.set_active(self.overlay_visible, game_mode);
+                    if let Some(live) = self.live_game.clone() {
+                        self.refresh_live_game_data(&live);
+                    } else {
+                        self.populate_hero_hud_state(self.active_champ_select_hero_id, None, &[]);
+                        self.vision.set_active(self.overlay_visible, "");
+                    }
                 } else {
                     self.vision.set_active(false, "");
-                    self.offered_augments.clear();
-                    self.owned_augment_ids.clear();
-                    self.last_offer_capture_ms = None;
-                    self.dynamic_build = None;
-                    self.active_hero_name_zh = None;
-                    self.hotkey_interactive = false;
+                    self.clear_in_game_hud_state();
                 }
             }
             AppEvent::LcuConnectionChanged(connected) => {
@@ -434,7 +469,6 @@ impl HexOverlayApp {
                 capture_ms,
             } => {
                 debug!(?candidates, capture_ms, "augment offer detected by hex-vision");
-                self.evaluate_detected_offer(&candidates, capture_ms);
             }
             AppEvent::EndOfGameCaptured(eog) => {
                 info!(
@@ -450,62 +484,60 @@ impl HexOverlayApp {
         }
     }
 
-    fn resolve_active_hero_id(&self) -> Option<i32> {
-        if let Some(live) = self.live_game.as_ref() {
-            if let Some(id) = live.active_champion_id {
-                return Some(id);
-            }
-            if let Some(meta) = self.meta.as_ref() {
-                if let Some(id) = meta.resolve_champion_id_by_alias(&live.active_champion_name) {
-                    return Some(id);
-                }
-            }
-        }
-
-        self.champ_select
-            .as_ref()
-            .map(|cs| {
-                if cs.local_champion_id > 0 {
-                    cs.local_champion_id
-                } else {
-                    cs.local_intent_id
-                }
-            })
-            .filter(|&id| id > 0)
-    }
-
     fn refresh_live_game_data(&mut self, live: &LiveGameState) {
         self.vision.set_active(
             self.mode == AppMode::InGameOverlay && self.overlay_visible,
             &live.game_mode,
         );
 
-        let Some(meta) = self.meta.as_ref() else {
-            return;
-        };
-
         let hero_id = live
             .active_champion_id
-            .or_else(|| meta.resolve_champion_id_by_alias(&live.active_champion_name));
+            .or_else(|| {
+                self.meta
+                    .as_ref()
+                    .and_then(|meta| meta.resolve_champion_id_by_alias(&live.active_champion_name))
+            })
+            .or(self.active_champ_select_hero_id);
 
-        self.active_hero_name_zh = hero_id
-            .and_then(|id| meta.get_hero_stats(id))
-            .map(|stats| stats.name_zh);
-
-        self.dynamic_build = hero_id.and_then(|id| {
-            meta.get_dynamic_build(id, &self.owned_augment_ids, &live.owned_item_ids)
-        });
+        let fallback_name = (!live.active_champion_name.is_empty())
+            .then_some(live.active_champion_name.as_str());
+        self.populate_hero_hud_state(hero_id, fallback_name, &live.owned_item_ids);
     }
 
-    fn evaluate_detected_offer(&mut self, candidates: &[i32], capture_ms: u64) {
-        let Some(meta) = self.meta.as_ref() else {
-            return;
-        };
-        let hero_id = self.resolve_active_hero_id().unwrap_or(0);
-        let evals = meta.evaluate_augment_offer(hero_id, candidates, &self.owned_augment_ids);
-        if !evals.is_empty() {
-            self.offered_augments = evals;
-            self.last_offer_capture_ms = Some(capture_ms);
+    fn populate_hero_hud_state(
+        &mut self,
+        hero_id: Option<i32>,
+        fallback_name: Option<&str>,
+        owned_item_ids: &[i32],
+    ) {
+        let stats = hero_id.and_then(|id| self.meta.as_ref()?.get_hero_stats(id));
+
+        self.active_hero_id = hero_id;
+        self.active_hero_alias = stats
+            .as_ref()
+            .map(|s| s.alias.clone())
+            .or_else(|| fallback_name.map(str::to_owned));
+        self.active_hero_name_zh = stats
+            .map(|s| s.name_zh)
+            .or_else(|| fallback_name.map(str::to_owned));
+        self.dynamic_build = self.meta.as_ref().map(|meta| {
+            meta.get_dynamic_build_or_fallback(hero_id, &self.owned_augment_ids, owned_item_ids)
+        });
+
+        self.refresh_active_icons();
+    }
+
+    fn refresh_active_icons(&mut self) {
+        self.active_hero_icon = self
+            .active_hero_id
+            .and_then(|id| self.icon_cache.champion_icon(id, self.active_hero_alias.as_deref()));
+
+        if let Some(plan) = self.dynamic_build.as_ref() {
+            for item in plan.items.iter().take(3) {
+                if let Some(path) = self.icon_cache.item_icon(item.id) {
+                    self.item_icons.insert(item.id, path);
+                }
+            }
         }
     }
 
@@ -622,15 +654,17 @@ impl HexOverlayApp {
                 } else {
                     None
                 };
-                let interactive = is_preview || self.hotkey_interactive;
                 let visible = is_preview || self.overlay_visible;
 
-                let state = (target_rect, interactive, visible);
+                let state = (target_rect, self.overlay_corner, visible);
                 if self.last_overlay_sync != Some(state) {
-                    if let Err(err) =
-                        win32::set_in_game_overlay_mode(window, target_rect, interactive, visible)
-                    {
-                        warn!(error = %err, "failed to update in-game overlay window");
+                    if let Err(err) = win32::set_in_game_overlay_mode(
+                        window,
+                        target_rect,
+                        self.overlay_corner,
+                        visible,
+                    ) {
+                        warn!(error = %err, "failed to update in-game corner HUD window");
                     }
                     self.last_overlay_sync = Some(state);
                 }
@@ -648,16 +682,14 @@ impl HexOverlayApp {
 }
 
 impl Render for HexOverlayApp {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.diagnostics_open && self.preview_mode.is_none() {
             return render_diagnostics_panel(self, cx).into_any_element();
         }
 
         match self.preview_mode.unwrap_or(self.mode) {
             AppMode::LobbyDocked => lobby_view::render_lobby_sidebar(self, cx).into_any_element(),
-            AppMode::InGameOverlay => {
-                overlay_view::render_in_game_overlay(self, window, cx).into_any_element()
-            }
+            AppMode::InGameOverlay => overlay_view::render_in_game_overlay(self).into_any_element(),
             AppMode::Dormant => div()
                 .size_full()
                 .bg(rgba(0x00000000))
@@ -937,6 +969,12 @@ fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
                                             this.set_preview_mode(Some(AppMode::InGameOverlay), cx);
                                         })),
                                 ),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::text_muted())
+                                .child("提示：局内小窗永久穿透，预览时右键托盘“显示诊断面板”即可切回。"),
                         ),
                 )
                 .child(
@@ -966,7 +1004,7 @@ fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
                             div()
                                 .text_xs()
                                 .text_color(theme::text_muted())
-                                .child("2. 若 WeGame / 客户端以管理员身份运行导致无法识别，请右键“以管理员身份运行 HexOverlay.exe”。"),
+                                .child("2. 若 WeGame / 客户端以管理员身份运行导致无法识别，请点击上方按钮或右键以管理员身份运行。"),
                         )
                         .child(
                             div()
@@ -982,7 +1020,7 @@ fn diag_row(label: &str, value: String) -> Div {
     diag_row_colored(label, value, theme::text_primary())
 }
 
-fn diag_row_colored(label: &str, value: String, value_color: gpui::Rgba) -> Div {
+fn diag_row_colored(label: &str, value: String, value_color: Rgba) -> Div {
     div()
         .flex()
         .items_center()
