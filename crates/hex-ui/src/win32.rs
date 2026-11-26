@@ -5,8 +5,8 @@
 pub const SIDEBAR_WIDTH_DIP: f32 = 320.0;
 
 /// Logical diagnostics floating panel width and height in DIPs.
-pub const DIAGNOSTICS_WIDTH_DIP: f32 = 380.0;
-pub const DIAGNOSTICS_HEIGHT_DIP: f32 = 500.0;
+pub const DIAGNOSTICS_WIDTH_DIP: f32 = 440.0;
+pub const DIAGNOSTICS_HEIGHT_DIP: f32 = 560.0;
 
 /// Screen-space window geometry and DPI metadata for a target client window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +42,7 @@ impl WindowRectInfo {
 
 #[cfg(target_os = "windows")]
 mod imp {
+    use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
     use std::process::Command;
 
@@ -53,13 +54,14 @@ mod imp {
     use windows::Win32::Graphics::Gdi::InvalidateRect;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_MENU};
+    use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, FindWindowW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
         GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
         SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
         SystemParametersInfoW, GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, SM_CXVIRTUALSCREEN,
         SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WS_EX_APPWINDOW, WS_EX_LAYERED,
         WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
         WS_EX_TRANSPARENT,
@@ -622,6 +624,36 @@ mod imp {
             .with_context(|| format!("failed to open log file {}", path.display()))?;
         Ok(())
     }
+
+    /// Relaunches the current `HexOverlay.exe` elevated via Windows UAC (`runas`).
+    pub fn relaunch_as_administrator() -> Result<()> {
+        let exe = std::env::current_exe().context("failed to resolve current HexOverlay.exe path")?;
+        let exe_w: Vec<u16> = exe
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // SAFETY: `exe_w` is null-terminated UTF-16 and lives across the synchronous `ShellExecuteW` call.
+        let res = unsafe {
+            ShellExecuteW(
+                None,
+                w!("runas"),
+                PCWSTR::from_raw(exe_w.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+
+        if (res.0 as isize) <= 32 {
+            anyhow::bail!(
+                "UAC 提权启动失败或被用户取消 (ShellExecuteW code={})",
+                res.0 as isize
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -724,10 +756,17 @@ mod imp {
         tracing::info!(path = %path.display(), "open_log_file requested on non-Windows");
         Ok(())
     }
+
+    /// Non-Windows stub for `relaunch_as_administrator`.
+    pub fn relaunch_as_administrator() -> Result<()> {
+        tracing::warn!("relaunch_as_administrator requested on non-Windows");
+        anyhow::bail!("仅支持 Windows UAC 提权")
+    }
 }
 
 pub use imp::{
     default_preview_game_rect, default_preview_lobby_rect, find_league_game_window,
     find_league_lobby_window, hide_window, is_alt_hotkey_pressed, open_data_directory,
-    open_log_file, set_diagnostics_window_mode, set_in_game_overlay_mode, set_lobby_dock_mode,
+    open_log_file, relaunch_as_administrator, set_diagnostics_window_mode,
+    set_in_game_overlay_mode, set_lobby_dock_mode,
 };

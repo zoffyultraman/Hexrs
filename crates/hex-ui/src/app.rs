@@ -268,6 +268,10 @@ impl HexOverlayApp {
                             warn!(error = %err, "failed to open runtime log file");
                         }
                     }
+                    TrayAction::RelaunchAsAdmin => {
+                        self.relaunch_as_admin(cx);
+                        return;
+                    }
                     TrayAction::Quit => {
                         info!("exit requested from system tray; shutting down services");
                         self.vision.shutdown();
@@ -343,6 +347,21 @@ impl HexOverlayApp {
         cx.notify();
     }
 
+    /// Triggers UAC elevation and exits this unprivileged instance upon success.
+    pub fn relaunch_as_admin(&mut self, cx: &mut Context<Self>) {
+        match win32::relaunch_as_administrator() {
+            Ok(()) => {
+                info!("relaunching HexOverlay with UAC elevation; shutting down current instance");
+                self.vision.shutdown();
+                self.core_handle.shutdown();
+                cx.quit();
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to relaunch HexOverlay as administrator");
+            }
+        }
+    }
+
     fn reset_window_sync_cache(&mut self) {
         self.last_lobby_sync = None;
         self.last_overlay_sync = None;
@@ -355,6 +374,15 @@ impl HexOverlayApp {
             AppEvent::ModeChanged(next_mode) => {
                 info!(?next_mode, "overlay mode transitioned");
                 self.mode = next_mode;
+                if self.diagnostics_open
+                    && self.preview_mode.is_none()
+                    && next_mode != AppMode::Dormant
+                {
+                    self.diagnostics_open = false;
+                    if let Some(ref tray_ctrl) = self.tray {
+                        tray_ctrl.set_diagnostics_checked(false);
+                    }
+                }
                 self.reset_window_sync_cache();
 
                 if let Some(ref tray_ctrl) = self.tray {
@@ -757,7 +785,76 @@ fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
                                 if diag.live_api_active { "活跃" } else { "等待中" }
                             ),
                         ))
-                        .child(diag_row("MetaEngine 数据库", meta_status.to_owned())),
+                        .child(diag_row("MetaEngine 数据库", meta_status.to_owned()))
+                        .child(diag_row_colored(
+                            "当前权限",
+                            if diag.is_elevated {
+                                "管理员 (已提权)".to_owned()
+                            } else {
+                                "普通用户 (若国服提权请点下方提权)".to_owned()
+                            },
+                            if diag.is_elevated {
+                                theme::cyan()
+                            } else {
+                                theme::warning_text()
+                            },
+                        ))
+                        .when_some(
+                            diag.lcu_diagnostic
+                                .as_ref()
+                                .filter(|_| diag.lcu_port.is_none()),
+                            |card, msg| {
+                                card.child(
+                                    div()
+                                        .mt_1()
+                                        .p_2()
+                                        .rounded_md()
+                                        .bg(theme::warning_bg())
+                                        .border_1()
+                                        .border_color(theme::warning_border())
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(FontWeight::BOLD)
+                                                .text_color(theme::warning_text())
+                                                .child("LCU 诊断"),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(theme::text_primary())
+                                                .child(msg.clone()),
+                                        ),
+                                )
+                            },
+                        )
+                        .when(!diag.is_elevated, |card| {
+                            card.child(
+                                div()
+                                    .id("relaunch-admin-btn")
+                                    .mt_1()
+                                    .cursor_pointer()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(theme::warning_bg())
+                                    .border_1()
+                                    .border_color(theme::warning_border())
+                                    .hover(|s| s.bg(theme::card_elevated_bg()))
+                                    .flex()
+                                    .justify_center()
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme::warning_text())
+                                    .child("以管理员身份重启 (UAC 提权)")
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.relaunch_as_admin(cx);
+                                    })),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -882,6 +979,10 @@ fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
 }
 
 fn diag_row(label: &str, value: String) -> Div {
+    diag_row_colored(label, value, theme::text_primary())
+}
+
+fn diag_row_colored(label: &str, value: String, value_color: gpui::Rgba) -> Div {
     div()
         .flex()
         .items_center()
@@ -897,7 +998,7 @@ fn diag_row(label: &str, value: String) -> Div {
             div()
                 .text_xs()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::text_primary())
+                .text_color(value_color)
                 .child(value),
         )
 }

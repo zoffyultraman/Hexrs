@@ -14,6 +14,7 @@ pub enum TrayAction {
     ToggleTelemetry,
     OpenDataDir,
     OpenLogFile,
+    RelaunchAsAdmin,
     Quit,
 }
 
@@ -30,6 +31,7 @@ pub struct TrayController {
     check_update_id: MenuId,
     open_dir_id: MenuId,
     open_log_id: MenuId,
+    relaunch_admin_id: MenuId,
     quit_id: MenuId,
 }
 
@@ -45,6 +47,11 @@ impl TrayController {
         let check_update_item = MenuItem::new("检查数据热更新", true, None);
         let open_dir_item = MenuItem::new("打开数据目录", true, None);
         let open_log_item = MenuItem::new("打开运行日志", true, None);
+        let relaunch_admin_item = MenuItem::new(
+            "以管理员身份重启 (UAC)",
+            !hex_core::is_current_process_elevated(),
+            None,
+        );
         let quit_item = MenuItem::new("退出 HexOverlay", true, None);
 
         let sep1 = PredefinedMenuItem::separator();
@@ -66,6 +73,8 @@ impl TrayController {
             .context("failed to append open-dir item")?;
         menu.append(&open_log_item)
             .context("failed to append open-log item")?;
+        menu.append(&relaunch_admin_item)
+            .context("failed to append relaunch-admin item")?;
         menu.append(&sep2)
             .context("failed to append separator")?;
         menu.append(&quit_item)
@@ -77,6 +86,7 @@ impl TrayController {
         let check_update_id = check_update_item.id().clone();
         let open_dir_id = open_dir_item.id().clone();
         let open_log_id = open_log_item.id().clone();
+        let relaunch_admin_id = relaunch_admin_item.id().clone();
         let quit_id = quit_item.id().clone();
 
         let icon = build_hextech_icon()?;
@@ -99,6 +109,7 @@ impl TrayController {
             check_update_id,
             open_dir_id,
             open_log_id,
+            relaunch_admin_id,
             quit_id,
         })
     }
@@ -120,6 +131,8 @@ impl TrayController {
                 actions.push(TrayAction::OpenDataDir);
             } else if id == self.open_log_id {
                 actions.push(TrayAction::OpenLogFile);
+            } else if id == self.relaunch_admin_id {
+                actions.push(TrayAction::RelaunchAsAdmin);
             } else if id == self.quit_id {
                 actions.push(TrayAction::Quit);
             }
