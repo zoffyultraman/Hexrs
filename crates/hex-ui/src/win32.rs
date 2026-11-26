@@ -16,7 +16,6 @@ pub const IN_GAME_HUD_HEIGHT_DIP: f32 = 204.0;
 
 const CARD_WIDTH_RATIO: f32 = 0.86;
 const CARD_GAP_RATIO: f32 = 0.14;
-const STRIP_TOTAL_RATIO: f32 = 2.86;
 const AUGMENT_BAR_HEIGHT_DIP: f32 = 94.0;
 
 /// Pixel-calibrated Champ Select bench strip geometry relative to `LeagueClientUx.exe`.
@@ -35,7 +34,7 @@ pub enum OverlayCorner {
 }
 
 /// Deferred Win32 window repositioning or visibility command executed after GPUI releases `Window`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Win32WindowAction {
     Hide,
     Diagnostics,
@@ -55,12 +54,13 @@ pub enum Win32WindowAction {
     InGameAugmentBar {
         target_rect: Option<WindowRectInfo>,
         visible: bool,
+        slot_count: usize,
         layout: Option<AugmentOfferLayout>,
     },
 }
 
 /// Deferred Win32 command targeting a specific `HWND` outside GPUI's re-entrant `Window` lock.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Win32WindowCommand {
     pub hwnd_raw: isize,
     pub action: Win32WindowAction,
@@ -106,58 +106,75 @@ struct AugmentBarGeometry {
     gap_dip: f32,
 }
 
+fn fallback_augment_bar_bounds(
+    target: WindowRectInfo,
+    scale: f32,
+    slot_count: usize,
+    target_w: i32,
+    target_h: i32,
+) -> (i32, i32, i32, f32) {
+    let n = slot_count.clamp(3, 4);
+    let strip_total_ratio = (n - 1) as f32 + CARD_WIDTH_RATIO;
+    let spacing_norm = if target_w as f32 / target_h.max(1) as f32 >= 2.05 {
+        0.165
+    } else {
+        0.225
+    };
+    let min_w = (480.0 * scale).round() as i32;
+    let width_px = ((target_w as f32 * spacing_norm * strip_total_ratio).round() as i32)
+        .clamp(min_w.min(target_w), target_w);
+    let x = target.left + (target_w - width_px) / 2;
+    let y = target.top + (target_h as f32 * 0.08).round() as i32;
+    (x, y, width_px, strip_total_ratio)
+}
+
 fn compute_augment_bar_geometry(
     target: WindowRectInfo,
     scale: f32,
-    layout: Option<AugmentOfferLayout>,
+    slot_count: usize,
+    layout: Option<&AugmentOfferLayout>,
 ) -> AugmentBarGeometry {
     let scale = if scale <= 0.0 { 1.0 } else { scale };
     let target_w = target.width().max(320);
     let target_h = target.height().max(90);
     let height_px = ((AUGMENT_BAR_HEIGHT_DIP * scale).round() as i32).min(target_h);
 
-    let (raw_x, raw_y, width_px) = match layout {
-        Some(l) if l.slot_centers_x[2] > l.slot_centers_x[0] + 0.16 => {
-            let cx0 = l.slot_centers_x[0];
-            let cx2 = l.slot_centers_x[2];
-            let spacing_norm = ((cx2 - cx0) * 0.5).clamp(0.14, 0.36);
-            let spacing_px = spacing_norm * target_w as f32;
-            let strip_left_px = target.left
-                + ((cx0 - spacing_norm * (CARD_WIDTH_RATIO * 0.5)) * target_w as f32).round()
+    let (raw_x, raw_y, width_px, strip_total_ratio) = match layout {
+        Some(l) if l.slot_centers_x.len() >= 2 => {
+            let n = l.slot_centers_x.len().clamp(2, 4);
+            let cx_first = l.slot_centers_x[0];
+            let cx_last = l.slot_centers_x[n - 1];
+            if cx_last > cx_first + 0.08 * (n - 1) as f32 {
+                let spacing_norm = ((cx_last - cx_first) / (n - 1) as f32).clamp(0.14, 0.36);
+                let strip_total_ratio = (n - 1) as f32 + CARD_WIDTH_RATIO;
+                let spacing_px = spacing_norm * target_w as f32;
+                let strip_left_px = target.left
+                    + ((cx_first - spacing_norm * (CARD_WIDTH_RATIO * 0.5)) * target_w as f32)
+                        .round() as i32;
+                let min_w = (360.0 * scale).round() as i32;
+                let width_px = (spacing_px * strip_total_ratio)
+                    .round()
+                    .clamp(min_w.min(target_w) as f32, target_w as f32)
                     as i32;
-            let min_w = (360.0 * scale).round() as i32;
-            let width_px = (spacing_px * STRIP_TOTAL_RATIO)
-                .round()
-                .clamp(min_w.min(target_w) as f32, target_w as f32)
-                as i32;
-            let card_top_px =
-                target.top + (l.title_y * target_h as f32 - spacing_px * 0.69).round() as i32;
-            let v_gap_px = (8.0 * scale).round() as i32;
-            let y = (card_top_px - height_px - v_gap_px).clamp(
-                target.top + (4.0 * scale).round() as i32,
-                (target.bottom - height_px).max(target.top),
-            );
-            (strip_left_px, y, width_px)
-        }
-        _ => {
-            let spacing_norm = if target_w as f32 / target_h.max(1) as f32 >= 2.05 {
-                0.165
+                let card_top_px =
+                    target.top + (l.title_y * target_h as f32 - spacing_px * 0.69).round() as i32;
+                let v_gap_px = (8.0 * scale).round() as i32;
+                let y = (card_top_px - height_px - v_gap_px).clamp(
+                    target.top + (4.0 * scale).round() as i32,
+                    (target.bottom - height_px).max(target.top),
+                );
+                (strip_left_px, y, width_px, strip_total_ratio)
             } else {
-                0.225
-            };
-            let min_w = (480.0 * scale).round() as i32;
-            let width_px = ((target_w as f32 * spacing_norm * STRIP_TOTAL_RATIO).round() as i32)
-                .clamp(min_w.min(target_w), target_w);
-            let x = target.left + (target_w - width_px) / 2;
-            let y = target.top + (target_h as f32 * 0.08).round() as i32;
-            (x, y, width_px)
+                fallback_augment_bar_bounds(target, scale, slot_count, target_w, target_h)
+            }
         }
+        _ => fallback_augment_bar_bounds(target, scale, slot_count, target_w, target_h),
     };
 
     let x = raw_x.clamp(target.left, (target.right - width_px).max(target.left));
     let y = raw_y.clamp(target.top, (target.bottom - height_px).max(target.top));
     let gap_dip =
-        ((width_px as f32 / scale) * (CARD_GAP_RATIO / STRIP_TOTAL_RATIO)).clamp(8.0, 160.0);
+        ((width_px as f32 / scale) * (CARD_GAP_RATIO / strip_total_ratio)).clamp(8.0, 160.0);
 
     AugmentBarGeometry {
         x,
@@ -168,15 +185,16 @@ fn compute_augment_bar_geometry(
     }
 }
 
-/// Computes the exact DIP flex gap matching the aligned 3-card augment strip geometry.
+/// Computes the exact DIP flex gap matching the aligned 3-card or 4-card augment strip geometry.
 pub fn compute_augment_bar_gap_dip(
     target: Option<WindowRectInfo>,
-    layout: Option<AugmentOfferLayout>,
+    slot_count: usize,
+    layout: Option<&AugmentOfferLayout>,
 ) -> f32 {
     let Some(rect) = target else {
         return 28.0;
     };
-    compute_augment_bar_geometry(rect, rect.scale(), layout).gap_dip
+    compute_augment_bar_geometry(rect, rect.scale(), slot_count, layout).gap_dip
 }
 
 #[cfg(target_os = "windows")]
@@ -589,31 +607,38 @@ mod imp {
     }
 
     /// Executes a deferred Win32 window move/resize/show command outside GPUI's `Window` borrow.
-    pub fn apply_window_command(cmd: Win32WindowCommand) -> Result<()> {
+    pub fn apply_window_command(cmd: &Win32WindowCommand) -> Result<()> {
         let hwnd = HWND(cmd.hwnd_raw as *mut core::ffi::c_void);
-        match cmd.action {
+        match &cmd.action {
             Win32WindowAction::Hide => hide_window_hwnd(hwnd),
             Win32WindowAction::Diagnostics => set_diagnostics_window_mode_hwnd(hwnd),
             Win32WindowAction::LobbyDock(target_rect) => {
-                set_lobby_dock_mode_hwnd(hwnd, target_rect)
+                set_lobby_dock_mode_hwnd(hwnd, *target_rect)
             }
             Win32WindowAction::BenchBadgeStrip {
                 target_rect,
                 slot_count,
-            } => set_bench_badge_strip_hwnd(hwnd, target_rect, slot_count),
+            } => set_bench_badge_strip_hwnd(hwnd, *target_rect, *slot_count),
             Win32WindowAction::TeamBadgeStrip { target_rect } => {
-                set_team_badge_strip_hwnd(hwnd, target_rect)
+                set_team_badge_strip_hwnd(hwnd, *target_rect)
             }
             Win32WindowAction::InGameOverlay {
                 target_rect,
                 corner,
                 visible,
-            } => set_in_game_overlay_mode_hwnd(hwnd, target_rect, corner, visible),
+            } => set_in_game_overlay_mode_hwnd(hwnd, *target_rect, *corner, *visible),
             Win32WindowAction::InGameAugmentBar {
                 target_rect,
                 visible,
+                slot_count,
                 layout,
-            } => set_in_game_augment_bar_mode_hwnd(hwnd, target_rect, visible, layout),
+            } => set_in_game_augment_bar_mode_hwnd(
+                hwnd,
+                *target_rect,
+                *visible,
+                *slot_count,
+                layout.as_ref(),
+            ),
         }
     }
 
@@ -676,12 +701,13 @@ mod imp {
         Ok(())
     }
 
-    /// Anchors a permanently click-through horizontal strip strictly ABOVE the 3 augment cards.
+    /// Anchors a permanently click-through horizontal strip strictly ABOVE the augment cards.
     fn set_in_game_augment_bar_mode_hwnd(
         hwnd: HWND,
         target_rect: Option<WindowRectInfo>,
         visible: bool,
-        layout: Option<AugmentOfferLayout>,
+        slot_count: usize,
+        layout: Option<&AugmentOfferLayout>,
     ) -> Result<()> {
         // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
         unsafe {
@@ -694,7 +720,8 @@ mod imp {
 
             let own_dpi = GetDpiForWindow(hwnd);
             let dpi = if own_dpi > 0 { own_dpi } else { target.dpi.max(96) };
-            let geom = compute_augment_bar_geometry(target, dpi as f32 / 96.0, layout);
+            let geom =
+                compute_augment_bar_geometry(target, dpi as f32 / 96.0, slot_count, layout);
 
             SetWindowPos(
                 hwnd,
@@ -1029,7 +1056,7 @@ mod imp {
     }
 
     /// Non-Windows stub for `apply_window_command`.
-    pub fn apply_window_command(_cmd: Win32WindowCommand) -> Result<()> {
+    pub fn apply_window_command(_cmd: &Win32WindowCommand) -> Result<()> {
         Ok(())
     }
 

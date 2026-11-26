@@ -83,8 +83,8 @@ pub struct HexrsApp {
         Option<WindowRectInfo>,
         OverlayCorner,
         bool,
-        bool,
-        Option<([i32; 3], i32)>,
+        usize,
+        Option<(usize, i32, i32, i32)>,
     )>,
     last_diagnostics_sync: bool,
     last_dormant_hidden: bool,
@@ -772,10 +772,10 @@ impl HexrsApp {
             .or(self.active_champ_select_hero_id)
             .unwrap_or(0);
 
-        let mut slots = Vec::with_capacity(candidates.len().min(3));
+        let mut slots = Vec::with_capacity(candidates.len().min(4));
         let mut matched_any = false;
 
-        for &aug_id in candidates.iter().take(3) {
+        for &aug_id in candidates.iter().take(4) {
             if aug_id > 0 {
                 if let Some(eval) = meta
                     .evaluate_augment_offer(hero_id, &[aug_id], &self.owned_augment_ids)
@@ -1025,30 +1025,36 @@ impl HexrsApp {
                     None
                 };
                 let visible = is_preview || self.overlay_visible;
-                let has_augment_offer = !self.offered_augments.is_empty();
-                let offer_layout = has_augment_offer
-                    .then_some(self.offered_augment_layout)
-                    .flatten();
+                let augment_slot_count = self.offered_augments.len().min(4);
+                let offer_layout = if augment_slot_count > 0 {
+                    self.offered_augment_layout.as_ref()
+                } else {
+                    None
+                };
                 let quantized_layout = quantize_offer_layout(offer_layout);
-                if has_augment_offer {
-                    self.augment_bar_gap_dip =
-                        win32::compute_augment_bar_gap_dip(target_rect, offer_layout);
+                if augment_slot_count > 0 {
+                    self.augment_bar_gap_dip = win32::compute_augment_bar_gap_dip(
+                        target_rect,
+                        augment_slot_count,
+                        offer_layout,
+                    );
                 }
 
                 let state = (
                     target_rect,
                     self.overlay_corner,
                     visible,
-                    has_augment_offer,
+                    augment_slot_count,
                     quantized_layout,
                 );
                 if self.last_overlay_sync != Some(state) {
                     self.last_overlay_sync = Some(state);
-                    let action = if has_augment_offer {
+                    let action = if augment_slot_count > 0 {
                         Win32WindowAction::InGameAugmentBar {
                             target_rect,
                             visible,
-                            layout: offer_layout,
+                            slot_count: augment_slot_count,
+                            layout: offer_layout.cloned(),
                         }
                     } else {
                         Win32WindowAction::InGameOverlay {
@@ -1075,16 +1081,16 @@ impl HexrsApp {
     }
 }
 
-fn quantize_offer_layout(layout: Option<AugmentOfferLayout>) -> Option<([i32; 3], i32)> {
-    layout.map(|l| {
-        (
-            [
-                (l.slot_centers_x[0] * 100.0).round() as i32,
-                (l.slot_centers_x[1] * 100.0).round() as i32,
-                (l.slot_centers_x[2] * 100.0).round() as i32,
-            ],
+fn quantize_offer_layout(layout: Option<&AugmentOfferLayout>) -> Option<(usize, i32, i32, i32)> {
+    layout.and_then(|l| {
+        let first = *l.slot_centers_x.first()?;
+        let last = *l.slot_centers_x.last()?;
+        Some((
+            l.slot_centers_x.len(),
+            (first * 100.0).round() as i32,
+            (last * 100.0).round() as i32,
             (l.title_y * 100.0).round() as i32,
-        )
+        ))
     })
 }
 

@@ -196,7 +196,7 @@ fn main() {
             }
 
             if let Some(cmd) = main_cmd {
-                if let Err(err) = win32::apply_window_command(cmd) {
+                if let Err(err) = win32::apply_window_command(&cmd) {
                     warn!(error = %err, ?cmd.action, "failed to apply deferred Win32 window command");
                 }
                 if window_handle
@@ -211,7 +211,7 @@ fn main() {
             }
 
             if let Some(cmd) = bench_cmd {
-                if let Err(err) = win32::apply_window_command(cmd) {
+                if let Err(err) = win32::apply_window_command(&cmd) {
                     warn!(error = %err, ?cmd.action, "failed to apply deferred bench badge strip command");
                 }
                 if let Some(ref bench_handle) = bench_window_handle {
@@ -223,7 +223,7 @@ fn main() {
             }
 
             if let Some(cmd) = team_cmd {
-                if let Err(err) = win32::apply_window_command(cmd) {
+                if let Err(err) = win32::apply_window_command(&cmd) {
                     warn!(error = %err, ?cmd.action, "failed to apply deferred team badge strip command");
                 }
                 if let Some(ref team_handle) = team_window_handle {

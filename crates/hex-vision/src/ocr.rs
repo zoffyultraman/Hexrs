@@ -135,7 +135,7 @@ impl AugmentTextMatcher {
 
             row_hits.sort_by(|a, b| b.score.cmp(&a.score));
 
-            let mut selected: Vec<MatchedHit> = Vec::with_capacity(3);
+            let mut selected: Vec<MatchedHit> = Vec::with_capacity(4);
             for candidate in row_hits {
                 let too_close = selected
                     .iter()
@@ -150,8 +150,8 @@ impl AugmentTextMatcher {
                 continue;
             }
 
-            // Cap to the top 3 highest-scoring hits before spatial ordering if > 3 matched.
-            selected.truncate(3);
+            // Cap to the top 4 highest-scoring hits before spatial ordering (supports 3-card and 4-card offers).
+            selected.truncate(4);
             let total_score: i32 = selected.iter().map(|s| s.score).sum();
             let count = selected.len();
 
@@ -170,15 +170,45 @@ impl AugmentTextMatcher {
         let (_, _, mut winners) = best_cluster?;
         winners.sort_by(|a, b| a.cx.total_cmp(&b.cx));
 
-        if winners.len() >= 3 {
-            let layout = AugmentOfferLayout {
-                slot_centers_x: [winners[0].cx, winners[1].cx, winners[2].cx],
-                title_y: (winners[0].cy + winners[1].cy + winners[2].cy) / 3.0,
-            };
+        if winners.len() >= 4 {
+            let (w0, w1, w2, w3) = (winners[0], winners[1], winners[2], winners[3]);
             Some(OcrOfferMatch {
-                candidates: vec![winners[0].aug_id, winners[1].aug_id, winners[2].aug_id],
-                layout,
+                candidates: vec![w0.aug_id, w1.aug_id, w2.aug_id, w3.aug_id],
+                layout: AugmentOfferLayout {
+                    slot_centers_x: vec![w0.cx, w1.cx, w2.cx, w3.cx],
+                    title_y: (w0.cy + w1.cy + w2.cy + w3.cy) / 4.0,
+                },
             })
+        } else if winners.len() == 3 {
+            let (w0, w1, w2) = (winners[0], winners[1], winners[2]);
+            let gap01 = w1.cx - w0.cx;
+            let gap12 = w2.cx - w1.cx;
+            let title_y = (w0.cy + w1.cy + w2.cy) / 3.0;
+            if gap01 > gap12 * 1.55 && gap12 >= CARD_SEPARATION_X_MIN {
+                Some(OcrOfferMatch {
+                    candidates: vec![w0.aug_id, 0, w1.aug_id, w2.aug_id],
+                    layout: AugmentOfferLayout {
+                        slot_centers_x: vec![w0.cx, (w0.cx + w1.cx) * 0.5, w1.cx, w2.cx],
+                        title_y,
+                    },
+                })
+            } else if gap12 > gap01 * 1.55 && gap01 >= CARD_SEPARATION_X_MIN {
+                Some(OcrOfferMatch {
+                    candidates: vec![w0.aug_id, w1.aug_id, 0, w2.aug_id],
+                    layout: AugmentOfferLayout {
+                        slot_centers_x: vec![w0.cx, w1.cx, (w1.cx + w2.cx) * 0.5, w2.cx],
+                        title_y,
+                    },
+                })
+            } else {
+                Some(OcrOfferMatch {
+                    candidates: vec![w0.aug_id, w1.aug_id, w2.aug_id],
+                    layout: AugmentOfferLayout {
+                        slot_centers_x: vec![w0.cx, w1.cx, w2.cx],
+                        title_y,
+                    },
+                })
+            }
         } else {
             let h0 = winners[0];
             let h1 = winners[1];
@@ -188,7 +218,7 @@ impl AugmentTextMatcher {
                 Some(OcrOfferMatch {
                     candidates: vec![h0.aug_id, 0, h1.aug_id],
                     layout: AugmentOfferLayout {
-                        slot_centers_x: [h0.cx, (h0.cx + h1.cx) * 0.5, h1.cx],
+                        slot_centers_x: vec![h0.cx, (h0.cx + h1.cx) * 0.5, h1.cx],
                         title_y,
                     },
                 })
@@ -196,7 +226,7 @@ impl AugmentTextMatcher {
                 Some(OcrOfferMatch {
                     candidates: vec![h0.aug_id, h1.aug_id, 0],
                     layout: AugmentOfferLayout {
-                        slot_centers_x: [h0.cx, h1.cx, (h1.cx + gap).min(0.95)],
+                        slot_centers_x: vec![h0.cx, h1.cx, (h1.cx + gap).min(0.95)],
                         title_y,
                     },
                 })
@@ -204,7 +234,7 @@ impl AugmentTextMatcher {
                 Some(OcrOfferMatch {
                     candidates: vec![0, h0.aug_id, h1.aug_id],
                     layout: AugmentOfferLayout {
-                        slot_centers_x: [(h0.cx - gap).max(0.05), h0.cx, h1.cx],
+                        slot_centers_x: vec![(h0.cx - gap).max(0.05), h0.cx, h1.cx],
                         title_y,
                     },
                 })
@@ -616,5 +646,88 @@ mod tests {
         assert_eq!(left_pair.candidates, vec![101, 102, 0]);
         assert!((left_pair.layout.slot_centers_x[2] - 0.60).abs() < 1e-4);
         assert!((left_pair.layout.title_y - 0.44).abs() < 1e-4);
+    }
+
+    #[test]
+    fn matches_four_card_jhin_band_and_missing_middle_slots() {
+        let matcher = AugmentTextMatcher::new(sample_entries());
+
+        let four_card_hits = vec![
+            OcrLineHit {
+                text: "急速之追求".to_owned(),
+                center_x_norm: 0.11,
+                center_y_norm: 0.42,
+            },
+            OcrLineHit {
+                text: "杀戮时间到了".to_owned(),
+                center_x_norm: 0.365,
+                center_y_norm: 0.42,
+            },
+            OcrLineHit {
+                text: "拯救".to_owned(),
+                center_x_norm: 0.62,
+                center_y_norm: 0.42,
+            },
+            OcrLineHit {
+                text: "灵巧".to_owned(),
+                center_x_norm: 0.875,
+                center_y_norm: 0.42,
+            },
+        ];
+        let full_four = matcher
+            .match_ocr_lines_to_offer_with_layout(&four_card_hits)
+            .expect("4-card match should succeed");
+        assert_eq!(full_four.candidates, vec![101, 102, 103, 104]);
+        assert_eq!(full_four.layout.slot_centers_x.len(), 4);
+        assert!((full_four.layout.slot_centers_x[0] - 0.11).abs() < 1e-4);
+        assert!((full_four.layout.slot_centers_x[3] - 0.875).abs() < 1e-4);
+
+        // Missing slot 1 in a 4-card offer -> [101, 0, 103, 104] with interpolated cx[1].
+        let missing_slot1 = vec![
+            OcrLineHit {
+                text: "急速之追求".to_owned(),
+                center_x_norm: 0.11,
+                center_y_norm: 0.42,
+            },
+            OcrLineHit {
+                text: "拯救".to_owned(),
+                center_x_norm: 0.62,
+                center_y_norm: 0.42,
+            },
+            OcrLineHit {
+                text: "灵巧".to_owned(),
+                center_x_norm: 0.875,
+                center_y_norm: 0.42,
+            },
+        ];
+        let m1 = matcher
+            .match_ocr_lines_to_offer_with_layout(&missing_slot1)
+            .expect("4-card missing slot 1 should interpolate");
+        assert_eq!(m1.candidates, vec![101, 0, 103, 104]);
+        assert!((m1.layout.slot_centers_x[1] - 0.365).abs() < 1e-4);
+
+        // Missing slot 2 in a 4-card offer -> [101, 102, 0, 104] with interpolated cx[2].
+        let missing_slot2 = vec![
+            OcrLineHit {
+                text: "急速之追求".to_owned(),
+                center_x_norm: 0.11,
+                center_y_norm: 0.42,
+            },
+            OcrLineHit {
+                text: "杀戮时间到了".to_owned(),
+                center_x_norm: 0.365,
+                center_y_norm: 0.42,
+            },
+            OcrLineHit {
+                text: "灵巧".to_owned(),
+                center_x_norm: 0.875,
+                center_y_norm: 0.42,
+            },
+        ];
+        let m2 = matcher
+            .match_ocr_lines_to_offer_with_layout(&missing_slot2)
+            .expect("4-card missing slot 2 should interpolate");
+        assert_eq!(m2.candidates, vec![101, 102, 0, 104]);
+        assert!((m2.layout.slot_centers_x[2] - 0.62).abs() < 1e-4);
     }
 }

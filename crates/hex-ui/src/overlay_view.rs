@@ -64,7 +64,7 @@ fn render_augment_offer_bar(app: &HexrsApp) -> Div {
         .flex_row()
         .gap(px(app.augment_bar_gap_dip))
         .text_color(theme::text_primary());
-    for eval in app.offered_augments.iter().take(3) {
+    for eval in app.offered_augments.iter().take(4) {
         columns = columns.child(render_augment_slot_card(eval));
     }
     columns
@@ -74,7 +74,9 @@ fn render_augment_slot_card(eval: &AugmentEvaluation) -> Div {
     if eval.augment_id <= 0 {
         return div()
             .flex_1()
+            .min_w_0()
             .h_full()
+            .overflow_hidden()
             .p_2()
             .rounded_xl()
             .bg(theme::overlay_card_bg())
@@ -104,7 +106,9 @@ fn render_augment_slot_card(eval: &AugmentEvaluation) -> Div {
 
     div()
         .flex_1()
+        .min_w_0()
         .h_full()
+        .overflow_hidden()
         .p_2()
         .rounded_xl()
         .bg(theme::overlay_card_bg())
