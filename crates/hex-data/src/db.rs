@@ -213,7 +213,7 @@ impl MetaEngine {
             hero_count == 0
                 || (cfg!(has_bundled_meta_db)
                     && (aug_count < 100
-                        || !data_version.starts_with("aramhex-")
+                        || !data_version.starts_with("aramhex6-")
                         || builds_hero_count < 100))
         };
 
@@ -679,7 +679,7 @@ impl MetaEngine {
         })
     }
 
-    /// Returns the champion's dynamic build plan, or a generic 3-item fallback when unknown.
+    /// Returns the champion's dynamic build plan, or a generic 6-item fallback when unknown.
     pub fn get_dynamic_build_or_fallback(
         &self,
         hero_id: Option<i32>,
@@ -710,6 +710,21 @@ impl MetaEngine {
                     id: 6333,
                     name_zh: "死亡之舞".to_owned(),
                     already_owned: owned_item_ids.contains(&6333),
+                },
+                BuildItemInfo {
+                    id: 3111,
+                    name_zh: "水银之靴".to_owned(),
+                    already_owned: owned_item_ids.contains(&3111),
+                },
+                BuildItemInfo {
+                    id: 3071,
+                    name_zh: "黑色切割者".to_owned(),
+                    already_owned: owned_item_ids.contains(&3071),
+                },
+                BuildItemInfo {
+                    id: 3065,
+                    name_zh: "振奋盔甲".to_owned(),
+                    already_owned: owned_item_ids.contains(&3065),
                 },
             ],
         }

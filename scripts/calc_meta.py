@@ -167,11 +167,27 @@ CURATED_AUGMENT_SYNERGIES_BY_NAME: list[tuple[str, str, float, int]] = [
 ]
 
 FALLBACK_ITEM_NAMES: dict[int, str] = {
+    2502: "无终恨意",
+    3006: "狂战士胫甲",
+    3020: "法师之靴",
     3031: "无尽之刃",
+    3047: "铁板靴",
     3053: "斯特拉克的挑战护手",
+    3065: "振奋盔甲",
+    3071: "黑色切割者",
+    3075: "荆棘之甲",
     3078: "三相之力",
+    3083: "狂徒铠甲",
+    3084: "心之钢",
+    3089: "灭世者的死亡之帽",
+    3111: "水银之靴",
+    3135: "虚空之杖",
     3153: "破败王者之刃",
+    3157: "中娅沙漏",
+    4645: "影焰",
     6333: "死亡之舞",
+    6655: "卢登的伙伴",
+    6665: "贾修万象之衣",
 }
 
 
@@ -247,6 +263,7 @@ def fetch_aramhex_data(aramhex_base_url: str) -> dict[str, Any]:
         ("augments", "augments.json"),
         ("hero_augments", "hero_augments.json"),
         ("core_builds", "core_builds.json"),
+        ("hero_item_recommendations", "hero_item_recommendations.json"),
         ("item_metadata", "item_metadata.json"),
     ]:
         url = f"{base}/{rel_path}/{filename}"
@@ -325,11 +342,160 @@ def _infer_hero_attributes_from_builds(
     return (ad_w, ap_w, tank_score, cc_score)
 
 
+_KNOWN_TIER2_BOOTS: set[int] = {3006, 3009, 3020, 3047, 3111, 3117, 3158}
+
+
+def _is_boot_item(item_id: int, item_metadata: dict[str, Any]) -> bool:
+    if item_id == 1001:
+        return True
+    meta = item_metadata.get(str(item_id))
+    if isinstance(meta, dict):
+        return "Boots" in (meta.get("types") or [])
+    return item_id in _KNOWN_TIER2_BOOTS
+
+
+def _is_tier2_boot_item(item_id: int, item_metadata: dict[str, Any]) -> bool:
+    if item_id == 1001:
+        return False
+    meta = item_metadata.get(str(item_id))
+    if isinstance(meta, dict):
+        types = meta.get("types") or []
+        total = int(meta.get("total") or 0)
+        return "Boots" in types and total >= 900
+    return item_id in _KNOWN_TIER2_BOOTS
+
+
+def extend_build_to_six_items(
+    hero_id: int,
+    core_ids: list[int],
+    hero_item_recs: dict[str, Any],
+    item_metadata: dict[str, Any],
+    hero_games: int,
+    hero_base_wr: float,
+    ad_w: float = 0.5,
+    ap_w: float = 0.5,
+    tank_s: float = 0.35,
+) -> list[int]:
+    """Expands a core item sequence to 6 unique items (core + tier-2 boot + complete fills)."""
+    result: list[int] = []
+    seen: set[int] = set()
+    for raw_id in core_ids:
+        item_id = int(raw_id)
+        if item_id > 0 and item_id not in seen:
+            result.append(item_id)
+            seen.add(item_id)
+            if len(result) == 6:
+                return result
+
+    raw_recs = hero_item_recs.get(str(hero_id))
+    hero_recs: dict[str, Any] = raw_recs if isinstance(raw_recs, dict) else {}
+    hero_games_denom = max(int(hero_games), 1)
+
+    def _rec_score(wins: float, games: int) -> float:
+        return bayesian_smoothed_win_rate(wins, games, hero_base_wr) + 0.015 * min(
+            games / hero_games_denom, 0.35
+        )
+
+    if len(result) < 6 and not any(_is_boot_item(iid, item_metadata) for iid in result):
+        boot_candidates: list[tuple[int, float, int]] = []
+        for raw_iid, stat in hero_recs.items():
+            if not str(raw_iid).isdigit() or not isinstance(stat, dict):
+                continue
+            iid = int(raw_iid)
+            if iid <= 0 or iid in seen or not _is_tier2_boot_item(iid, item_metadata):
+                continue
+            games = int(stat.get("games") or 0)
+            wins = float(stat.get("wins") or 0)
+            if games <= 0:
+                continue
+            boot_candidates.append((iid, _rec_score(wins, games), games))
+
+        chosen_boot: int | None = None
+        reliable_boots = [c for c in boot_candidates if c[2] >= 300]
+        if reliable_boots:
+            reliable_boots.sort(key=lambda c: (c[1], c[2]), reverse=True)
+            chosen_boot = reliable_boots[0][0]
+        elif boot_candidates:
+            boot_candidates.sort(key=lambda c: (c[2], c[1]), reverse=True)
+            chosen_boot = boot_candidates[0][0]
+        else:
+            if ap_w >= 0.65:
+                chosen_boot = 3020
+            elif ad_w >= 0.65 and tank_s < 0.45:
+                chosen_boot = 3006
+            elif tank_s >= 0.65:
+                chosen_boot = 3111
+            else:
+                chosen_boot = 3047 if ad_w >= ap_w else 3111
+
+        if chosen_boot is not None and chosen_boot not in seen:
+            result.append(chosen_boot)
+            seen.add(chosen_boot)
+
+    if len(result) < 6:
+        equip_candidates: list[tuple[bool, float, int, int]] = []
+        for raw_iid, stat in hero_recs.items():
+            if not str(raw_iid).isdigit() or not isinstance(stat, dict):
+                continue
+            iid = int(raw_iid)
+            if iid <= 0 or iid in seen or _is_boot_item(iid, item_metadata):
+                continue
+            meta = item_metadata.get(str(iid))
+            if not isinstance(meta, dict) or meta.get("category") != "complete_equipment":
+                continue
+            games = int(stat.get("games") or 0)
+            wins = float(stat.get("wins") or 0)
+            if games <= 0:
+                continue
+            equip_candidates.append((games >= 1000, _rec_score(wins, games), games, iid))
+
+        equip_candidates.sort(key=lambda c: (c[0], c[1], c[2]), reverse=True)
+        for _, _, _, iid in equip_candidates:
+            if len(result) >= 6:
+                break
+            if iid not in seen:
+                result.append(iid)
+                seen.add(iid)
+
+    if len(result) < 6:
+        if tank_s >= 0.65:
+            primary_pool = [3084, 2502, 3083, 3111, 6665, 3075]
+        elif ap_w >= 0.65:
+            primary_pool = [6655, 4645, 3089, 3020, 3157, 3135]
+        else:
+            primary_pool = [3078, 3053, 6333, 3111, 3071, 3065]
+
+        safety_pool = primary_pool + [
+            3078, 3053, 6333, 3111, 3071, 3065,
+            6655, 4645, 3089, 3020, 3157, 3135,
+            3084, 2502, 3083, 6665, 3075,
+        ]
+        for iid in safety_pool:
+            if len(result) >= 6:
+                break
+            if iid not in seen and not (
+                _is_boot_item(iid, item_metadata)
+                and any(_is_boot_item(existing, item_metadata) for existing in result)
+            ):
+                result.append(iid)
+                seen.add(iid)
+
+        # Ultimate fallback in case item_metadata filtering prevented boots while pool exhausted
+        for iid in safety_pool:
+            if len(result) >= 6:
+                break
+            if iid not in seen:
+                result.append(iid)
+                seen.add(iid)
+
+    return result[:6]
+
+
 def _infer_build_tag(
     idx: int, item_ids: list[int], item_metadata: dict[str, Any]
 ) -> str:
-    base_labels = ["高胜三件套", "热门三件套", "备选三件套"]
-    base = base_labels[idx] if idx < len(base_labels) else "核心三件套"
+    base_labels = ["高胜六神装", "热门六神装", "备选六神装"]
+    base = base_labels[idx] if idx < len(base_labels) else "核心六神装"
 
     ad_cnt = 0
     ap_cnt = 0
@@ -477,6 +643,7 @@ def build_meta_database(
     aramhex_augments: dict[str, Any] = (aramhex_data or {}).get("augments", {})
     aramhex_hero_augs: dict[str, Any] = (aramhex_data or {}).get("hero_augments", {})
     aramhex_core_builds: dict[str, Any] = (aramhex_data or {}).get("core_builds", {})
+    aramhex_item_recs: dict[str, Any] = (aramhex_data or {}).get("hero_item_recommendations", {})
     aramhex_item_meta: dict[str, Any] = (aramhex_data or {}).get("item_metadata", {})
 
     def resolve_item_name(item_id: int) -> str:
@@ -621,12 +788,23 @@ def build_meta_database(
                 ]
                 if not parsed_ids:
                     continue
+                six_ids = extend_build_to_six_items(
+                    hero_id,
+                    parsed_ids,
+                    aramhex_item_recs,
+                    aramhex_item_meta,
+                    hero_games_map[hero_id],
+                    wr_ratio,
+                    ad_w,
+                    ap_w,
+                    tank_s,
+                )
                 items_payload = [
                     {"id": item_id, "name_zh": resolve_item_name(item_id)}
-                    for item_id in parsed_ids[:3]
+                    for item_id in six_ids
                 ]
                 build_wr = round(float(b.get("win") or wr_ratio) * 100.0, 1)
-                tag = _infer_build_tag(inserted_builds, parsed_ids, aramhex_item_meta)
+                tag = _infer_build_tag(inserted_builds, six_ids, aramhex_item_meta)
                 conn.execute(
                     "INSERT INTO hero_builds (hero_id, playstyle_tag, core_items_json, win_rate) VALUES (?, ?, ?, ?)",
                     (hero_id, tag, json.dumps(items_payload, ensure_ascii=False), build_wr),
@@ -635,8 +813,19 @@ def build_meta_database(
 
             # Ensure zero heroes have empty/missing hero_builds.
             if inserted_builds == 0:
-                fallback_ids = arch[6] if arch is not None else [3078, 3053, 6333]
-                fallback_tag = arch[5] if arch is not None else "通用推荐"
+                seed_ids = list(arch[6]) if arch is not None else []
+                fallback_ids = extend_build_to_six_items(
+                    hero_id,
+                    seed_ids,
+                    aramhex_item_recs,
+                    aramhex_item_meta,
+                    hero_games_map[hero_id],
+                    wr_ratio,
+                    ad_w,
+                    ap_w,
+                    tank_s,
+                )
+                fallback_tag = arch[5] if arch is not None else "均衡六神装"
                 items_payload = [
                     {"id": item_id, "name_zh": resolve_item_name(item_id)}
                     for item_id in fallback_ids
@@ -650,9 +839,17 @@ def build_meta_database(
             if g < 5:
                 continue
             wr_pct = round(bayesian_smoothed_win_rate(w, g) * 100.0, 1)
+            six_sample_ids = extend_build_to_six_items(
+                hero_id,
+                list(item_tuple),
+                aramhex_item_recs,
+                aramhex_item_meta,
+                hero_games_map.get(hero_id, 100),
+                hero_base_wr_map.get(hero_id, BASE_WIN_RATE),
+            )
             items_payload = [
                 {"id": item_id, "name_zh": resolve_item_name(item_id)}
-                for item_id in item_tuple
+                for item_id in six_sample_ids
             ]
             conn.execute(
                 "INSERT INTO hero_builds (hero_id, playstyle_tag, core_items_json, win_rate) VALUES (?, ?, ?, ?)",
@@ -876,7 +1073,7 @@ def main() -> None:
     if args.version:
         version = args.version
     elif aramhex_data is not None:
-        version = f"aramhex-{aramhex_data['patch']}-{today_str}"
+        version = f"aramhex6-{aramhex_data['patch']}-{today_str}"
     else:
         version = f"cdragon-{today_str}"
 
