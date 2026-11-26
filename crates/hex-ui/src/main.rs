@@ -102,13 +102,23 @@ fn main() {
 
         cx.spawn(async move |cx: &mut AsyncApp| loop {
             cx.background_executor().timer(EVENT_POLL_INTERVAL).await;
-            let alive = window_handle
-                .update(cx, |app, window, cx| {
-                    app.tick(window, cx);
-                })
-                .is_ok();
-            if !alive {
-                break;
+            let pending_cmd = match window_handle.update(cx, |app, window, cx| app.tick(window, cx)) {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            };
+            if let Some(cmd) = pending_cmd {
+                if let Err(err) = win32::apply_window_command(cmd) {
+                    warn!(error = %err, ?cmd.action, "failed to apply deferred Win32 window command");
+                }
+                if window_handle
+                    .update(cx, |_app, window, cx| {
+                        window.refresh();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();

@@ -20,6 +20,30 @@ pub enum OverlayCorner {
     TopRight,
 }
 
+/// Deferred Win32 window repositioning or visibility command executed after GPUI releases `Window`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Win32WindowAction {
+    Hide,
+    Diagnostics,
+    LobbyDock(Option<WindowRectInfo>),
+    InGameOverlay {
+        target_rect: Option<WindowRectInfo>,
+        corner: OverlayCorner,
+        visible: bool,
+    },
+    InGameAugmentBar {
+        target_rect: Option<WindowRectInfo>,
+        visible: bool,
+    },
+}
+
+/// Deferred Win32 command targeting a specific `HWND` outside GPUI's re-entrant `Window` lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Win32WindowCommand {
+    pub hwnd_raw: isize,
+    pub action: Win32WindowAction,
+}
+
 /// Screen-space window geometry and DPI metadata for a target client window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowRectInfo {
@@ -79,8 +103,9 @@ mod imp {
     };
 
     use super::{
-        OverlayCorner, WindowRectInfo, DIAGNOSTICS_HEIGHT_DIP, DIAGNOSTICS_WIDTH_DIP,
-        IN_GAME_HUD_HEIGHT_DIP, IN_GAME_HUD_WIDTH_DIP, SIDEBAR_WIDTH_DIP,
+        OverlayCorner, Win32WindowAction, Win32WindowCommand, WindowRectInfo,
+        DIAGNOSTICS_HEIGHT_DIP, DIAGNOSTICS_WIDTH_DIP, IN_GAME_HUD_HEIGHT_DIP,
+        IN_GAME_HUD_WIDTH_DIP, SIDEBAR_WIDTH_DIP,
     };
 
     const MIN_TARGET_WINDOW_DIM: i32 = 200;
@@ -95,6 +120,11 @@ mod imp {
             }
             other => anyhow::bail!("expected Win32 raw window handle, got {other:?}"),
         }
+    }
+
+    /// Extracts the raw Win32 `HWND` handle value for deferred window commands.
+    pub fn window_hwnd_raw(window: &Window) -> Result<isize> {
+        extract_hwnd(window).map(|hwnd| hwnd.0 as isize)
     }
 
     unsafe fn inspect_window_rect(hwnd: HWND, min_w: i32, min_h: i32) -> Option<WindowRectInfo> {
@@ -439,14 +469,34 @@ mod imp {
         Ok(())
     }
 
-    /// Anchors the compact `304x126` click-through corner HUD onto `League of Legends.exe`.
-    pub fn set_in_game_overlay_mode(
-        window: &Window,
+    /// Executes a deferred Win32 window move/resize/show command outside GPUI's `Window` borrow.
+    pub fn apply_window_command(cmd: Win32WindowCommand) -> Result<()> {
+        let hwnd = HWND(cmd.hwnd_raw as *mut core::ffi::c_void);
+        match cmd.action {
+            Win32WindowAction::Hide => hide_window_hwnd(hwnd),
+            Win32WindowAction::Diagnostics => set_diagnostics_window_mode_hwnd(hwnd),
+            Win32WindowAction::LobbyDock(target_rect) => {
+                set_lobby_dock_mode_hwnd(hwnd, target_rect)
+            }
+            Win32WindowAction::InGameOverlay {
+                target_rect,
+                corner,
+                visible,
+            } => set_in_game_overlay_mode_hwnd(hwnd, target_rect, corner, visible),
+            Win32WindowAction::InGameAugmentBar {
+                target_rect,
+                visible,
+            } => set_in_game_augment_bar_mode_hwnd(hwnd, target_rect, visible),
+        }
+    }
+
+    /// Anchors the compact `324x136` click-through corner HUD onto `League of Legends.exe`.
+    fn set_in_game_overlay_mode_hwnd(
+        hwnd: HWND,
         target_rect: Option<WindowRectInfo>,
         corner: OverlayCorner,
         visible: bool,
     ) -> Result<()> {
-        let hwnd = extract_hwnd(window)?;
 
         // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
         unsafe {
@@ -500,12 +550,11 @@ mod imp {
     }
 
     /// Anchors a permanently click-through horizontal strip strictly ABOVE the 3 augment cards.
-    pub fn set_in_game_augment_bar_mode(
-        window: &Window,
+    fn set_in_game_augment_bar_mode_hwnd(
+        hwnd: HWND,
         target_rect: Option<WindowRectInfo>,
         visible: bool,
     ) -> Result<()> {
-        let hwnd = extract_hwnd(window)?;
 
         // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
         unsafe {
@@ -552,8 +601,7 @@ mod imp {
     }
 
     /// Configures interactive Champ Select sidebar mode docked beside `LeagueClientUx.exe`.
-    pub fn set_lobby_dock_mode(window: &Window, target_rect: Option<WindowRectInfo>) -> Result<()> {
-        let hwnd = extract_hwnd(window)?;
+    fn set_lobby_dock_mode_hwnd(hwnd: HWND, target_rect: Option<WindowRectInfo>) -> Result<()> {
 
         // SAFETY: `hwnd` is owned by the active GPUI window on the UI thread.
         unsafe {
@@ -619,8 +667,7 @@ mod imp {
     }
 
     /// Positions an interactive floating diagnostics panel near the top-right of the primary work area.
-    pub fn set_diagnostics_window_mode(window: &Window) -> Result<()> {
-        let hwnd = extract_hwnd(window)?;
+    fn set_diagnostics_window_mode_hwnd(hwnd: HWND) -> Result<()> {
 
         // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
         unsafe {
@@ -664,8 +711,7 @@ mod imp {
     }
 
     /// Hides the overlay window without destroying its GPUI entity state.
-    pub fn hide_window(window: &Window) -> Result<()> {
-        let hwnd = extract_hwnd(window)?;
+    fn hide_window_hwnd(hwnd: HWND) -> Result<()> {
         // SAFETY: `hwnd` is a valid top-level GPUI window on the UI thread.
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
@@ -747,7 +793,17 @@ mod imp {
     use anyhow::Result;
     use gpui::Window;
 
-    use super::{OverlayCorner, WindowRectInfo};
+    use super::{Win32WindowCommand, WindowRectInfo};
+
+    /// Non-Windows stub for `window_hwnd_raw`.
+    pub fn window_hwnd_raw(_window: &Window) -> Result<isize> {
+        Ok(0)
+    }
+
+    /// Non-Windows stub for `apply_window_command`.
+    pub fn apply_window_command(_cmd: Win32WindowCommand) -> Result<()> {
+        Ok(())
+    }
 
     /// Non-Windows stub for `default_preview_lobby_rect`.
     pub fn default_preview_lobby_rect() -> WindowRectInfo {
@@ -777,25 +833,6 @@ mod imp {
         Ok(())
     }
 
-    /// Non-Windows stub for `set_in_game_overlay_mode`.
-    pub fn set_in_game_overlay_mode(
-        _window: &Window,
-        _target_rect: Option<WindowRectInfo>,
-        _corner: OverlayCorner,
-        _visible: bool,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    /// Non-Windows stub for `set_in_game_augment_bar_mode`.
-    pub fn set_in_game_augment_bar_mode(
-        _window: &Window,
-        _target_rect: Option<WindowRectInfo>,
-        _visible: bool,
-    ) -> Result<()> {
-        Ok(())
-    }
-
     /// Non-Windows stub for `find_window_by_pid`.
     #[allow(dead_code)]
     pub fn find_window_by_pid(_pid: u32) -> Option<WindowRectInfo> {
@@ -810,21 +847,6 @@ mod imp {
     /// Non-Windows stub for `find_league_game_window`.
     pub fn find_league_game_window(_pid: Option<u32>) -> Option<WindowRectInfo> {
         None
-    }
-
-    /// Non-Windows stub for `set_lobby_dock_mode`.
-    pub fn set_lobby_dock_mode(_window: &Window, _target_rect: Option<WindowRectInfo>) -> Result<()> {
-        Ok(())
-    }
-
-    /// Non-Windows stub for `set_diagnostics_window_mode`.
-    pub fn set_diagnostics_window_mode(_window: &Window) -> Result<()> {
-        Ok(())
-    }
-
-    /// Non-Windows stub for `hide_window`.
-    pub fn hide_window(_window: &Window) -> Result<()> {
-        Ok(())
     }
 
     /// Non-Windows stub for `show_window_no_activate`.
@@ -853,8 +875,7 @@ mod imp {
 }
 
 pub use imp::{
-    default_preview_game_rect, default_preview_lobby_rect, find_league_game_window,
-    find_league_lobby_window, hide_window, open_data_directory, open_log_file,
-    relaunch_as_administrator, set_diagnostics_window_mode, set_in_game_augment_bar_mode,
-    set_in_game_overlay_mode, set_lobby_dock_mode,
+    apply_window_command, default_preview_game_rect, default_preview_lobby_rect,
+    find_league_game_window, find_league_lobby_window, open_data_directory, open_log_file,
+    relaunch_as_administrator, window_hwnd_raw,
 };

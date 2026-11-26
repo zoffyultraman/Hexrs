@@ -23,7 +23,7 @@ use crate::log_file_path;
 use crate::overlay_view;
 use crate::theme;
 use crate::tray::{TrayAction, TrayController};
-use crate::win32::{self, OverlayCorner, WindowRectInfo};
+use crate::win32::{self, OverlayCorner, Win32WindowAction, Win32WindowCommand, WindowRectInfo};
 
 const BENCH_HIGHLIGHT_LIMIT: usize = 12;
 const TEAM_RECOMMENDATION_LIMIT: usize = 5;
@@ -80,7 +80,6 @@ pub struct HexOverlayApp {
     auto_elevation_prompted: bool,
     last_auto_expanded_hero_id: Option<i32>,
     last_logged_hud_signature: Option<(Option<i32>, usize, bool)>,
-    pending_repaint_ticks: u8,
 }
 
 impl HexOverlayApp {
@@ -183,12 +182,11 @@ impl HexOverlayApp {
             auto_elevation_prompted: false,
             last_auto_expanded_hero_id: None,
             last_logged_hud_signature: None,
-            pending_repaint_ticks: 0,
         }
     }
 
-    /// Drains pending `hex-core`, `hex-vision`, icon cache, and tray events, then syncs Win32 state.
-    pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Drains pending `hex-core`, `hex-vision`, icon cache, and tray events, returning any deferred Win32 command.
+    pub fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Option<Win32WindowCommand> {
         let mut dirty = false;
 
         while let Ok(event) = self.event_rx.try_recv() {
@@ -339,14 +337,14 @@ impl HexOverlayApp {
                     }
                     TrayAction::RelaunchAsAdmin => {
                         self.relaunch_as_admin(cx);
-                        return;
+                        return None;
                     }
                     TrayAction::Quit => {
                         info!("exit requested from system tray; shutting down services");
                         self.vision.shutdown();
                         self.core_handle.shutdown();
                         cx.quit();
-                        return;
+                        return None;
                     }
                 }
             }
@@ -376,18 +374,13 @@ impl HexOverlayApp {
             dirty = true;
         }
 
-        if self.sync_window_mode(window) {
-            self.pending_repaint_ticks = 4;
-        }
-        if self.pending_repaint_ticks > 0 {
-            self.pending_repaint_ticks -= 1;
-            window.refresh();
-            dirty = true;
-        }
+        let pending_cmd = self.sync_window_mode(window);
 
         if dirty {
             cx.notify();
         }
+
+        pending_cmd
     }
 
     /// Toggles the inline pre-match preview drawer for `hero_id`.
@@ -771,17 +764,25 @@ impl HexOverlayApp {
         }
     }
 
-    fn sync_window_mode(&mut self, window: &Window) -> bool {
+    fn sync_window_mode(&mut self, window: &Window) -> Option<Win32WindowCommand> {
+        let hwnd_raw = match win32::window_hwnd_raw(window) {
+            Ok(raw) => raw,
+            Err(err) => {
+                warn!(error = %err, "failed to extract Win32 HWND for window sync");
+                return None;
+            }
+        };
+
         if self.diagnostics_open && self.preview_mode.is_none() {
             if !self.last_diagnostics_sync {
-                if let Err(err) = win32::set_diagnostics_window_mode(window) {
-                    warn!(error = %err, "failed to show diagnostics window");
-                }
                 self.last_diagnostics_sync = true;
                 self.last_dormant_hidden = false;
-                return true;
+                return Some(Win32WindowCommand {
+                    hwnd_raw,
+                    action: Win32WindowAction::Diagnostics,
+                });
             }
-            return false;
+            return None;
         }
         self.last_diagnostics_sync = false;
 
@@ -811,13 +812,13 @@ impl HexOverlayApp {
 
                 let state = (target_rect, is_preview || self.overlay_visible);
                 if self.last_lobby_sync != Some(state) {
-                    if let Err(err) = win32::set_lobby_dock_mode(window, target_rect) {
-                        warn!(error = %err, "failed to dock lobby sidebar");
-                    }
                     self.last_lobby_sync = Some(state);
-                    return true;
+                    return Some(Win32WindowCommand {
+                        hwnd_raw,
+                        action: Win32WindowAction::LobbyDock(target_rect),
+                    });
                 }
-                false
+                None
             }
             AppMode::InGameOverlay => {
                 let detected_rect = win32::find_league_game_window(self.core_handle.game_pid());
@@ -843,32 +844,32 @@ impl HexOverlayApp {
 
                 let state = (target_rect, self.overlay_corner, visible, has_augment_offer);
                 if self.last_overlay_sync != Some(state) {
-                    let res = if has_augment_offer {
-                        win32::set_in_game_augment_bar_mode(window, target_rect, visible)
-                    } else {
-                        win32::set_in_game_overlay_mode(
-                            window,
-                            target_rect,
-                            self.overlay_corner,
-                            visible,
-                        )
-                    };
-                    if let Err(err) = res {
-                        warn!(error = %err, has_augment_offer, "failed to update in-game overlay window");
-                    }
                     self.last_overlay_sync = Some(state);
-                    return true;
+                    let action = if has_augment_offer {
+                        Win32WindowAction::InGameAugmentBar {
+                            target_rect,
+                            visible,
+                        }
+                    } else {
+                        Win32WindowAction::InGameOverlay {
+                            target_rect,
+                            corner: self.overlay_corner,
+                            visible,
+                        }
+                    };
+                    return Some(Win32WindowCommand { hwnd_raw, action });
                 }
-                false
+                None
             }
             AppMode::Dormant => {
                 if !self.last_dormant_hidden {
-                    if let Err(err) = win32::hide_window(window) {
-                        warn!(error = %err, "failed to hide dormant overlay window");
-                    }
                     self.last_dormant_hidden = true;
+                    return Some(Win32WindowCommand {
+                        hwnd_raw,
+                        action: Win32WindowAction::Hide,
+                    });
                 }
-                false
+                None
             }
         }
     }
