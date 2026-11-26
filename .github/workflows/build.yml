@@ -1,4 +1,4 @@
-name: Build HexOverlay (Windows)
+name: Build Hexrs (Windows)
 
 on:
   push:
@@ -81,16 +81,16 @@ jobs:
             exit $code
           }
 
-      - name: Report HexOverlay.exe size
+      - name: Report Hexrs.exe size
         shell: pwsh
         run: |
-          $exe = Get-Item "target/x86_64-pc-windows-msvc/release/HexOverlay.exe"
+          $exe = Get-Item "target/x86_64-pc-windows-msvc/release/Hexrs.exe"
           $mb = [math]::Round($exe.Length / 1MB, 2)
-          Write-Host "HexOverlay.exe size: $($exe.Length) bytes ($mb MB)"
+          Write-Host "Hexrs.exe size: $($exe.Length) bytes ($mb MB)"
 
-      - name: Upload HexOverlay artifact
+      - name: Upload Hexrs artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HexOverlay-windows-x86_64
-          path: target/x86_64-pc-windows-msvc/release/HexOverlay.exe
+          name: Hexrs-windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/Hexrs.exe
           if-no-files-found: error

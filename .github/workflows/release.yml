@@ -1,4 +1,4 @@
-name: Release HexOverlay (Windows)
+name: Release Hexrs (Windows)
 
 on:
   push:
@@ -63,18 +63,18 @@ jobs:
       - name: Cache Cargo dependencies and artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build HexOverlay release binary
-        run: cargo build --release --target x86_64-pc-windows-msvc --bin HexOverlay
+      - name: Build Hexrs release binary
+        run: cargo build --release --target x86_64-pc-windows-msvc --bin Hexrs
 
-      - name: Report HexOverlay.exe size
+      - name: Report Hexrs.exe size
         shell: pwsh
         run: |
-          $exe = Get-Item "target/x86_64-pc-windows-msvc/release/HexOverlay.exe"
+          $exe = Get-Item "target/x86_64-pc-windows-msvc/release/Hexrs.exe"
           $mb = [math]::Round($exe.Length / 1MB, 2)
-          Write-Host "HexOverlay.exe size: $($exe.Length) bytes ($mb MB)"
+          Write-Host "Hexrs.exe size: $($exe.Length) bytes ($mb MB)"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/x86_64-pc-windows-msvc/release/HexOverlay.exe
+          files: target/x86_64-pc-windows-msvc/release/Hexrs.exe
           generate_release_notes: true

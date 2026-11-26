@@ -1,4 +1,4 @@
-//! Shared domain models, ROI manifests, and event types for HexOverlay.
+//! Shared domain models, ROI manifests, and event types for Hexrs.
 
 use std::fmt;
 
