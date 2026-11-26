@@ -2,6 +2,10 @@
 
 use std::collections::HashSet;
 use std::fs;
+#[cfg(has_bundled_meta_db)]
+use std::fs::File;
+#[cfg(has_bundled_meta_db)]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -18,6 +22,11 @@ use crate::seed::{lookup_item_name_zh, populate_seed_data};
 
 const SYNERGY_LIFT_THRESHOLD: f64 = 1.15;
 const SYNERGY_MIN_SAMPLES: i32 = 30;
+#[cfg(has_bundled_meta_db)]
+const SQLITE_MAGIC_HEADER: &[u8] = b"SQLite format 3\0";
+
+#[cfg(has_bundled_meta_db)]
+const BUNDLED_META_DB_ZST: &[u8] = include_bytes!("../assets/meta.db.zst");
 
 /// Returns the local application data directory (`%LOCALAPPDATA%/Hexrs` on Windows).
 pub fn data_dir() -> PathBuf {
@@ -160,33 +169,53 @@ pub struct MetaEngine {
 }
 
 impl MetaEngine {
-    /// Opens the default `%LOCALAPPDATA%/Hexrs/meta.db`, seeding it if missing/empty, and loads into RAM.
+    /// Opens the default `%LOCALAPPDATA%/Hexrs/meta.db`, installing bundled/seed data if missing or outdated, and loads into RAM.
     pub fn open_default() -> Result<Self> {
         let dir = data_dir();
         fs::create_dir_all(&dir)
             .with_context(|| format!("failed to create data directory {}", dir.display()))?;
         let path = db_path();
 
-        let needs_seed = if !path.exists() {
+        let needs_init = if !path.exists() {
             true
         } else {
             let check_conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .with_context(|| format!("failed to inspect existing {}", path.display()))?;
-            let count: i64 = check_conn
+            let hero_count: i64 = check_conn
                 .query_row("SELECT COUNT(*) FROM hero_tier_stats", [], |row| row.get(0))
                 .unwrap_or(0);
-            count == 0
+            let aug_count: i64 = check_conn
+                .query_row("SELECT COUNT(*) FROM augment_meta", [], |row| row.get(0))
+                .unwrap_or(0);
+            hero_count == 0 || (cfg!(has_bundled_meta_db) && aug_count < 100)
         };
 
-        if needs_seed {
-            info!(path = %path.display(), "initializing cold-start meta.db seed dataset");
-            let disk_conn = Connection::open(&path)
-                .with_context(|| format!("failed to create/open {}", path.display()))?;
-            init_schema(&disk_conn)?;
-            populate_seed_data(&disk_conn)?;
+        if needs_init {
+            let installed_bundled = try_install_bundled_db(&dir, &path);
+            if !installed_bundled {
+                info!(path = %path.display(), "initializing cold-start meta.db seed dataset");
+                let disk_conn = Connection::open(&path)
+                    .with_context(|| format!("failed to create/open {}", path.display()))?;
+                init_schema(&disk_conn)?;
+                populate_seed_data(&disk_conn)?;
+            }
         }
 
         Self::open_from_path(&path)
+    }
+
+    /// Returns `(champion_count, augment_count)` from the active in-memory SQLite database.
+    pub fn stats_counts(&self) -> (usize, usize) {
+        let Ok(conn) = self.conn.lock() else {
+            return (0, 0);
+        };
+        let champs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM champions", [], |row| row.get(0))
+            .unwrap_or(0);
+        let augs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM augment_meta", [], |row| row.get(0))
+            .unwrap_or(0);
+        (champs.max(0) as usize, augs.max(0) as usize)
     }
 
     /// Loads an existing SQLite `meta.db` file read-only into an in-memory SQLite connection.
@@ -617,6 +646,67 @@ impl MetaEngine {
             ],
         }
     }
+}
+
+#[cfg(has_bundled_meta_db)]
+fn try_install_bundled_db(dir: &Path, target_db: &Path) -> bool {
+    use tracing::warn;
+
+    let decompressed = match zstd::stream::decode_all(BUNDLED_META_DB_ZST) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            warn!(error = %err, "failed to decompress bundled meta.db.zst; falling back to seed");
+            return false;
+        }
+    };
+
+    if !decompressed.starts_with(SQLITE_MAGIC_HEADER) {
+        warn!("bundled meta.db.zst did not decode to a valid SQLite 3 header");
+        return false;
+    }
+
+    let tmp_path = dir.join("meta.db.tmp");
+    {
+        let mut tmp_file = match File::create(&tmp_path) {
+            Ok(f) => f,
+            Err(err) => {
+                warn!(error = %err, "failed to create meta.db.tmp for bundled DB");
+                return false;
+            }
+        };
+        if let Err(err) = tmp_file.write_all(&decompressed).and_then(|_| tmp_file.sync_all()) {
+            warn!(error = %err, "failed to write bundled meta.db.tmp");
+            let _ = fs::remove_file(&tmp_path);
+            return false;
+        }
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, target_db) {
+        warn!(error = %err, "failed to install bundled meta.db");
+        let _ = fs::remove_file(&tmp_path);
+        return false;
+    }
+
+    if let Ok(conn) = Connection::open_with_flags(target_db, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        if let Ok(Some(ver)) = conn
+            .query_row(
+                "SELECT value FROM meta_info WHERE key = 'data_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+        {
+            let _ = fs::write(dir.join("version.txt"), ver.trim());
+        }
+    }
+
+    info!(path = %target_db.display(), "installed bundled CDragon meta.db");
+    true
+}
+
+#[cfg(not(has_bundled_meta_db))]
+fn try_install_bundled_db(_dir: &Path, _target_db: &Path) -> bool {
+    false
 }
 
 fn load_path_into_memory(path: &Path) -> Result<Connection> {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch CommunityDragon champions, items, and Arena/Hex augments + compute exact DCT-II pHashes.
+"""Fetch CommunityDragon champions, items, and all Arena/Cherry/Hex augments + compute exact DCT-II pHashes.
 
 The 64-bit pHash implementation matches `crates/hex-vision/src/phash.rs::compute_region_phash`
 bit-for-bit:
@@ -14,26 +14,45 @@ bit-for-bit:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import requests
 from PIL import Image
+from requests.adapters import HTTPAdapter
 
 CDRAGON_BASE = "https://raw.communitydragon.org/latest"
 CHAMPIONS_URL = f"{CDRAGON_BASE}/plugins/rcp-be-lol-game-data/global/zh_cn/v1/champion-summary.json"
 ITEMS_URL = f"{CDRAGON_BASE}/plugins/rcp-be-lol-game-data/global/zh_cn/v1/items.json"
-ARENA_DATA_URL = f"{CDRAGON_BASE}/cdragon/arena/zh_cn.json"
 CHERRY_AUGMENTS_URL = (
     f"{CDRAGON_BASE}/plugins/rcp-be-lol-game-data/global/zh_cn/v1/cherry-augments.json"
 )
+ARENA_DATA_URL = f"{CDRAGON_BASE}/cdragon/arena/zh_cn.json"
 
 DCT_SIZE = 32
 LOW_FREQ_SIZE = 8
+MAX_ICON_WORKERS = 16
+
+_thread_local = threading.local()
+
+
+def _get_session() -> requests.Session:
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=MAX_ICON_WORKERS, pool_maxsize=MAX_ICON_WORKERS)
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+        session.headers.update({"User-Agent": "Hexrs-MetaUpdater/1.0"})
+        _thread_local.session = session
+    return session
 
 
 def _build_dct_lut() -> np.ndarray:
@@ -136,13 +155,41 @@ def rarity_zh(raw_rarity: Any) -> str:
     return "白银"
 
 
+def _download_and_hash_icon(icon_url: str, cache_dir: Path | None) -> str:
+    if not icon_url:
+        return "0000000000000000"
+
+    cache_file: Path | None = None
+    if cache_dir is not None:
+        digest = hashlib.sha256(icon_url.encode("utf-8")).hexdigest()[:24]
+        cache_file = cache_dir / f"{digest}.png"
+        if cache_file.exists() and cache_file.stat().st_size > 8:
+            try:
+                with Image.open(io.BytesIO(cache_file.read_bytes())) as img:
+                    return compute_rgba_phash(img)
+            except Exception:
+                pass
+
+    session = _get_session()
+    try:
+        resp = session.get(icon_url, timeout=15)
+        resp.raise_for_status()
+        img_bytes = resp.content
+        with Image.open(io.BytesIO(img_bytes)) as img:
+            phash = compute_rgba_phash(img)
+        if cache_file is not None:
+            cache_file.write_bytes(img_bytes)
+        return phash
+    except Exception:
+        return "0000000000000000"
+
+
 def fetch_cdragon_metadata(
     cache_dir: Path | None = None,
     skip_icons: bool = False,
     limit_icons: int | None = None,
 ) -> dict[str, Any]:
-    session = requests.Session()
-    session.headers.update({"User-Agent": "Hexrs-MetaUpdater/1.0"})
+    session = _get_session()
 
     champions_raw = fetch_json(session, CHAMPIONS_URL)
     champions = []
@@ -173,64 +220,113 @@ def fetch_cdragon_metadata(
             }
         )
 
-    augments_raw: list[dict[str, Any]] = []
+    cherry_raw: list[dict[str, Any]] = []
+    try:
+        loaded = fetch_json(session, CHERRY_AUGMENTS_URL, timeout=30)
+        if isinstance(loaded, list):
+            cherry_raw = loaded
+    except Exception:
+        cherry_raw = []
+
+    arena_augments_by_id: dict[int, dict[str, Any]] = {}
     try:
         arena_bundle = fetch_json(session, ARENA_DATA_URL, timeout=45)
         if isinstance(arena_bundle, dict) and isinstance(arena_bundle.get("augments"), list):
-            augments_raw = arena_bundle["augments"]
+            for entry in arena_bundle["augments"]:
+                aid = int(entry.get("id", -1))
+                if aid > 0:
+                    arena_augments_by_id[aid] = entry
     except Exception:
-        augments_raw = []
+        pass
 
-    if not augments_raw:
-        try:
-            cherry_raw = fetch_json(session, CHERRY_AUGMENTS_URL, timeout=30)
-            if isinstance(cherry_raw, list):
-                augments_raw = cherry_raw
-        except Exception:
-            augments_raw = []
+    merged_by_id: dict[int, dict[str, Any]] = {}
+    for aug in cherry_raw:
+        aug_id = int(aug.get("id", -1))
+        if aug_id <= 0:
+            continue
+        arena_extra = arena_augments_by_id.get(aug_id, {})
+        name_zh = str(
+            aug.get("nameTRA")
+            or aug.get("name")
+            or arena_extra.get("name")
+            or aug.get("augmentNameId")
+            or ""
+        ).strip()
+        desc_zh = str(
+            aug.get("summaryDescription")
+            or arena_extra.get("desc")
+            or arena_extra.get("tooltip")
+            or aug.get("desc")
+            or ""
+        ).strip()
+        icon_raw = str(
+            aug.get("augmentLargeIconPath")
+            or aug.get("augmentSmallIconPath")
+            or arena_extra.get("iconLarge")
+            or arena_extra.get("iconSmall")
+            or ""
+        )
+        merged_by_id[aug_id] = {
+            "augment_id": aug_id,
+            "name_zh": name_zh,
+            "rarity": rarity_zh(aug.get("rarity") or arena_extra.get("rarity")),
+            "desc_zh": desc_zh,
+            "icon_url": normalize_cdragon_asset_url(icon_raw),
+        }
+
+    for aug_id, arena_aug in arena_augments_by_id.items():
+        if aug_id in merged_by_id:
+            continue
+        name_zh = str(arena_aug.get("name") or arena_aug.get("nameTRA") or "").strip()
+        desc_zh = str(arena_aug.get("desc") or arena_aug.get("tooltip") or "").strip()
+        icon_raw = str(arena_aug.get("iconLarge") or arena_aug.get("iconSmall") or "")
+        merged_by_id[aug_id] = {
+            "augment_id": aug_id,
+            "name_zh": name_zh,
+            "rarity": rarity_zh(arena_aug.get("rarity")),
+            "desc_zh": desc_zh,
+            "icon_url": normalize_cdragon_asset_url(icon_raw),
+        }
 
     if cache_dir is not None:
         cache_dir.mkdir(parents=True, exist_ok=True)
 
+    augments_list = [merged_by_id[k] for k in sorted(merged_by_id)]
+    url_to_phash: dict[str, str] = {}
+
+    if not skip_icons:
+        unique_urls: list[str] = []
+        seen_urls: set[str] = set()
+        for aug in augments_list:
+            url = aug["icon_url"]
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                unique_urls.append(url)
+        if limit_icons is not None:
+            unique_urls = unique_urls[:limit_icons]
+
+        with ThreadPoolExecutor(max_workers=MAX_ICON_WORKERS) as pool:
+            future_map = {
+                pool.submit(_download_and_hash_icon, url, cache_dir): url for url in unique_urls
+            }
+            for future in as_completed(future_map):
+                url = future_map[future]
+                try:
+                    url_to_phash[url] = future.result()
+                except Exception:
+                    url_to_phash[url] = "0000000000000000"
+
     augments = []
-    hashed_count = 0
-    for aug in augments_raw:
-        aug_id = int(aug.get("id", -1))
-        if aug_id <= 0:
-            continue
-        name_zh = str(aug.get("name") or aug.get("nameTRA") or "").strip()
-        desc_zh = str(aug.get("desc") or aug.get("tooltip") or "").strip()
-        icon_raw = str(
-            aug.get("iconLarge") or aug.get("iconSmall") or aug.get("augmentSmallIconPath") or ""
-        )
-        icon_url = normalize_cdragon_asset_url(icon_raw)
-
-        phash = "0000000000000000"
-        if not skip_icons and icon_url and (limit_icons is None or hashed_count < limit_icons):
-            cache_file = cache_dir / f"{aug_id}.png" if cache_dir is not None else None
-            try:
-                if cache_file is not None and cache_file.exists():
-                    img_bytes = cache_file.read_bytes()
-                else:
-                    icon_resp = session.get(icon_url, timeout=15)
-                    icon_resp.raise_for_status()
-                    img_bytes = icon_resp.content
-                    if cache_file is not None:
-                        cache_file.write_bytes(img_bytes)
-                with Image.open(io.BytesIO(img_bytes)) as img:
-                    phash = compute_rgba_phash(img)
-                hashed_count += 1
-            except Exception:
-                pass
-
+    for aug in augments_list:
+        phash = url_to_phash.get(aug["icon_url"], "0000000000000000")
         augments.append(
             {
-                "augment_id": aug_id,
-                "name_zh": name_zh,
-                "rarity": rarity_zh(aug.get("rarity")),
+                "augment_id": aug["augment_id"],
+                "name_zh": aug["name_zh"],
+                "rarity": aug["rarity"],
                 "phash": phash,
-                "desc_zh": desc_zh,
-                "icon_url": icon_url,
+                "desc_zh": aug["desc_zh"],
+                "icon_url": aug["icon_url"],
             }
         )
 
@@ -264,7 +360,7 @@ def main() -> None:
         "--limit-icons",
         type=int,
         default=None,
-        help="Optional limit on number of augment icons to hash.",
+        help="Optional limit on number of unique augment icons to hash.",
     )
     args = parser.parse_args()
 
@@ -276,9 +372,11 @@ def main() -> None:
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    hashed_ok = sum(1 for a in payload["augments"] if a["phash"] != "0000000000000000")
     print(
         f"Saved {len(payload['champions'])} champions, "
-        f"{len(payload['items'])} items, {len(payload['augments'])} augments -> {args.output}"
+        f"{len(payload['items'])} items, {len(payload['augments'])} augments "
+        f"({hashed_ok} pHashed) -> {args.output}"
     )
 
 

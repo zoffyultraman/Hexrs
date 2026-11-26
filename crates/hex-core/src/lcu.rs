@@ -12,11 +12,13 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::header::AUTHORIZATION;
 use reqwest::StatusCode;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::crypto::{ring::default_provider, verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::crypto::{
+    ring::default_provider, verify_tls12_signature, verify_tls13_signature, CryptoProvider,
+};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use tokio::sync::{mpsc, watch};
 use tokio::time::sleep;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -31,12 +33,15 @@ use crate::models::{ChampSelectState, EndOfGameParticipant, EndOfGameStats, Team
 const WAMP_EVENT_OPCODE: i64 = 8;
 const EVENT_CHAMP_SELECT: &str = "OnJsonApiEvent_lol-champ-select_v1_session";
 const EVENT_EOG_STATS: &str = "OnJsonApiEvent_lol-end-of-game_v1_eog-stats-block";
+const EVENT_GAMEFLOW_PHASE: &str = "OnJsonApiEvent_lol-gameflow_v1_gameflow-phase";
 
 /// Events produced by the LCU WebSocket subscription loop.
 #[derive(Debug, Clone)]
 pub enum LcuWsEvent {
     Connected,
     Disconnected,
+    WsError(String),
+    GameflowPhase(String),
     ChampSelectUpdated(ChampSelectState),
     ChampSelectEnded,
     EndOfGameCaptured(EndOfGameStats),
@@ -117,6 +122,19 @@ impl LcuClient {
         Ok(raw.map(into_champ_select_state))
     }
 
+    /// Queries `/lol-gameflow/v1/gameflow-phase` (e.g. `"None"`, `"Lobby"`, `"ChampSelect"`, `"InProgress"`).
+    pub async fn get_gameflow_phase(&self) -> Result<Option<String>> {
+        let raw = self
+            .get_json::<serde_json::Value>("/lol-gameflow/v1/gameflow-phase")
+            .await?;
+        Ok(raw.and_then(|val| {
+            val.as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        }))
+    }
+
     /// Queries `/lol-gameflow/v1/session` for the active queue's game mode (e.g. `CHERRY`, `ARAM`, `KIWI`).
     pub async fn get_current_game_mode(&self) -> Result<Option<String>> {
         Ok(self
@@ -151,7 +169,7 @@ impl LcuClient {
         Ok(raw.map(into_eog_stats))
     }
 
-    /// Maintains a reconnecting WebSocket subscription for champ select and EOG events until shutdown.
+    /// Maintains a reconnecting WebSocket subscription for champ select, gameflow phase, and EOG events until shutdown.
     pub async fn run_ws_loop(
         &self,
         event_tx: mpsc::UnboundedSender<LcuWsEvent>,
@@ -164,9 +182,7 @@ impl LcuClient {
                 break;
             }
 
-            let outcome = self
-                .connect_and_stream(&event_tx, &mut shutdown_rx)
-                .await;
+            let outcome = self.connect_and_stream(&event_tx, &mut shutdown_rx).await;
 
             match outcome {
                 Ok(was_connected) => {
@@ -180,6 +196,7 @@ impl LcuClient {
                         let _ = event_tx.send(LcuWsEvent::Disconnected);
                         backoff_secs = 1;
                     }
+                    let _ = event_tx.send(LcuWsEvent::WsError(format!("LCU WS: {err:#}")));
                     debug!(error = %err, backoff_secs, "LCU WebSocket disconnected; retrying");
                 }
             }
@@ -228,19 +245,14 @@ impl LcuClient {
 
         let (mut write, mut read) = ws_stream.split();
 
-        let sub_champ = format!(r#"[5, "{EVENT_CHAMP_SELECT}"]"#);
-        let sub_eog = format!(r#"[5, "{EVENT_EOG_STATS}"]"#);
-
-        write
-            .send(Message::text(sub_champ))
-            .await
-            .context("failed to subscribe to champ select WS topic")
-            .map_err(|e| (false, e))?;
-        write
-            .send(Message::text(sub_eog))
-            .await
-            .context("failed to subscribe to EOG WS topic")
-            .map_err(|e| (false, e))?;
+        for topic in [EVENT_CHAMP_SELECT, EVENT_EOG_STATS, EVENT_GAMEFLOW_PHASE] {
+            let sub_frame = format!(r#"[5, "{topic}"]"#);
+            write
+                .send(Message::text(sub_frame))
+                .await
+                .with_context(|| format!("failed to subscribe to WS topic {topic}"))
+                .map_err(|e| (false, e))?;
+        }
 
         let _ = event_tx.send(LcuWsEvent::Connected);
 
@@ -369,16 +381,38 @@ pub fn parse_wamp_event(text: &str) -> Option<LcuWsEvent> {
             if envelope.event_type.eq_ignore_ascii_case("Delete") {
                 Some(LcuWsEvent::ChampSelectEnded)
             } else {
-                let raw: RawChampSelectSession = serde_json::from_value(envelope.data).ok()?;
-                Some(LcuWsEvent::ChampSelectUpdated(into_champ_select_state(raw)))
+                match serde_json::from_value::<RawChampSelectSession>(envelope.data) {
+                    Ok(raw) => Some(LcuWsEvent::ChampSelectUpdated(into_champ_select_state(raw))),
+                    Err(err) => {
+                        warn!(error = %err, "failed to deserialize LCU WS champ select payload");
+                        None
+                    }
+                }
+            }
+        }
+        EVENT_GAMEFLOW_PHASE => {
+            if envelope.event_type.eq_ignore_ascii_case("Delete") {
+                Some(LcuWsEvent::GameflowPhase("None".to_owned()))
+            } else {
+                envelope
+                    .data
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|phase| LcuWsEvent::GameflowPhase(phase.to_owned()))
             }
         }
         EVENT_EOG_STATS => {
             if envelope.event_type.eq_ignore_ascii_case("Delete") {
                 None
             } else {
-                let raw: RawEogStatsBlock = serde_json::from_value(envelope.data).ok()?;
-                Some(LcuWsEvent::EndOfGameCaptured(into_eog_stats(raw)))
+                match serde_json::from_value::<RawEogStatsBlock>(envelope.data) {
+                    Ok(raw) => Some(LcuWsEvent::EndOfGameCaptured(into_eog_stats(raw))),
+                    Err(err) => {
+                        warn!(error = %err, "failed to deserialize LCU WS EOG payload");
+                        None
+                    }
+                }
             }
         }
         _ => None,
@@ -392,6 +426,7 @@ fn into_champ_select_state(raw: RawChampSelectSession) -> ChampSelectState {
     let my_team = raw
         .my_team
         .into_iter()
+        .flatten()
         .map(|slot| {
             if slot.cell_id == raw.local_player_cell_id {
                 local_champion_id = slot.champion_id;
@@ -409,12 +444,15 @@ fn into_champ_select_state(raw: RawChampSelectSession) -> ChampSelectState {
     let bench_champions = raw
         .bench_champions
         .into_iter()
+        .flatten()
         .map(|entry| match entry {
             RawBenchEntry::Id(id) => id,
             RawBenchEntry::Obj { champion_id } => champion_id,
         })
         .filter(|&id| id > 0)
         .collect();
+
+    let rerolls_remaining = u32::try_from(raw.rerolls_remaining.max(0)).unwrap_or(u32::MAX);
 
     ChampSelectState {
         phase: raw.timer.phase,
@@ -425,15 +463,15 @@ fn into_champ_select_state(raw: RawChampSelectSession) -> ChampSelectState {
         local_intent_id,
         my_team,
         bench_champions,
-        rerolls_remaining: raw.rerolls_remaining,
+        rerolls_remaining,
     }
 }
 
 fn into_eog_stats(raw: RawEogStatsBlock) -> EndOfGameStats {
     let mut participants = Vec::new();
 
-    for team in raw.teams {
-        for player in team.players {
+    for team in raw.teams.into_iter().flatten() {
+        for player in team.players.into_iter().flatten() {
             let win = stat_bool(&player.stats, "WIN").unwrap_or(team.is_winning_team);
             let placement = player
                 .subteam_placement
@@ -441,14 +479,24 @@ fn into_eog_stats(raw: RawEogStatsBlock) -> EndOfGameStats {
                 .or_else(|| stat_u8(&player.stats, "PLACEMENT"))
                 .unwrap_or(if win { 1 } else { 2 });
 
-            let items = if !player.items.is_empty() {
-                player.items.into_iter().filter(|&id| id > 0).collect()
+            let items: Vec<i32> = if !player.items.is_empty() {
+                player
+                    .items
+                    .into_iter()
+                    .flatten()
+                    .filter(|&id| id > 0)
+                    .collect()
             } else {
                 extract_numbered_stat_ids(&player.stats, "ITEM", 0..=6)
             };
 
-            let augments = if !player.augments.is_empty() {
-                player.augments.into_iter().filter(|&id| id > 0).collect()
+            let augments: Vec<i32> = if !player.augments.is_empty() {
+                player
+                    .augments
+                    .into_iter()
+                    .flatten()
+                    .filter(|&id| id > 0)
+                    .collect()
             } else {
                 let mut augs = extract_numbered_stat_ids(&player.stats, "PLAYER_AUGMENT_", 1..=4);
                 if augs.is_empty() {
@@ -512,48 +560,59 @@ fn extract_numbered_stat_ids(
     ids
 }
 
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    let opt = Option::deserialize(deserializer)?;
+    Ok(opt.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct RawWampEnvelope {
-    #[serde(rename = "eventType", default)]
+    #[serde(rename = "eventType", default, deserialize_with = "deserialize_null_default")]
     event_type: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     data: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RawChampSelectSession {
+    #[serde(deserialize_with = "deserialize_null_default")]
     timer: RawChampSelectTimer,
-    #[serde(rename = "gameMode")]
+    #[serde(rename = "gameMode", deserialize_with = "deserialize_null_default")]
     game_mode: String,
     #[serde(rename = "queueId")]
     queue_id: Option<i32>,
-    #[serde(rename = "localPlayerCellId")]
+    #[serde(rename = "localPlayerCellId", deserialize_with = "deserialize_null_default")]
     local_player_cell_id: i32,
-    #[serde(rename = "myTeam")]
-    my_team: Vec<RawTeamSlot>,
-    #[serde(rename = "benchChampions")]
-    bench_champions: Vec<RawBenchEntry>,
-    #[serde(rename = "rerollsRemaining")]
-    rerolls_remaining: u32,
+    #[serde(rename = "myTeam", deserialize_with = "deserialize_null_default")]
+    my_team: Vec<Option<RawTeamSlot>>,
+    #[serde(rename = "benchChampions", deserialize_with = "deserialize_null_default")]
+    bench_champions: Vec<Option<RawBenchEntry>>,
+    #[serde(rename = "rerollsRemaining", deserialize_with = "deserialize_null_default")]
+    rerolls_remaining: i64,
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RawChampSelectTimer {
+    #[serde(deserialize_with = "deserialize_null_default")]
     phase: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RawTeamSlot {
-    #[serde(rename = "cellId")]
+    #[serde(rename = "cellId", deserialize_with = "deserialize_null_default")]
     cell_id: i32,
-    #[serde(rename = "championId")]
+    #[serde(rename = "championId", deserialize_with = "deserialize_null_default")]
     champion_id: i32,
-    #[serde(rename = "championPickIntent")]
+    #[serde(rename = "championPickIntent", deserialize_with = "deserialize_null_default")]
     champion_pick_intent: i32,
-    #[serde(rename = "assignedPosition")]
+    #[serde(rename = "assignedPosition", deserialize_with = "deserialize_null_default")]
     assigned_position: String,
 }
 
@@ -562,7 +621,7 @@ struct RawTeamSlot {
 enum RawBenchEntry {
     Id(i32),
     Obj {
-        #[serde(rename = "championId")]
+        #[serde(rename = "championId", default, deserialize_with = "deserialize_null_default")]
         champion_id: i32,
     },
 }
@@ -570,14 +629,16 @@ enum RawBenchEntry {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RawGameflowSession {
-    #[serde(rename = "gameData")]
+    #[serde(rename = "gameData", deserialize_with = "deserialize_null_default")]
     game_data: RawGameflowGameData,
+    #[serde(deserialize_with = "deserialize_null_default")]
     map: RawGameflowMap,
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RawGameflowGameData {
+    #[serde(deserialize_with = "deserialize_null_default")]
     queue: RawGameflowQueue,
 }
 
@@ -585,14 +646,14 @@ struct RawGameflowGameData {
 #[serde(default)]
 struct RawGameflowQueue {
     id: Option<i32>,
-    #[serde(rename = "gameMode")]
+    #[serde(rename = "gameMode", deserialize_with = "deserialize_null_default")]
     game_mode: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RawGameflowMap {
-    #[serde(rename = "gameMode")]
+    #[serde(rename = "gameMode", deserialize_with = "deserialize_null_default")]
     game_mode: String,
 }
 
@@ -600,29 +661,34 @@ struct RawGameflowMap {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RawEogStatsBlock {
-    #[serde(rename = "gameMode")]
+    #[serde(rename = "gameMode", deserialize_with = "deserialize_null_default")]
     game_mode: String,
     #[serde(rename = "queueId")]
     queue_id: Option<i32>,
-    teams: Vec<RawEogTeam>,
+    #[serde(deserialize_with = "deserialize_null_default")]
+    teams: Vec<Option<RawEogTeam>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RawEogTeam {
-    #[serde(rename = "isWinningTeam")]
+    #[serde(rename = "isWinningTeam", deserialize_with = "deserialize_null_default")]
     is_winning_team: bool,
-    players: Vec<RawEogPlayer>,
+    #[serde(deserialize_with = "deserialize_null_default")]
+    players: Vec<Option<RawEogPlayer>>,
 }
 
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RawEogPlayer {
-    #[serde(rename = "championId")]
+    #[serde(rename = "championId", deserialize_with = "deserialize_null_default")]
     champion_id: i32,
     #[serde(rename = "subteamPlacement")]
     subteam_placement: Option<u8>,
-    items: Vec<i32>,
-    augments: Vec<i32>,
+    #[serde(deserialize_with = "deserialize_null_default")]
+    items: Vec<Option<i32>>,
+    #[serde(deserialize_with = "deserialize_null_default")]
+    augments: Vec<Option<i32>>,
+    #[serde(deserialize_with = "deserialize_null_default")]
     stats: HashMap<String, serde_json::Value>,
 }

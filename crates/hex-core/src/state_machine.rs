@@ -17,7 +17,7 @@ use crate::models::{AppEvent, AppMode, ChampSelectState, LiveGameState};
 use crate::process::{LcuCredentials, ProcessMonitor, ProcessSnapshot};
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(1500);
-const CHAMP_SELECT_REST_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+const CHAMP_SELECT_REST_POLL_INTERVAL: Duration = Duration::from_millis(1200);
 const LIVE_API_POLL_INTERVAL: Duration = Duration::from_millis(2000);
 
 /// Diagnostic snapshot exposed via `CoreHandle::diagnostics()` for UI/tray inspection.
@@ -42,6 +42,7 @@ struct CoreSharedState {
     lcu_connected: bool,
     in_champ_select: bool,
     live_api_active: bool,
+    last_lcu_error: Option<String>,
 }
 
 /// Control handle for querying core state and cleanly shutting down the background service.
@@ -96,17 +97,28 @@ impl CoreHandle {
     pub fn diagnostics(&self) -> CoreDiagnostics {
         self.shared
             .read()
-            .map(|guard| CoreDiagnostics {
-                mode: guard.mode,
-                lcu_pid: guard.snapshot.lcu_pid,
-                lcu_port: guard.snapshot.lcu.as_ref().map(|c| c.port),
-                lcu_connected_ws: guard.lcu_connected,
-                in_champ_select: guard.in_champ_select,
-                game_pid: guard.snapshot.game_pid,
-                game_running: guard.snapshot.game_running,
-                live_api_active: guard.live_api_active,
-                is_elevated: guard.snapshot.is_elevated,
-                lcu_diagnostic: guard.snapshot.lcu_diagnostic.clone(),
+            .map(|guard| {
+                let lcu_port = guard.snapshot.lcu.as_ref().map(|c| c.port);
+                let lcu_diagnostic = guard.snapshot.lcu_diagnostic.clone().or_else(|| {
+                    if !guard.in_champ_select && lcu_port.is_some() {
+                        guard.last_lcu_error.clone()
+                    } else {
+                        None
+                    }
+                });
+
+                CoreDiagnostics {
+                    mode: guard.mode,
+                    lcu_pid: guard.snapshot.lcu_pid,
+                    lcu_port,
+                    lcu_connected_ws: guard.lcu_connected,
+                    in_champ_select: guard.in_champ_select,
+                    game_pid: guard.snapshot.game_pid,
+                    game_running: guard.snapshot.game_running,
+                    live_api_active: guard.live_api_active,
+                    is_elevated: guard.snapshot.is_elevated,
+                    lcu_diagnostic,
+                }
             })
             .unwrap_or_default()
     }
@@ -172,6 +184,11 @@ pub fn spawn_core_service() -> Result<(Receiver<AppEvent>, CoreHandle)> {
     CoreRuntime::spawn()
 }
 
+struct ChampPollOutcome {
+    session: Result<Option<ChampSelectState>>,
+    phase: Option<String>,
+}
+
 struct CoordinatorState {
     event_tx: Sender<AppEvent>,
     shared: Arc<RwLock<CoreSharedState>>,
@@ -182,6 +199,7 @@ struct CoordinatorState {
     lcu_connected: bool,
     in_champ_select: bool,
     live_api_active: bool,
+    last_lcu_error: Option<String>,
     cached_game_mode: Option<String>,
     cached_queue_id: Option<i32>,
     last_champ_select: Option<ChampSelectState>,
@@ -204,6 +222,7 @@ impl CoordinatorState {
             lcu_connected: false,
             in_champ_select: false,
             live_api_active: false,
+            last_lcu_error: None,
             cached_game_mode: None,
             cached_queue_id: None,
             last_champ_select: None,
@@ -239,6 +258,7 @@ impl CoordinatorState {
             guard.lcu_connected = self.lcu_connected;
             guard.in_champ_select = self.in_champ_select;
             guard.live_api_active = self.live_api_active;
+            guard.last_lcu_error = self.last_lcu_error.clone();
         }
 
         if mode_changed {
@@ -266,6 +286,7 @@ impl CoordinatorState {
             let was_connected = self.lcu_connected;
             self.lcu_connected = false;
             self.in_champ_select = false;
+            self.last_lcu_error = None;
             self.cached_game_mode = None;
             self.cached_queue_id = None;
             self.last_champ_select = None;
@@ -300,6 +321,7 @@ impl CoordinatorState {
                     }
                     Err(err) => {
                         warn!(error = %err, "failed to initialize LcuClient");
+                        self.last_lcu_error = Some(format!("LcuClient 初始化失败: {err:#}"));
                     }
                 }
             }
@@ -326,6 +348,14 @@ impl CoordinatorState {
         state
     }
 
+    fn clear_champ_select_state(&mut self) {
+        self.in_champ_select = false;
+        self.cached_game_mode = None;
+        self.cached_queue_id = None;
+        self.last_champ_select = None;
+        self.gameflow_fetch_in_flight = false;
+    }
+
     fn handle_ws_event(
         &mut self,
         event: LcuWsEvent,
@@ -334,6 +364,7 @@ impl CoordinatorState {
     ) {
         match event {
             LcuWsEvent::Connected => {
+                self.last_lcu_error = None;
                 if !self.lcu_connected {
                     self.lcu_connected = true;
                     let _ = self.event_tx.send(AppEvent::LcuConnectionChanged(true));
@@ -351,8 +382,29 @@ impl CoordinatorState {
                     let _ = self.event_tx.send(AppEvent::LcuConnectionChanged(false));
                 }
             }
+            LcuWsEvent::WsError(msg) => {
+                self.last_lcu_error = Some(msg);
+            }
+            LcuWsEvent::GameflowPhase(phase) => {
+                debug!(%phase, "LCU gameflow phase changed");
+                if phase == "ChampSelect" {
+                    self.in_champ_select = true;
+                    if let Some(client) = self.active_lcu.clone() {
+                        let tx = ws_event_tx.clone();
+                        tokio::spawn(async move {
+                            emit_initial_champ_select(&client, &tx).await;
+                        });
+                    }
+                } else if matches!(
+                    phase.as_str(),
+                    "None" | "Lobby" | "Matchmaking" | "EndOfGame"
+                ) {
+                    self.clear_champ_select_state();
+                }
+            }
             LcuWsEvent::ChampSelectUpdated(raw_state) => {
                 self.in_champ_select = true;
+                self.last_lcu_error = None;
                 let state = self.normalize_champ_select(raw_state);
 
                 if state.game_mode.is_empty() && !self.gameflow_fetch_in_flight {
@@ -374,11 +426,7 @@ impl CoordinatorState {
                 let _ = self.event_tx.send(AppEvent::ChampSelectUpdated(state));
             }
             LcuWsEvent::ChampSelectEnded => {
-                self.in_champ_select = false;
-                self.cached_game_mode = None;
-                self.cached_queue_id = None;
-                self.last_champ_select = None;
-                self.gameflow_fetch_in_flight = false;
+                self.clear_champ_select_state();
             }
             LcuWsEvent::EndOfGameCaptured(stats) => {
                 let _ = self.event_tx.send(AppEvent::EndOfGameCaptured(stats));
@@ -390,13 +438,14 @@ impl CoordinatorState {
 
     fn handle_champ_poll_result(
         &mut self,
-        result: Result<Option<ChampSelectState>>,
+        outcome: ChampPollOutcome,
         ws_event_tx: &mpsc::UnboundedSender<LcuWsEvent>,
         gameflow_tx: &mpsc::UnboundedSender<Option<(String, Option<i32>)>>,
     ) {
         self.champ_poll_in_flight = false;
-        match result {
+        match outcome.session {
             Ok(Some(raw_session)) => {
+                self.last_lcu_error = None;
                 let normalized = self.normalize_champ_select(raw_session);
                 if Some(&normalized) != self.last_champ_select.as_ref() {
                     self.handle_ws_event(
@@ -407,12 +456,39 @@ impl CoordinatorState {
                 }
             }
             Ok(None) => {
-                if self.in_champ_select {
-                    self.handle_ws_event(LcuWsEvent::ChampSelectEnded, ws_event_tx, gameflow_tx);
+                self.last_lcu_error = None;
+                match outcome.phase.as_deref() {
+                    Some("ChampSelect") => {
+                        if !self.in_champ_select {
+                            info!("LCU gameflow-phase=ChampSelect detected via REST fallback");
+                            self.in_champ_select = true;
+                            self.sync_shared_and_mode();
+                        }
+                    }
+                    Some("None" | "Lobby" | "Matchmaking" | "EndOfGame") => {
+                        if self.in_champ_select {
+                            self.handle_ws_event(
+                                LcuWsEvent::ChampSelectEnded,
+                                ws_event_tx,
+                                gameflow_tx,
+                            );
+                        }
+                    }
+                    _ => {
+                        if self.in_champ_select && outcome.phase.is_none() {
+                            self.handle_ws_event(
+                                LcuWsEvent::ChampSelectEnded,
+                                ws_event_tx,
+                                gameflow_tx,
+                            );
+                        }
+                    }
                 }
             }
             Err(err) => {
-                debug!(error = %err, "LCU REST champ select poll fallback failed");
+                warn!(error = %err, "LCU REST champ select poll fallback failed");
+                self.last_lcu_error = Some(format!("LCU REST: {err:#}"));
+                self.sync_shared_and_mode();
             }
         }
     }
@@ -499,9 +575,16 @@ async fn emit_initial_champ_select(
             }
             let _ = ws_event_tx.send(LcuWsEvent::ChampSelectUpdated(session));
         }
-        Ok(None) => {}
+        Ok(None) => {
+            if let Ok(Some(phase)) = client.get_gameflow_phase().await {
+                if phase == "ChampSelect" {
+                    let _ = ws_event_tx.send(LcuWsEvent::GameflowPhase(phase));
+                }
+            }
+        }
         Err(err) => {
-            debug!(error = %err, "failed to fetch initial LCU champ select session");
+            warn!(error = %err, "failed to fetch initial LCU champ select session");
+            let _ = ws_event_tx.send(LcuWsEvent::WsError(format!("LCU REST: {err:#}")));
         }
     }
 }
@@ -532,8 +615,7 @@ async fn run_coordinator(
 
     let (ws_event_tx, mut ws_event_rx) = mpsc::unbounded_channel::<LcuWsEvent>();
     let (gameflow_tx, mut gameflow_rx) = mpsc::unbounded_channel::<Option<(String, Option<i32>)>>();
-    let (champ_poll_tx, mut champ_poll_rx) =
-        mpsc::unbounded_channel::<Result<Option<ChampSelectState>>>();
+    let (champ_poll_tx, mut champ_poll_rx) = mpsc::unbounded_channel::<ChampPollOutcome>();
     let (live_poll_tx, mut live_poll_rx) =
         mpsc::unbounded_channel::<Result<Option<LiveGameState>>>();
 
@@ -575,8 +657,13 @@ async fn run_coordinator(
                         state.champ_poll_in_flight = true;
                         let tx = champ_poll_tx.clone();
                         tokio::spawn(async move {
-                            let res = client.get_champ_select_session().await;
-                            let _ = tx.send(res);
+                            let session = client.get_champ_select_session().await;
+                            let phase = if matches!(session, Ok(None)) {
+                                client.get_gameflow_phase().await.ok().flatten()
+                            } else {
+                                None
+                            };
+                            let _ = tx.send(ChampPollOutcome { session, phase });
                         });
                     }
                 }

@@ -243,5 +243,6 @@ pub enum AppEvent {
         candidates: Vec<i32>,
         capture_ms: u64,
     },
+    AugmentOfferCleared,
     LcuConnectionChanged(bool),
 }
