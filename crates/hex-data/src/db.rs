@@ -41,7 +41,8 @@ fn is_dir_writable(dir: &Path) -> bool {
         .truncate(true)
         .open(&probe)
     {
-        Ok(_) => {
+        Ok(file) => {
+            drop(file);
             let _ = fs::remove_file(&probe);
             true
         }
