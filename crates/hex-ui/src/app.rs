@@ -709,6 +709,7 @@ impl HexrsApp {
         let team_state = TeamBadgeState {
             visible: has_team,
             slots: team_slots,
+            strip_width_dip: win32::compute_team_strip_width_dip(rect.width() as f32 / team_scale),
             client_height_dip: rect.height() as f32 / team_scale,
         };
         let card_state = CardBadgeState {

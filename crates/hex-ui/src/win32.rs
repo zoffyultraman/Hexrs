@@ -32,6 +32,14 @@ pub const PICK_CARD_PITCH_FRAC: f32 = PICK_CARD_WIDTH_FRAC + PICK_CARD_GAP_FRAC;
 pub const PICK_CARD_STRIP_Y_FRAC: f32 = 0.6660;
 pub const PICK_CARD_BADGE_HEIGHT_FRAC: f32 = 0.0360;
 
+/// Pixel-calibrated Champ Select allied team badge strip right-edge anchor relative to `LeagueClientUx.exe`.
+pub const TEAM_STRIP_RIGHT_FRAC: f32 = 0.2580;
+
+/// Computes the logical DIP width of `TeamBadgeStrip` from the client width in DIPs.
+pub fn compute_team_strip_width_dip(target_width_dip: f32) -> f32 {
+    (target_width_dip * 0.078).clamp(112.0, 134.0)
+}
+
 /// Corner anchor for the compact in-game HUD card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverlayCorner {
@@ -244,6 +252,7 @@ mod imp {
         BENCH_STRIP_LEFT_FRAC, DIAGNOSTICS_HEIGHT_DIP, DIAGNOSTICS_WIDTH_DIP,
         IN_GAME_HUD_HEIGHT_DIP, IN_GAME_HUD_WIDTH_DIP, PICK_CARD_BADGE_HEIGHT_FRAC,
         PICK_CARD_GAP_FRAC, PICK_CARD_STRIP_Y_FRAC, PICK_CARD_WIDTH_FRAC, SIDEBAR_WIDTH_DIP,
+        TEAM_STRIP_RIGHT_FRAC,
     };
 
     const MIN_TARGET_WINDOW_DIM: i32 = 200;
@@ -854,12 +863,14 @@ mod imp {
             let target_w = target.width().max(320);
             let target_h = target.height().max(200);
 
-            let x = (target.left + (0.2000 * target_w as f32).round() as i32)
+            let mut w = ((target_w as f32 * 0.078).round() as i32)
+                .clamp((112.0 * scale).round() as i32, (134.0 * scale).round() as i32);
+            let right_px = target.left + (TEAM_STRIP_RIGHT_FRAC * target_w as f32).round() as i32;
+            let min_left_px = target.left + (0.1650 * target_w as f32).round() as i32;
+            let x = (right_px - w)
+                .max(min_left_px)
                 .clamp(target.left, target.right.saturating_sub(1));
-            let max_w = (target.right - x).max(1);
-            let w = ((target_w as f32 * 0.058).round() as i32)
-                .clamp((94.0 * scale).round() as i32, (128.0 * scale).round() as i32)
-                .min(max_w);
+            w = w.min((target.right - x).max(1));
 
             let y = (target.top + (0.1261 * target_h as f32).round() as i32)
                 .clamp(target.top, target.bottom.saturating_sub(1));

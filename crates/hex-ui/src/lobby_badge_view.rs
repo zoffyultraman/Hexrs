@@ -11,7 +11,6 @@ use crate::win32::{
 };
 
 const TEAM_ROW_PITCH_FRAC: f32 = 0.1129;
-const TEAM_BADGE_HEIGHT_FRAC: f32 = 0.032;
 
 /// Single champion strength badge rendered onto a Champ Select strip overlay.
 #[derive(Debug, Clone, PartialEq)]
@@ -138,6 +137,7 @@ impl Render for BenchBadgeOverlay {
 pub struct TeamBadgeState {
     pub visible: bool,
     pub slots: Vec<TeamSlotBadgeEntry>,
+    pub strip_width_dip: f32,
     pub client_height_dip: f32,
 }
 
@@ -163,34 +163,48 @@ impl TeamBadgeOverlay {
     }
 }
 
-fn rating_colors(status: SummonerRatingStatus, tier_index: u8) -> (Rgba, Rgba, Rgba) {
-    match status {
-        SummonerRatingStatus::Ready => match tier_index {
-            0 => (rgba(0xC8AA6E38), rgba(0xF0C75EBF), rgb(0xFFD97D)),
-            1 => (rgba(0x0AC8B933), rgba(0x0AC8B9AA), rgb(0x4BE8DB)),
-            2 => (rgba(0x94A3B830), rgba(0xCBD5E188), rgb(0xE2E8F0)),
-            3 => (rgba(0xF59E0B2B), rgba(0xFBBF2488), rgb(0xFCD34D)),
-            _ => (rgba(0xE840572E), rgba(0xE8405799), rgb(0xFDA4AF)),
-        },
-        SummonerRatingStatus::Private => (rgba(0x33415555), rgba(0x64748B77), rgb(0x94A3B8)),
-        SummonerRatingStatus::InsufficientSamples => {
-            (rgba(0x33415544), rgba(0x64748B66), rgb(0xCBD5E1))
-        }
-        SummonerRatingStatus::Loading => (rgba(0x1E293B88), rgba(0x47556966), rgb(0x94A3B8)),
+/// Returns `(main_text_and_bar, badge_bg, border)` for the Hextech team strip tier accents.
+fn hextech_tier_colors(tier: HeroTier) -> (Rgba, Rgba, Rgba) {
+    match tier {
+        HeroTier::SPlus => (rgb(0xF0C46C), rgba(0xF0C46C29), rgba(0xF0C46C80)),
+        HeroTier::S => (rgb(0x2DD4BF), rgba(0x2DD4BF29), rgba(0x2DD4BF73)),
+        HeroTier::A | HeroTier::B => (rgb(0x4ADE80), rgba(0x4ADE8024), rgba(0x4ADE8066)),
+        HeroTier::C | HeroTier::D => (rgb(0x94A3B8), rgba(0x94A3B824), rgba(0x94A3B859)),
     }
 }
 
-fn premade_group_colors(group_id: u8, is_mvp: bool) -> (Rgba, Rgba, Rgba) {
-    let (bg, base_border, base_text) = match group_id {
-        1 => (rgba(0x0AC8B933), rgba(0x0AC8B9AA), rgb(0x4BE8DB)),
-        2 => (rgba(0x8B5CF638), rgba(0xA78BFA99), rgb(0xDDD6FE)),
-        _ => (rgba(0x14B8A633), rgba(0x2DD4BF99), rgb(0x99F6E4)),
-    };
-    if is_mvp {
-        (bg, rgba(0xF0C75EE6), rgb(0xFFD97D))
-    } else {
-        (bg, base_border, base_text)
+fn premade_ghost_colors(group_id: u8) -> (Rgba, Rgba, Rgba) {
+    match group_id {
+        1 => (rgba(0x14B8A62E), rgba(0x2DD4BF73), rgb(0x5EEAD4)),
+        2 => (rgba(0xA855F72E), rgba(0xC084FC73), rgb(0xD8B4FE)),
+        _ => (rgba(0x0EA5E92E), rgba(0x38BDF873), rgb(0x7DD3FC)),
     }
+}
+
+fn scrim_layer(width_dip: f32, bg: Rgba) -> Div {
+    div()
+        .absolute()
+        .top(px(0.0))
+        .right(px(2.0))
+        .w(px(width_dip))
+        .h_full()
+        .bg(bg)
+}
+
+fn ghost_pill(bg: Rgba, border: Rgba, text_color: Rgba, label: String) -> Div {
+    div()
+        .h(px(17.0))
+        .px(px(4.5))
+        .rounded(px(2.0))
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .flex()
+        .items_center()
+        .text_size(px(9.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(text_color)
+        .child(label)
 }
 
 impl Render for TeamBadgeOverlay {
@@ -208,12 +222,8 @@ impl Render for TeamBadgeOverlay {
 
         let h = self.state.client_height_dip;
         let row_pitch_h = TEAM_ROW_PITCH_FRAC * h;
-        let line1_h = (h * 0.028).clamp(17.0, 25.0);
-        let line1_font = (line1_h * 0.42).clamp(8.8, 11.0);
-        let line2_h = (h * 0.025).clamp(16.0, 22.0);
-        let line2_font = (line2_h * 0.43).clamp(8.5, 10.5);
-        let line3_h = (h * 0.021).clamp(14.0, 18.0);
-        let line3_font = (line3_h * 0.48).clamp(7.8, 9.5);
+        let row_h = (row_pitch_h - 2.0).max(20.0);
+        let sw = self.state.strip_width_dip.max(112.0);
 
         let mut canvas: Div = div().size_full().relative().bg(rgba(0x00000000));
 
@@ -222,187 +232,182 @@ impl Render for TeamBadgeOverlay {
                 continue;
             }
 
-            let mut row_col = div()
-                .absolute()
-                .left(px(0.0))
-                .top(px(idx as f32 * row_pitch_h))
-                .w_full()
-                .h(px(row_pitch_h))
+            let tier_accent = slot.hero.as_ref().map(|b| hextech_tier_colors(b.tier));
+            let tier_bar_color = tier_accent
+                .map(|(main_color, _, _)| main_color)
+                .unwrap_or_else(|| rgba(0x94A3B866));
+
+            let mut content_col = div()
+                .relative()
+                .size_full()
+                .pl(px(14.0))
+                .pr(px(10.0))
+                .py(px(4.0))
                 .flex()
                 .flex_col()
                 .justify_center()
-                .gap(px(2.0))
+                .items_end()
+                .gap(px(3.5))
                 .overflow_hidden();
 
             if let Some(badge) = slot.hero.as_ref() {
-                let (bg, border, text) = theme::tier_colors(badge.tier);
-                row_col = row_col.child(
-                    div().flex().flex_row().child(
-                        div()
-                            .h(px(line1_h))
-                            .px(px(5.0))
-                            .rounded_md()
-                            .bg(rgba(0x0B101BE8))
-                            .border_1()
-                            .border_color(theme::border_gold())
-                            .overflow_hidden()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(3.0))
-                            .text_size(px(line1_font))
-                            .child(
-                                div()
-                                    .px(px(3.0))
-                                    .rounded_sm()
-                                    .bg(bg)
-                                    .border_1()
-                                    .border_color(border)
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(text)
-                                    .child(badge.tier.label()),
-                            )
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme::cyan())
-                                    .child(format!("{:.1}%", badge.win_rate)),
-                            ),
-                    ),
+                let (tier_main, tier_bg, tier_border) = hextech_tier_colors(badge.tier);
+                content_col = content_col.child(
+                    div()
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded(px(3.0))
+                        .bg(rgba(0x0F172AA6))
+                        .border_1()
+                        .border_color(tier_border)
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(5.0))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .px(px(3.0))
+                                .rounded(px(2.0))
+                                .bg(tier_bg)
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(tier_main)
+                                .child(badge.tier.label()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(0xF1F5F9))
+                                .font_family("Consolas")
+                                .child(format!("{:.1}%", badge.win_rate)),
+                        ),
                 );
             }
 
             if let Some(sum) = slot.summoner.as_ref() {
-                let (r_bg, r_border, r_text) = rating_colors(sum.status, sum.tier_index);
-                let mut rating_pill = div()
-                    .h(px(line2_h))
+                let mut line2 = div()
                     .px(px(5.0))
-                    .rounded_md()
-                    .bg(rgba(0x0B101BE8))
-                    .border_1()
-                    .border_color(r_border)
-                    .overflow_hidden()
+                    .py(px(1.0))
+                    .rounded(px(2.0))
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(3.0))
-                    .text_size(px(line2_font));
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .overflow_hidden();
 
-                match sum.status {
+                line2 = match sum.status {
                     SummonerRatingStatus::Ready => {
+                        let (bg, score_color, title_color) = if sum.tier_index <= 2 {
+                            (rgba(0x0F172A73), rgb(0xF0C46C), rgb(0xE2E8F0))
+                        } else if sum.tier_index == 3 {
+                            (rgba(0x0F172A73), rgb(0xCBD5E1), rgb(0x94A3B8))
+                        } else {
+                            (rgba(0xEF444424), rgb(0xFDA4AF), rgb(0xF87171))
+                        };
                         let compact_title: String = sum.title.chars().take(4).collect();
-                        rating_pill = rating_pill
-                            .child(
-                                div()
-                                    .px(px(3.0))
-                                    .rounded_sm()
-                                    .bg(r_bg)
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(r_text)
-                                    .child(sum.score.to_string()),
-                            )
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(r_text)
-                                    .child(compact_title),
-                            );
+                        line2
+                            .bg(bg)
+                            .child(div().text_color(score_color).child(sum.score.to_string()))
+                            .child(div().text_color(rgb(0x64748B)).child("·"))
+                            .child(div().text_color(title_color).child(compact_title))
                     }
-                    SummonerRatingStatus::Private => {
-                        let label = if sum.title.trim().is_empty() {
-                            "隐藏".to_owned()
-                        } else {
-                            sum.title.chars().take(4).collect()
-                        };
-                        rating_pill = rating_pill.child(div().text_color(r_text).child(label));
-                    }
-                    SummonerRatingStatus::InsufficientSamples => {
-                        let label = if sum.title.trim().is_empty() {
-                            "样本少".to_owned()
-                        } else {
-                            sum.title.chars().take(4).collect()
-                        };
-                        rating_pill = rating_pill.child(div().text_color(r_text).child(label));
-                    }
-                    SummonerRatingStatus::Loading => {
-                        rating_pill = rating_pill.child(div().text_color(r_text).child("战绩…"));
-                    }
-                }
+                    SummonerRatingStatus::Private => line2
+                        .bg(rgba(0x0F172A73))
+                        .child(div().text_color(rgb(0x94A3B8)).child("隐藏")),
+                    SummonerRatingStatus::InsufficientSamples => line2
+                        .bg(rgba(0x0F172A73))
+                        .child(div().text_color(rgb(0x94A3B8)).child("样本少")),
+                    SummonerRatingStatus::Loading => line2
+                        .bg(rgba(0x0F172A73))
+                        .child(div().text_color(rgb(0x94A3B8)).child("战绩…")),
+                };
 
-                row_col = row_col.child(div().flex().flex_row().child(rating_pill));
+                content_col = content_col.child(line2);
 
                 let has_streak = sum.streak >= 3 || sum.streak <= -3;
                 if sum.premade_group_id.is_some() || has_streak {
+                    let has_all_three =
+                        sum.premade_group_id.is_some() && sum.is_premade_last_mvp && has_streak;
                     let mut tags = div()
-                        .h(px(line3_h))
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(3.0))
-                        .text_size(px(line3_font))
+                        .justify_end()
+                        .gap(px(4.0))
                         .overflow_hidden();
 
                     if let Some(gid) = sum.premade_group_id {
-                        let (p_bg, p_border, p_text) =
-                            premade_group_colors(gid, sum.is_premade_last_mvp);
-                        let label = if sum.is_premade_last_mvp {
-                            format!("黑{gid}·MVP")
+                        let (p_bg, p_border, p_text) = premade_ghost_colors(gid);
+                        let label = if has_all_three {
+                            format!("● {gid}")
                         } else {
-                            format!("黑{gid}")
+                            format!("● 黑{gid}")
                         };
-                        tags = tags.child(
-                            div()
-                                .h(px(line3_h))
-                                .px(px(4.0))
-                                .rounded_sm()
-                                .bg(p_bg)
-                                .border_1()
-                                .border_color(p_border)
-                                .flex()
-                                .items_center()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(p_text)
-                                .child(label),
-                        );
+                        tags = tags.child(ghost_pill(p_bg, p_border, p_text, label));
+                    }
+
+                    if sum.is_premade_last_mvp {
+                        tags = tags.child(ghost_pill(
+                            rgba(0xEAB3082E),
+                            rgba(0xFACC1580),
+                            rgb(0xFDE047),
+                            "★ MVP".to_owned(),
+                        ));
                     }
 
                     if sum.streak >= 3 {
-                        tags = tags.child(
-                            div()
-                                .h(px(line3_h))
-                                .px(px(4.0))
-                                .rounded_sm()
-                                .bg(rgba(0x10B98133))
-                                .border_1()
-                                .border_color(rgba(0x34D399AA))
-                                .flex()
-                                .items_center()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(0x6EE7B7))
-                                .child(format!("{}连胜", sum.streak)),
-                        );
+                        tags = tags.child(ghost_pill(
+                            rgba(0x22C55E2E),
+                            rgba(0x4ADE8073),
+                            rgb(0x86EFAC),
+                            format!("{}连胜", sum.streak),
+                        ));
                     } else if sum.streak <= -3 {
-                        tags = tags.child(
-                            div()
-                                .h(px(line3_h))
-                                .px(px(4.0))
-                                .rounded_sm()
-                                .bg(rgba(0xE840572E))
-                                .border_1()
-                                .border_color(rgba(0xE8405788))
-                                .flex()
-                                .items_center()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(0xFDA4AF))
-                                .child(format!("{}连败", sum.streak.unsigned_abs())),
-                        );
+                        tags = tags.child(ghost_pill(
+                            rgba(0xEF44442E),
+                            rgba(0xF8717180),
+                            rgb(0xFCA5A5),
+                            format!("{}连败", sum.streak.unsigned_abs()),
+                        ));
                     }
 
-                    row_col = row_col.child(tags);
+                    content_col = content_col.child(tags);
                 }
             }
 
-            canvas = canvas.child(row_col);
+            let row_inner = div()
+                .relative()
+                .size_full()
+                .child(scrim_layer(sw * 0.96, rgba(0x09142818)))
+                .child(scrim_layer(sw * 0.82, rgba(0x09142826)))
+                .child(scrim_layer(sw * 0.68, rgba(0x09142838)))
+                .child(scrim_layer(sw * 0.52, rgba(0x0914284D)))
+                .child(scrim_layer(sw * 0.36, rgba(0x091428B8)))
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(0.0))
+                        .right(px(0.0))
+                        .w(px(2.0))
+                        .h_full()
+                        .bg(tier_bar_color),
+                )
+                .child(content_col);
+
+            canvas = canvas.child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(idx as f32 * row_pitch_h + 1.0))
+                    .w_full()
+                    .h(px(row_h))
+                    .overflow_hidden()
+                    .child(row_inner),
+            );
         }
 
         canvas
