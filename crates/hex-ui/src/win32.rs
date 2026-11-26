@@ -20,9 +20,9 @@ const STRIP_TOTAL_RATIO: f32 = 2.86;
 const AUGMENT_BAR_HEIGHT_DIP: f32 = 94.0;
 
 /// Pixel-calibrated Champ Select bench strip geometry relative to `LeagueClientUx.exe`.
-pub const BENCH_SLOT0_CX: f32 = 0.2898;
-pub const BENCH_SLOT_PITCH_FRAC: f32 = 0.0458;
-pub const BENCH_SLOT_WIDTH_FRAC: f32 = 0.0410;
+pub const BENCH_SLOT0_CX: f32 = 0.2912;
+pub const BENCH_SLOT_PITCH_FRAC: f32 = 0.0460;
+pub const BENCH_SLOT_WIDTH_FRAC: f32 = 0.0400;
 pub const BENCH_SLOT_HEIGHT_FRAC: f32 = 0.0285;
 pub const BENCH_STRIP_LEFT_FRAC: f32 = BENCH_SLOT0_CX - BENCH_SLOT_WIDTH_FRAC * 0.5;
 
@@ -742,7 +742,8 @@ mod imp {
             let max_w = (target.right - x).max(1);
             let raw_w = (((count - 1) as f32 * BENCH_SLOT_PITCH_FRAC + BENCH_SLOT_WIDTH_FRAC)
                 * target_w as f32)
-                .round() as i32;
+                .round() as i32
+                + (8.0 * scale).round() as i32;
             let w = raw_w.max((40.0 * scale).round() as i32).min(max_w);
 
             let y = (target.top + (0.0835 * target_h as f32).round() as i32)

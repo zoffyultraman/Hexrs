@@ -63,7 +63,7 @@ impl Render for BenchBadgeOverlay {
         let raw_slot_w = w * BENCH_SLOT_WIDTH_FRAC;
         let slot_w = raw_slot_w.clamp(40.0, 140.0);
         let slot_h = (h * BENCH_SLOT_HEIGHT_FRAC).clamp(18.0, 40.0);
-        let bench_font_px = (slot_w * 0.18).clamp(9.0, 14.0);
+        let bench_font_px = (slot_w * 0.140).clamp(8.5, 11.2);
 
         let mut canvas: Div = div().size_full().relative().bg(rgba(0x00000000));
 
@@ -81,6 +81,7 @@ impl Render for BenchBadgeOverlay {
                     .top(px(0.0))
                     .w(px(slot_w))
                     .h(px(slot_h))
+                    .overflow_hidden()
                     .rounded_md()
                     .bg(rgba(0x0B101BE8))
                     .border_1()
