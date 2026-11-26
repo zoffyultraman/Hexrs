@@ -150,8 +150,8 @@ impl Render for TeamBadgeOverlay {
         }
 
         let h = self.state.client_height_dip;
-        let badge_h = (h * TEAM_BADGE_HEIGHT_FRAC).clamp(20.0, 44.0);
-        let team_font_px = (badge_h * 0.46).clamp(10.5, 16.0);
+        let badge_h = (h * TEAM_BADGE_HEIGHT_FRAC).clamp(20.0, 38.0);
+        let team_font_px = (badge_h * 0.40).clamp(10.0, 14.0);
 
         let mut canvas: Div = div().size_full().relative().bg(rgba(0x00000000));
 
