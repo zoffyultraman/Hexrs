@@ -4,6 +4,9 @@ on:
   push:
     tags:
       - "v*"
+      - "alpha_*"
+      - "beta_*"
+      - "rc_*"
   workflow_dispatch:
 
 permissions:
@@ -63,18 +66,80 @@ jobs:
       - name: Cache Cargo dependencies and artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Build Hexrs release binary
+      - name: Build Hexrs release binary (x86_64)
         run: cargo build --release --target x86_64-pc-windows-msvc --bin Hexrs
 
-      - name: Report Hexrs.exe size
+      - name: Package portable Hexrs zip (x86_64)
         shell: pwsh
         run: |
-          $exe = Get-Item "target/x86_64-pc-windows-msvc/release/Hexrs.exe"
-          $mb = [math]::Round($exe.Length / 1MB, 2)
-          Write-Host "Hexrs.exe size: $($exe.Length) bytes ($mb MB)"
+          $ErrorActionPreference = "Stop"
+          $tag = $env:GITHUB_REF_NAME
+          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "manual" }
+
+          $stageRoot = "release_stage/Hexrs"
+          $dataDir = "$stageRoot/data"
+          if (Test-Path "release_stage") { Remove-Item -Recurse -Force "release_stage" }
+          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+
+          # Core executable and project GPL-3.0 license in root Hexrs/ folder
+          Copy-Item "target/x86_64-pc-windows-msvc/release/Hexrs.exe" "$stageRoot/Hexrs.exe" -Force
+          Copy-Item "LICENSE" "$stageRoot/LICENSE" -Force
+
+          # Data directory: prebuilt meta.db, version.txt, V2 rating_titles.json, and CC BY-NC 4.0 license
+          Copy-Item "crates/hex-data/assets/meta.db" "$dataDir/meta.db" -Force
+          Copy-Item "licenses/CC-BY-NC-4.0-LICENSE" "$dataDir/LICENSE" -Force
+
+          python -c "import json, pathlib; m = json.loads(pathlib.Path('crates/hex-data/assets/manifest.json').read_text(encoding='utf-8')); pathlib.Path('release_stage/Hexrs/data/version.txt').write_text(m.get('version', 'aramhex6'), encoding='utf-8'); t = {'tiers': [{'min_score': 82, 'label': '\u592f'}, {'min_score': 70, 'label': '\u9876\u7ea7'}, {'min_score': 58, 'label': '\u4eba\u4e0a\u4eba'}, {'min_score': 45, 'label': 'NPC'}, {'min_score': 0, 'label': '\u62c9\u5b8c\u4e86'}], 'insufficient_samples': '\u6837\u672c\u5c11', 'private_profile': '\u9690\u85cf'}; pathlib.Path('release_stage/Hexrs/data/rating_titles.json').write_text(json.dumps(t, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $zipPath = "dist/Hexrs-$tag-windows-x86_64.zip"
+          if (Test-Path $zipPath) { Remove-Item -Force $zipPath }
+          Compress-Archive -Path $stageRoot -DestinationPath $zipPath -Force
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $zipPath))
+          try {
+            Write-Host "Archive contents ($zipPath):"
+            foreach ($entry in $zip.Entries) {
+              Write-Host "  $($entry.FullName) ($($entry.Length) bytes)"
+            }
+          } finally {
+            $zip.Dispose()
+          }
+
+          $item = Get-Item $zipPath
+          $mb = [math]::Round($item.Length / 1MB, 2)
+          Write-Host "Release archive size: $($item.Length) bytes ($mb MB)"
+          Add-Content -Path $env:GITHUB_ENV -Value "RELEASE_ZIP_PATH=$zipPath"
 
       - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: target/x86_64-pc-windows-msvc/release/Hexrs.exe
+          name: "Hexrs ${{ github.ref_name }} (Windows x86_64)"
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          files: ${{ env.RELEASE_ZIP_PATH }}
           generate_release_notes: true
+          body: |
+            ## Hexrs `${{ github.ref_name }}`（测试版 / Windows x86_64）
+
+            > ⚠️ **架构说明**：当前仅支持 **Windows x86_64 (64位)** 架构，暂不支持 ARM64 或 32 位系统。
+
+            ### 使用方式
+            1. 下载下方压缩包 `Hexrs-${{ github.ref_name }}-windows-x86_64.zip` 并解压，内含完整根目录 `Hexrs/`：
+               ```text
+               Hexrs/
+               ├── Hexrs.exe          # 主程序
+               ├── LICENSE            # 本项目源代码开源协议 (GNU GPL-3.0)
+               └── data/
+                   ├── LICENSE        # 第三方数据开源协议 (CC BY-NC 4.0)
+                   ├── meta.db        # 海克斯大乱斗英雄/符文/六神装数据库
+                   ├── version.txt    # 数据库版本标记
+                   └── rating_titles.json  # 自定义召唤师称号梯度配置（支持热加载）
+               ```
+            2. 双击 `Hexrs/Hexrs.exe` 运行；若国服/WeGame 以管理员权限运行导致无法读取 LCU，请在托盘右键选择“以管理员身份运行”。
+            3. 局内游戏画面请设置为**无边框窗口化**，以确保海克斯选卡评分条正常置顶且不影响点击。
+
+            ### 开源协议与数据归属
+            - **程序源代码**：遵循根目录 `Hexrs/LICENSE`（[GNU GPL-3.0](https://www.gnu.org/licenses/gpl-3.0.html)）。
+            - **海克斯大乱斗统计数据**：来源于 [czgreat/aramhex-data](https://github.com/czgreat/aramhex-data)，独立遵循 `Hexrs/data/LICENSE`（[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/deed.zh-hans)，仅限非商业用途）。
