@@ -25,6 +25,13 @@ pub const BENCH_SLOT_WIDTH_FRAC: f32 = 0.0400;
 pub const BENCH_SLOT_HEIGHT_FRAC: f32 = 0.0285;
 pub const BENCH_STRIP_LEFT_FRAC: f32 = BENCH_SLOT0_CX - BENCH_SLOT_WIDTH_FRAC * 0.5;
 
+/// Pixel-calibrated Champ Select center champion pick card strip geometry relative to `LeagueClientUx.exe`.
+pub const PICK_CARD_WIDTH_FRAC: f32 = 0.1401;
+pub const PICK_CARD_GAP_FRAC: f32 = 0.0283;
+pub const PICK_CARD_PITCH_FRAC: f32 = PICK_CARD_WIDTH_FRAC + PICK_CARD_GAP_FRAC;
+pub const PICK_CARD_STRIP_Y_FRAC: f32 = 0.6660;
+pub const PICK_CARD_BADGE_HEIGHT_FRAC: f32 = 0.0360;
+
 /// Corner anchor for the compact in-game HUD card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverlayCorner {
@@ -45,6 +52,10 @@ pub enum Win32WindowAction {
     },
     TeamBadgeStrip {
         target_rect: Option<WindowRectInfo>,
+    },
+    CardBadgeStrip {
+        target_rect: Option<WindowRectInfo>,
+        card_count: usize,
     },
     InGameOverlay {
         target_rect: Option<WindowRectInfo>,
@@ -208,6 +219,10 @@ mod imp {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use windows::core::{w, BOOL, PCWSTR};
     use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT};
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_COLOR_NONE,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWM_WINDOW_CORNER_PREFERENCE,
+    };
     use windows::Win32::Graphics::Gdi::InvalidateRect;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Shell::ShellExecuteW;
@@ -227,7 +242,8 @@ mod imp {
         compute_augment_bar_geometry, AugmentOfferLayout, OverlayCorner, Win32WindowAction,
         Win32WindowCommand, WindowRectInfo, BENCH_SLOT_PITCH_FRAC, BENCH_SLOT_WIDTH_FRAC,
         BENCH_STRIP_LEFT_FRAC, DIAGNOSTICS_HEIGHT_DIP, DIAGNOSTICS_WIDTH_DIP,
-        IN_GAME_HUD_HEIGHT_DIP, IN_GAME_HUD_WIDTH_DIP, SIDEBAR_WIDTH_DIP,
+        IN_GAME_HUD_HEIGHT_DIP, IN_GAME_HUD_WIDTH_DIP, PICK_CARD_BADGE_HEIGHT_FRAC,
+        PICK_CARD_GAP_FRAC, PICK_CARD_STRIP_Y_FRAC, PICK_CARD_WIDTH_FRAC, SIDEBAR_WIDTH_DIP,
     };
 
     const MIN_TARGET_WINDOW_DIM: i32 = 200;
@@ -577,6 +593,22 @@ mod imp {
         if !uses_dcomp {
             let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
         }
+
+        // Disable Windows 11 automatic rounded corners and 1px accent/border frame on overlays.
+        let corner_pref: DWM_WINDOW_CORNER_PREFERENCE = DWMWCP_DONOTROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            (&raw const corner_pref).cast(),
+            core::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+        let border_color: u32 = DWMWA_COLOR_NONE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&raw const border_color).cast(),
+            core::mem::size_of::<u32>() as u32,
+        );
     }
 
     /// Applies topmost, click-through, and tool-window extended styles (DirectComposition-safe).
@@ -622,6 +654,10 @@ mod imp {
             Win32WindowAction::TeamBadgeStrip { target_rect } => {
                 set_team_badge_strip_hwnd(hwnd, *target_rect)
             }
+            Win32WindowAction::CardBadgeStrip {
+                target_rect,
+                card_count,
+            } => set_card_badge_strip_hwnd(hwnd, *target_rect, *card_count),
             Win32WindowAction::InGameOverlay {
                 target_rect,
                 corner,
@@ -818,11 +854,11 @@ mod imp {
             let target_w = target.width().max(320);
             let target_h = target.height().max(200);
 
-            let x = (target.left + (0.2980 * target_w as f32).round() as i32)
+            let x = (target.left + (0.2000 * target_w as f32).round() as i32)
                 .clamp(target.left, target.right.saturating_sub(1));
             let max_w = (target.right - x).max(1);
-            let w = ((target_w as f32 * 0.068).round() as i32)
-                .clamp((104.0 * scale).round() as i32, (156.0 * scale).round() as i32)
+            let w = ((target_w as f32 * 0.056).round() as i32)
+                .clamp((88.0 * scale).round() as i32, (124.0 * scale).round() as i32)
                 .min(max_w);
 
             let y = (target.top + (0.1261 * target_h as f32).round() as i32)
@@ -842,6 +878,65 @@ mod imp {
                 SWP_NOACTIVATE | SWP_FRAMECHANGED,
             )
             .context("SetWindowPos(team badge strip) failed")?;
+
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+
+        Ok(())
+    }
+
+    /// Anchors the narrow horizontal pick-card badge strip strictly below the 2 or 3 center cards.
+    fn set_card_badge_strip_hwnd(
+        hwnd: HWND,
+        target_rect: Option<WindowRectInfo>,
+        card_count: usize,
+    ) -> Result<()> {
+        // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
+        unsafe {
+            apply_transparent_ex_style(hwnd, false);
+
+            let Some(target) = target_rect.filter(|_| (2..=3).contains(&card_count)) else {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return Ok(());
+            };
+
+            let own_dpi = GetDpiForWindow(hwnd);
+            let dpi = if own_dpi > 0 { own_dpi } else { target.dpi.max(96) };
+            let scale = dpi as f32 / 96.0;
+
+            let target_w = target.width().max(320);
+            let target_h = target.height().max(200);
+            let count = card_count.clamp(2, 3);
+
+            let strip_w_frac =
+                count as f32 * PICK_CARD_WIDTH_FRAC + (count - 1) as f32 * PICK_CARD_GAP_FRAC;
+            let strip_left_frac = (0.4985 - strip_w_frac * 0.5).max(0.0);
+
+            let x = (target.left + (strip_left_frac * target_w as f32).round() as i32)
+                .clamp(target.left, target.right.saturating_sub(1));
+            let max_w = (target.right - x).max(1);
+            let w = ((strip_w_frac * target_w as f32).round() as i32 + (4.0 * scale).round() as i32)
+                .max((120.0 * scale).round() as i32)
+                .min(max_w);
+
+            let y = (target.top + (PICK_CARD_STRIP_Y_FRAC * target_h as f32).round() as i32)
+                .clamp(target.top, target.bottom.saturating_sub(1));
+            let max_h = (target.bottom - y).max(1);
+            let h = ((PICK_CARD_BADGE_HEIGHT_FRAC * target_h as f32).round() as i32)
+                .clamp((22.0 * scale).round() as i32, (44.0 * scale).round() as i32)
+                .min(max_h);
+
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            .context("SetWindowPos(card badge strip) failed")?;
 
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             let _ = InvalidateRect(Some(hwnd), None, false);

@@ -23,7 +23,8 @@ use tracing_subscriber::EnvFilter;
 
 use crate::app::HexrsApp;
 use crate::lobby_badge_view::{
-    BenchBadgeOverlay, BenchBadgeState, TeamBadgeOverlay, TeamBadgeState,
+    BenchBadgeOverlay, BenchBadgeState, CardBadgeOverlay, CardBadgeState, TeamBadgeOverlay,
+    TeamBadgeState,
 };
 use crate::tray::TrayController;
 
@@ -150,9 +151,32 @@ fn main() {
             }
         };
 
+        let mut card_hwnd_raw: isize = 0;
+        let card_options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: None,
+            kind: WindowKind::PopUp,
+            window_background: WindowBackgroundAppearance::Transparent,
+            focus: false,
+            show: true,
+            ..Default::default()
+        };
+        let card_window_handle = match cx.open_window(card_options, |window, cx| {
+            if let Ok(raw) = win32::window_hwnd_raw(window) {
+                card_hwnd_raw = raw;
+            }
+            cx.new(|_| CardBadgeOverlay::new())
+        }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                warn!(error = %err, "failed to open Hexrs card badge strip window");
+                None
+            }
+        };
+
         cx.spawn(async move |cx: &mut AsyncApp| loop {
             cx.background_executor().timer(EVENT_POLL_INTERVAL).await;
-            let (main_cmd, bench_state, bench_cmd, team_state, team_cmd) =
+            let (main_cmd, bench_state, bench_cmd, team_state, team_cmd, card_state, card_cmd) =
                 match window_handle.update(cx, |app, window, cx| {
                     let main_cmd = app.tick(window, cx);
                     let active_bench_hwnd = if bench_window_handle.is_some() {
@@ -165,18 +189,37 @@ fn main() {
                     } else {
                         0
                     };
-                    if active_bench_hwnd == 0 && active_team_hwnd == 0 {
+                    let active_card_hwnd = if card_window_handle.is_some() {
+                        card_hwnd_raw
+                    } else {
+                        0
+                    };
+                    if active_bench_hwnd == 0 && active_team_hwnd == 0 && active_card_hwnd == 0 {
                         (
                             main_cmd,
                             BenchBadgeState::default(),
                             None,
                             TeamBadgeState::default(),
                             None,
+                            CardBadgeState::default(),
+                            None,
                         )
                     } else {
-                        let (bench_state, bench_cmd, team_state, team_cmd) =
-                            app.build_lobby_badge_sync(active_bench_hwnd, active_team_hwnd);
-                        (main_cmd, bench_state, bench_cmd, team_state, team_cmd)
+                        let (bench_state, bench_cmd, team_state, team_cmd, card_state, card_cmd) =
+                            app.build_lobby_badge_sync(
+                                active_bench_hwnd,
+                                active_team_hwnd,
+                                active_card_hwnd,
+                            );
+                        (
+                            main_cmd,
+                            bench_state,
+                            bench_cmd,
+                            team_state,
+                            team_cmd,
+                            card_state,
+                            card_cmd,
+                        )
                     }
                 }) {
                     Ok(tuple) => tuple,
@@ -192,6 +235,12 @@ fn main() {
             if let Some(ref team_handle) = team_window_handle {
                 let _ = team_handle.update(cx, |overlay, _window, cx| {
                     overlay.update_state(team_state, cx);
+                });
+            }
+
+            if let Some(ref card_handle) = card_window_handle {
+                let _ = card_handle.update(cx, |overlay, _window, cx| {
+                    overlay.update_state(card_state, cx);
                 });
             }
 
@@ -228,6 +277,18 @@ fn main() {
                 }
                 if let Some(ref team_handle) = team_window_handle {
                     let _ = team_handle.update(cx, |_overlay, window, cx| {
+                        window.refresh();
+                        cx.notify();
+                    });
+                }
+            }
+
+            if let Some(cmd) = card_cmd {
+                if let Err(err) = win32::apply_window_command(&cmd) {
+                    warn!(error = %err, ?cmd.action, "failed to apply deferred card badge strip command");
+                }
+                if let Some(ref card_handle) = card_window_handle {
+                    let _ = card_handle.update(cx, |_overlay, window, cx| {
                         window.refresh();
                         cx.notify();
                     });

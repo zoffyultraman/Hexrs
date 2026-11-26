@@ -18,7 +18,9 @@ use hex_data::{
 use hex_vision::{SharedRoiManifest, VisionController, VisionGameContext};
 use tracing::{debug, info, warn};
 
-use crate::lobby_badge_view::{BenchBadgeState, SlotBadgeData, TeamBadgeState};
+use crate::lobby_badge_view::{
+    BenchBadgeState, CardBadgeState, CardSlotBadgeData, SlotBadgeData, TeamBadgeState,
+};
 use crate::lobby_view;
 use crate::log_file_path;
 use crate::overlay_view;
@@ -79,6 +81,7 @@ pub struct HexrsApp {
     last_lobby_sync: Option<(Option<WindowRectInfo>, bool)>,
     last_bench_badge_sync: Option<(Option<WindowRectInfo>, usize)>,
     last_team_badge_sync: Option<Option<WindowRectInfo>>,
+    last_card_badge_sync: Option<(Option<WindowRectInfo>, usize)>,
     last_overlay_sync: Option<(
         Option<WindowRectInfo>,
         OverlayCorner,
@@ -191,6 +194,7 @@ impl HexrsApp {
             last_lobby_sync: None,
             last_bench_badge_sync: None,
             last_team_badge_sync: None,
+            last_card_badge_sync: None,
             last_overlay_sync: None,
             last_diagnostics_sync: false,
             last_dormant_hidden: false,
@@ -484,20 +488,24 @@ impl HexrsApp {
         self.last_lobby_sync = None;
         self.last_bench_badge_sync = None;
         self.last_team_badge_sync = None;
+        self.last_card_badge_sync = None;
         self.last_overlay_sync = None;
         self.last_diagnostics_sync = false;
         self.last_dormant_hidden = false;
     }
 
-    /// Computes non-blocking bench and team strip badge states + deferred Win32 window commands.
+    /// Computes non-blocking bench, team, and pick-card strip badge states + deferred Win32 window commands.
     pub fn build_lobby_badge_sync(
         &mut self,
         bench_hwnd_raw: isize,
         team_hwnd_raw: isize,
+        card_hwnd_raw: isize,
     ) -> (
         BenchBadgeState,
         Option<Win32WindowCommand>,
         TeamBadgeState,
+        Option<Win32WindowCommand>,
+        CardBadgeState,
         Option<Win32WindowCommand>,
     ) {
         let in_diagnostics = self.diagnostics_open && self.preview_mode.is_none();
@@ -537,15 +545,29 @@ impl HexrsApp {
             } else {
                 None
             };
+            let card_cmd = if card_hwnd_raw != 0 && self.last_card_badge_sync != Some((None, 0)) {
+                self.last_card_badge_sync = Some((None, 0));
+                Some(Win32WindowCommand {
+                    hwnd_raw: card_hwnd_raw,
+                    action: Win32WindowAction::CardBadgeStrip {
+                        target_rect: None,
+                        card_count: 0,
+                    },
+                })
+            } else {
+                None
+            };
             return (
                 BenchBadgeState::default(),
                 bench_cmd,
                 TeamBadgeState::default(),
                 team_cmd,
+                CardBadgeState::default(),
+                card_cmd,
             );
         };
 
-        let (bench_slots, team_slots) = if let Some(cs) = self.champ_select.as_ref() {
+        let (bench_slots, team_slots, card_slots) = if let Some(cs) = self.champ_select.as_ref() {
             let bench = cs
                 .bench_champions
                 .iter()
@@ -565,21 +587,34 @@ impl HexrsApp {
                     self.lookup_slot_badge(id)
                 })
                 .collect();
-            (bench, team)
+            let cards = if cs.local_champion_id == 0 && (2..=3).contains(&cs.subset_champions.len())
+            {
+                cs.subset_champions
+                    .iter()
+                    .take(3)
+                    .map(|&id| self.lookup_card_slot_badge(id))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (bench, team, cards)
         } else if is_preview {
             const PREVIEW_BENCH_IDS: &[i32] =
                 &[25, 142, 59, 78, 517, 154, 106, 157, 777, 145, 67, 875, 32, 54];
             const PREVIEW_TEAM_IDS: &[i32] =
                 &[498, 23, 36, 526, 42, 157, 145, 875, 54, 32];
+            const PREVIEW_CARD_IDS: &[i32] = &[157, 432, 145, 54];
             let bench = self.collect_preview_badges(PREVIEW_BENCH_IDS, 7);
             let team = self.collect_preview_badges(PREVIEW_TEAM_IDS, 5);
-            (bench, team)
+            let cards = self.collect_preview_card_badges(PREVIEW_CARD_IDS, 2);
+            (bench, team, cards)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
 
         let has_bench = bench_slots.iter().any(Option::is_some);
         let has_team = team_slots.iter().any(Option::is_some);
+        let has_cards = (2..=3).contains(&card_slots.len()) && card_slots.iter().any(Option::is_some);
 
         let bench_target = has_bench.then_some(rect);
         let bench_slot_count = if has_bench { bench_slots.len().min(10) } else { 0 };
@@ -611,8 +646,26 @@ impl HexrsApp {
             None
         };
 
+        let card_target = has_cards.then_some(rect);
+        let card_count = if has_cards { card_slots.len().min(3) } else { 0 };
+        let card_cmd = if card_hwnd_raw != 0
+            && self.last_card_badge_sync != Some((card_target, card_count))
+        {
+            self.last_card_badge_sync = Some((card_target, card_count));
+            Some(Win32WindowCommand {
+                hwnd_raw: card_hwnd_raw,
+                action: Win32WindowAction::CardBadgeStrip {
+                    target_rect: card_target,
+                    card_count,
+                },
+            })
+        } else {
+            None
+        };
+
         let bench_scale = win32::window_scale_for_hwnd(bench_hwnd_raw, rect.scale()).max(0.5);
         let team_scale = win32::window_scale_for_hwnd(team_hwnd_raw, rect.scale()).max(0.5);
+        let card_scale = win32::window_scale_for_hwnd(card_hwnd_raw, rect.scale()).max(0.5);
 
         let bench_state = BenchBadgeState {
             visible: has_bench,
@@ -625,8 +678,46 @@ impl HexrsApp {
             slots: team_slots,
             client_height_dip: rect.height() as f32 / team_scale,
         };
+        let card_state = CardBadgeState {
+            visible: has_cards,
+            cards: card_slots,
+            client_width_dip: rect.width() as f32 / card_scale,
+            client_height_dip: rect.height() as f32 / card_scale,
+        };
 
-        (bench_state, bench_cmd, team_state, team_cmd)
+        (
+            bench_state,
+            bench_cmd,
+            team_state,
+            team_cmd,
+            card_state,
+            card_cmd,
+        )
+    }
+
+    fn lookup_card_slot_badge(&self, hero_id: i32) -> Option<CardSlotBadgeData> {
+        if hero_id <= 0 {
+            return None;
+        }
+        let stats = self.meta.as_ref()?.get_hero_stats(hero_id)?;
+        Some(CardSlotBadgeData {
+            tier: stats.tier,
+            win_rate: stats.win_rate,
+            name_zh: stats.name_zh,
+        })
+    }
+
+    fn collect_preview_card_badges(
+        &self,
+        candidates: &[i32],
+        max_cards: usize,
+    ) -> Vec<Option<CardSlotBadgeData>> {
+        candidates
+            .iter()
+            .filter_map(|&id| self.lookup_card_slot_badge(id))
+            .take(max_cards)
+            .map(Some)
+            .collect()
     }
 
     fn lookup_slot_badge(&self, hero_id: i32) -> Option<SlotBadgeData> {
