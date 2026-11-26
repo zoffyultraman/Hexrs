@@ -32,6 +32,10 @@ use crate::models::{ChampSelectState, EndOfGameParticipant, EndOfGameStats, Team
 
 const WAMP_EVENT_OPCODE: i64 = 8;
 const EVENT_CHAMP_SELECT: &str = "OnJsonApiEvent_lol-champ-select_v1_session";
+const EVENT_SUBSET_CHAMPIONS_TEAM_BUILDER: &str =
+    "OnJsonApiEvent_lol-lobby-team-builder_champ-select_v1_subset-champion-list";
+const EVENT_SUBSET_CHAMPIONS_LEGACY: &str =
+    "OnJsonApiEvent_lol-champ-select_v1_subset-champion-list";
 const EVENT_EOG_STATS: &str = "OnJsonApiEvent_lol-end-of-game_v1_eog-stats-block";
 const EVENT_GAMEFLOW_PHASE: &str = "OnJsonApiEvent_lol-gameflow_v1_gameflow-phase";
 
@@ -43,6 +47,7 @@ pub enum LcuWsEvent {
     WsError(String),
     GameflowPhase(String),
     ChampSelectUpdated(ChampSelectState),
+    SubsetChampionsUpdated(Vec<i32>),
     ChampSelectEnded,
     EndOfGameCaptured(EndOfGameStats),
 }
@@ -120,6 +125,28 @@ impl LcuClient {
             .get_json::<RawChampSelectSession>("/lol-champ-select/v1/session")
             .await?;
         Ok(raw.map(into_champ_select_state))
+    }
+
+    /// Queries ARAM Champion Cards (`subset-champion-list`), trying team-builder first then legacy champ-select.
+    pub async fn get_subset_champion_list(&self) -> Result<Vec<i32>> {
+        if let Ok(Some(val)) = self
+            .get_json::<serde_json::Value>(
+                "/lol-lobby-team-builder/champ-select/v1/subset-champion-list",
+            )
+            .await
+        {
+            let ids = parse_subset_champion_ids(&val);
+            if !ids.is_empty() {
+                return Ok(ids);
+            }
+        }
+
+        let fallback = self
+            .get_json::<serde_json::Value>("/lol-champ-select/v1/subset-champion-list")
+            .await?;
+        Ok(fallback
+            .map(|val| parse_subset_champion_ids(&val))
+            .unwrap_or_default())
     }
 
     /// Queries `/lol-gameflow/v1/gameflow-phase` (e.g. `"None"`, `"Lobby"`, `"ChampSelect"`, `"InProgress"`).
@@ -245,7 +272,13 @@ impl LcuClient {
 
         let (mut write, mut read) = ws_stream.split();
 
-        for topic in [EVENT_CHAMP_SELECT, EVENT_EOG_STATS, EVENT_GAMEFLOW_PHASE] {
+        for topic in [
+            EVENT_CHAMP_SELECT,
+            EVENT_SUBSET_CHAMPIONS_TEAM_BUILDER,
+            EVENT_SUBSET_CHAMPIONS_LEGACY,
+            EVENT_EOG_STATS,
+            EVENT_GAMEFLOW_PHASE,
+        ] {
             let sub_frame = format!(r#"[5, "{topic}"]"#);
             write
                 .send(Message::text(sub_frame))
@@ -390,6 +423,15 @@ pub fn parse_wamp_event(text: &str) -> Option<LcuWsEvent> {
                 }
             }
         }
+        EVENT_SUBSET_CHAMPIONS_TEAM_BUILDER | EVENT_SUBSET_CHAMPIONS_LEGACY => {
+            if envelope.event_type.eq_ignore_ascii_case("Delete") {
+                Some(LcuWsEvent::SubsetChampionsUpdated(Vec::new()))
+            } else {
+                Some(LcuWsEvent::SubsetChampionsUpdated(
+                    parse_subset_champion_ids(&envelope.data),
+                ))
+            }
+        }
         EVENT_GAMEFLOW_PHASE => {
             if envelope.event_type.eq_ignore_ascii_case("Delete") {
                 Some(LcuWsEvent::GameflowPhase("None".to_owned()))
@@ -417,6 +459,37 @@ pub fn parse_wamp_event(text: &str) -> Option<LcuWsEvent> {
         }
         _ => None,
     }
+}
+
+fn extract_subset_champion_id(item: &serde_json::Value) -> Option<i32> {
+    item.as_i64()
+        .and_then(|v| i32::try_from(v).ok())
+        .or_else(|| {
+            item.get("championId")
+                .and_then(|v| v.as_i64())
+                .and_then(|v| i32::try_from(v).ok())
+        })
+        .filter(|&id| id > 0)
+}
+
+fn parse_subset_champion_ids(val: &serde_json::Value) -> Vec<i32> {
+    let Some(items) = val.as_array().or_else(|| {
+        val.get("championIds")
+            .and_then(|v| v.as_array())
+            .or_else(|| val.get("subsetChampionList").and_then(|v| v.as_array()))
+    }) else {
+        return Vec::new();
+    };
+
+    let mut ids = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(id) = extract_subset_champion_id(item) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
 }
 
 fn into_champ_select_state(raw: RawChampSelectSession) -> ChampSelectState {
@@ -463,6 +536,8 @@ fn into_champ_select_state(raw: RawChampSelectSession) -> ChampSelectState {
         local_intent_id,
         my_team,
         bench_champions,
+        allow_subset_champion_picks: raw.allow_subset_champion_picks,
+        subset_champions: Vec::new(),
         rerolls_remaining,
     }
 }
@@ -592,6 +667,11 @@ struct RawChampSelectSession {
     my_team: Vec<Option<RawTeamSlot>>,
     #[serde(rename = "benchChampions", deserialize_with = "deserialize_null_default")]
     bench_champions: Vec<Option<RawBenchEntry>>,
+    #[serde(
+        rename = "allowSubsetChampionPicks",
+        deserialize_with = "deserialize_null_default"
+    )]
+    allow_subset_champion_picks: bool,
     #[serde(rename = "rerollsRemaining", deserialize_with = "deserialize_null_default")]
     rerolls_remaining: i64,
 }
@@ -691,4 +771,44 @@ struct RawEogPlayer {
     augments: Vec<Option<i32>>,
     #[serde(deserialize_with = "deserialize_null_default")]
     stats: HashMap<String, serde_json::Value>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_subset_champion_ws_events() {
+        let frame = r#"[8,"OnJsonApiEvent_lol-lobby-team-builder_champ-select_v1_subset-champion-list",{"eventType":"Update","data":[157,432,157,0,-1]}]"#;
+        match parse_wamp_event(frame) {
+            Some(LcuWsEvent::SubsetChampionsUpdated(ids)) => assert_eq!(ids, vec![157, 432]),
+            other => panic!("unexpected parsed event: {other:?}"),
+        }
+
+        let legacy_obj_frame = r#"[8,"OnJsonApiEvent_lol-champ-select_v1_subset-champion-list",{"eventType":"Create","data":{"championIds":[89,145,89]}}]"#;
+        match parse_wamp_event(legacy_obj_frame) {
+            Some(LcuWsEvent::SubsetChampionsUpdated(ids)) => assert_eq!(ids, vec![89, 145]),
+            other => panic!("unexpected parsed event: {other:?}"),
+        }
+
+        let del_frame = r#"[8,"OnJsonApiEvent_lol-lobby-team-builder_champ-select_v1_subset-champion-list",{"eventType":"Delete","data":null}]"#;
+        match parse_wamp_event(del_frame) {
+            Some(LcuWsEvent::SubsetChampionsUpdated(ids)) => assert!(ids.is_empty()),
+            other => panic!("unexpected parsed event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_allow_subset_champion_picks_from_session_ws_event() {
+        let frame = r#"[8,"OnJsonApiEvent_lol-champ-select_v1_session",{"eventType":"Update","data":{"timer":{"phase":"PLANNING"},"gameMode":"ARAM","queueId":450,"localPlayerCellId":2,"allowSubsetChampionPicks":true,"myTeam":[{"cellId":2,"championId":0,"championPickIntent":0,"assignedPosition":""}],"benchChampions":[32],"rerollsRemaining":1}}]"#;
+        match parse_wamp_event(frame) {
+            Some(LcuWsEvent::ChampSelectUpdated(state)) => {
+                assert!(state.allow_subset_champion_picks);
+                assert!(state.subset_champions.is_empty());
+                assert_eq!(state.local_champion_id, 0);
+                assert_eq!(state.bench_champions, vec![32]);
+            }
+            other => panic!("unexpected parsed event: {other:?}"),
+        }
+    }
 }

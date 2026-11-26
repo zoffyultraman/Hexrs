@@ -202,8 +202,10 @@ struct CoordinatorState {
     last_lcu_error: Option<String>,
     cached_game_mode: Option<String>,
     cached_queue_id: Option<i32>,
+    cached_subset_champions: Vec<i32>,
     last_champ_select: Option<ChampSelectState>,
     gameflow_fetch_in_flight: bool,
+    subset_fetch_in_flight: bool,
     champ_poll_in_flight: bool,
     live_poll_in_flight: bool,
     ws_shutdown_tx: Option<watch::Sender<bool>>,
@@ -225,8 +227,10 @@ impl CoordinatorState {
             last_lcu_error: None,
             cached_game_mode: None,
             cached_queue_id: None,
+            cached_subset_champions: Vec::new(),
             last_champ_select: None,
             gameflow_fetch_in_flight: false,
+            subset_fetch_in_flight: false,
             champ_poll_in_flight: false,
             live_poll_in_flight: false,
             ws_shutdown_tx: None,
@@ -289,8 +293,10 @@ impl CoordinatorState {
             self.last_lcu_error = None;
             self.cached_game_mode = None;
             self.cached_queue_id = None;
+            self.cached_subset_champions.clear();
             self.last_champ_select = None;
             self.gameflow_fetch_in_flight = false;
+            self.subset_fetch_in_flight = false;
             self.champ_poll_in_flight = false;
             self.active_lcu = None;
             self.active_creds = self.snapshot.lcu.clone();
@@ -345,6 +351,14 @@ impl CoordinatorState {
             self.cached_queue_id = state.queue_id;
         }
 
+        if state.local_champion_id > 0 {
+            state.subset_champions.clear();
+        } else if !state.subset_champions.is_empty() {
+            self.cached_subset_champions = state.subset_champions.clone();
+        } else if !self.cached_subset_champions.is_empty() {
+            state.subset_champions = self.cached_subset_champions.clone();
+        }
+
         state
     }
 
@@ -352,8 +366,10 @@ impl CoordinatorState {
         self.in_champ_select = false;
         self.cached_game_mode = None;
         self.cached_queue_id = None;
+        self.cached_subset_champions.clear();
         self.last_champ_select = None;
         self.gameflow_fetch_in_flight = false;
+        self.subset_fetch_in_flight = false;
     }
 
     fn handle_ws_event(
@@ -361,6 +377,7 @@ impl CoordinatorState {
         event: LcuWsEvent,
         ws_event_tx: &mpsc::UnboundedSender<LcuWsEvent>,
         gameflow_tx: &mpsc::UnboundedSender<Option<(String, Option<i32>)>>,
+        subset_tx: &mpsc::UnboundedSender<Vec<i32>>,
     ) {
         match event {
             LcuWsEvent::Connected => {
@@ -424,8 +441,25 @@ impl CoordinatorState {
                     }
                 }
 
+                if state.local_champion_id == 0
+                    && self.cached_subset_champions.is_empty()
+                    && !self.subset_fetch_in_flight
+                {
+                    if let Some(client) = self.active_lcu.clone() {
+                        self.subset_fetch_in_flight = true;
+                        let stx = subset_tx.clone();
+                        tokio::spawn(async move {
+                            let ids = client.get_subset_champion_list().await.unwrap_or_default();
+                            let _ = stx.send(ids);
+                        });
+                    }
+                }
+
                 self.last_champ_select = Some(state.clone());
                 let _ = self.event_tx.send(AppEvent::ChampSelectUpdated(state));
+            }
+            LcuWsEvent::SubsetChampionsUpdated(ids) => {
+                self.apply_subset_champions(ids);
             }
             LcuWsEvent::ChampSelectEnded => {
                 self.clear_champ_select_state();
@@ -443,6 +477,7 @@ impl CoordinatorState {
         outcome: ChampPollOutcome,
         ws_event_tx: &mpsc::UnboundedSender<LcuWsEvent>,
         gameflow_tx: &mpsc::UnboundedSender<Option<(String, Option<i32>)>>,
+        subset_tx: &mpsc::UnboundedSender<Vec<i32>>,
     ) {
         self.champ_poll_in_flight = false;
         match outcome.session {
@@ -454,6 +489,7 @@ impl CoordinatorState {
                         LcuWsEvent::ChampSelectUpdated(normalized),
                         ws_event_tx,
                         gameflow_tx,
+                        subset_tx,
                     );
                 }
             }
@@ -475,6 +511,7 @@ impl CoordinatorState {
                                 LcuWsEvent::ChampSelectEnded,
                                 ws_event_tx,
                                 gameflow_tx,
+                                subset_tx,
                             );
                             synced = true;
                         }
@@ -485,6 +522,7 @@ impl CoordinatorState {
                                 LcuWsEvent::ChampSelectEnded,
                                 ws_event_tx,
                                 gameflow_tx,
+                                subset_tx,
                             );
                             synced = true;
                         }
@@ -527,6 +565,25 @@ impl CoordinatorState {
                 if self.live_api_active {
                     self.live_api_active = false;
                     self.sync_shared_and_mode();
+                }
+            }
+        }
+    }
+
+    fn handle_subset_resolved(&mut self, ids: Vec<i32>) {
+        self.subset_fetch_in_flight = false;
+        self.apply_subset_champions(ids);
+    }
+
+    fn apply_subset_champions(&mut self, ids: Vec<i32>) {
+        self.cached_subset_champions = ids.clone();
+        if self.in_champ_select {
+            if let Some(mut session) = self.last_champ_select.clone() {
+                if session.local_champion_id == 0 && session.subset_champions != ids {
+                    session.subset_champions = ids;
+                    debug!(ids = ?session.subset_champions, "resolved champ select subset cards");
+                    self.last_champ_select = Some(session.clone());
+                    let _ = self.event_tx.send(AppEvent::ChampSelectUpdated(session));
                 }
             }
         }
@@ -583,6 +640,12 @@ async fn emit_initial_champ_select(
                     session.queue_id = queue_id;
                 }
             }
+            if session.local_champion_id == 0 {
+                let ids = client.get_subset_champion_list().await.unwrap_or_default();
+                if !ids.is_empty() {
+                    session.subset_champions = ids;
+                }
+            }
             let _ = ws_event_tx.send(LcuWsEvent::ChampSelectUpdated(session));
         }
         Ok(None) => {
@@ -627,6 +690,7 @@ async fn run_coordinator(
 
     let (ws_event_tx, mut ws_event_rx) = mpsc::unbounded_channel::<LcuWsEvent>();
     let (gameflow_tx, mut gameflow_rx) = mpsc::unbounded_channel::<Option<(String, Option<i32>)>>();
+    let (subset_tx, mut subset_rx) = mpsc::unbounded_channel::<Vec<i32>>();
     let (champ_poll_tx, mut champ_poll_rx) = mpsc::unbounded_channel::<ChampPollOutcome>();
     let (live_poll_tx, mut live_poll_rx) =
         mpsc::unbounded_channel::<Result<Option<LiveGameState>>>();
@@ -669,7 +733,18 @@ async fn run_coordinator(
                         state.champ_poll_in_flight = true;
                         let tx = champ_poll_tx.clone();
                         tokio::spawn(async move {
-                            let session = client.get_champ_select_session().await;
+                            let mut session = client.get_champ_select_session().await;
+                            if let Ok(Some(ref mut s)) = session {
+                                if s.local_champion_id == 0 {
+                                    let ids = client
+                                        .get_subset_champion_list()
+                                        .await
+                                        .unwrap_or_default();
+                                    if !ids.is_empty() {
+                                        s.subset_champions = ids;
+                                    }
+                                }
+                            }
                             let phase = if matches!(session, Ok(None)) {
                                 client.get_gameflow_phase().await.ok().flatten()
                             } else {
@@ -693,16 +768,19 @@ async fn run_coordinator(
                 }
             }
             Some(ws_event) = ws_event_rx.recv() => {
-                state.handle_ws_event(ws_event, &ws_event_tx, &gameflow_tx);
+                state.handle_ws_event(ws_event, &ws_event_tx, &gameflow_tx, &subset_tx);
             }
             Some(champ_res) = champ_poll_rx.recv() => {
-                state.handle_champ_poll_result(champ_res, &ws_event_tx, &gameflow_tx);
+                state.handle_champ_poll_result(champ_res, &ws_event_tx, &gameflow_tx, &subset_tx);
             }
             Some(live_res) = live_poll_rx.recv() => {
                 state.handle_live_poll_result(live_res);
             }
             Some(resolved) = gameflow_rx.recv() => {
                 state.handle_gameflow_resolved(resolved);
+            }
+            Some(ids) = subset_rx.recv() => {
+                state.handle_subset_resolved(ids);
             }
         }
     }

@@ -98,6 +98,10 @@ pub struct ChampSelectState {
     pub local_intent_id: i32,
     pub my_team: Vec<TeamSlot>,
     pub bench_champions: Vec<i32>,
+    #[serde(default)]
+    pub allow_subset_champion_picks: bool,
+    #[serde(default)]
+    pub subset_champions: Vec<i32>,
     pub rerolls_remaining: u32,
 }
 
