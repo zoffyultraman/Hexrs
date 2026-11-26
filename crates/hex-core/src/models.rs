@@ -236,11 +236,11 @@ impl Default for RoiManifest {
     }
 }
 
-/// Normalized screen-space anchor geometry of the 3 detected augment cards (`0.0..=1.0`).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// Normalized screen-space anchor geometry of the detected augment cards (`0.0..=1.0`, typically 3 or 4 cards).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AugmentOfferLayout {
-    /// Normalized `[left, mid, right]` card center X coordinates (`0.0..=1.0`).
-    pub slot_centers_x: [f32; 3],
+    /// Left-to-right normalized card center X coordinates (`0.0..=1.0`, typically 3 or 4 cards).
+    pub slot_centers_x: Vec<f32>,
     /// Normalized Y coordinate of the card title row (`0.0..=1.0`).
     pub title_y: f32,
 }
