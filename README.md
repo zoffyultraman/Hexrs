@@ -39,10 +39,11 @@ scripts/
 ## 下载与使用
 
 1. 前往仓库 [Releases](https://github.com/zoffyultraman/Hexrs/releases) 页面下载最新版 `Hexrs.exe`（便携单文件，解压/双击即可运行）。
-2. 启动后程序常驻系统托盘（默认开启匿名胜率数据库与热更新检查），打开《英雄联盟》客户端进入选人或对局后会自动切换模式：
+2. 运行时数据（`meta.db`、图标缓存、`hexrs.log`）默认便携存储在 `Hexrs.exe` 同级 `data` 目录（例如 `D:\Hexrs\data`；若程序所在目录只读或不可写，则自动回退至 `%LOCALAPPDATA%\Hexrs`）。
+3. 启动后程序常驻系统托盘（默认开启匿名胜率数据库与热更新检查），打开《英雄联盟》客户端进入选人或对局后会自动切换模式：
    * **选人阶段**：自动吸附于大厅左侧，同时在备选池与队友头像旁显示轻量胜率徽章条。
    * **对局阶段**：永久鼠标穿透渲染角落 `324x204` 六神装面板（可在托盘切换左上角 / 右上角），并在海克斯选卡出现时在卡片上方对齐弹出评分条。
-3. **关于安全软件误报提示**：由于内测阶段便携版 `.exe` 暂未配置商业代码签名证书，部分 Windows Defender 或安全软件可能会提示拦截，建议在确认由本仓库 GitHub Actions 公开编译后手动加入信任/白名单。
+4. **关于安全软件误报提示**：由于内测阶段便携版 `.exe` 暂未配置商业代码签名证书，部分 Windows Defender 或安全软件可能会提示拦截，建议在确认由本仓库 GitHub Actions 公开编译后手动加入信任/白名单。
 
 ### 可选环境变量
 
@@ -51,19 +52,24 @@ scripts/
 
 ---
 
-## 数据来源与开源协议
-
-* **海克斯大乱斗统计数据（英雄胜率 / 海克斯分英雄胜率 / 六神装推荐）**：
-  * 项目地址：`https://github.com/czgreat/aramhex-data`
-  * 开源协议：**CC BY-NC 4.0**（Creative Commons Attribution-NonCommercial 4.0 International，署名-非商业性使用 4.0 国际许可协议，协议原文：`https://github.com/czgreat/aramhex-data/blob/main/LICENSE`）
-  * 授权说明：已获作者在 [czgreat/aramhex-data#4](https://github.com/czgreat/aramhex-data/issues/4) 中明确授权免费开源项目 `Hexrs` 按 CC BY-NC 4.0 协议使用，本项目仅作开源非商业用途并保留完整署名。
-* **基础静态元数据与图标**：CommunityDragon (`https://www.communitydragon.org/`)、Data Dragon 及国服静态资源 CDN。
-* **本项目代码协议**：GPL-3.0（非商业开源项目）。
-
----
-
 ## 合规与隐私承诺
 
 * **绝不读取游戏内存、绝不注入 DLL、绝不修改封包、绝不使用 `SetWindowsHookEx` 全局钩子**。
 * 所有能力严格限定在官方本地接口（LCU / Live Client Data API）、官方 `Windows.Graphics.Capture` 抓屏及系统原生 `Windows.Media.Ocr` 范围内，无任何自动点击或代操作行为。
 * 战绩上报与本地缓存均在反序列化阶段即剥离所有召唤师名称、Riot ID、PUUID 与对局 ID，仅保留匿名英雄/名次/装备/海克斯 ID。
+
+---
+
+## 开源协议与数据声明 (License & Data Attribution)
+
+本项目采用**代码与数据分离**的许可方式：
+
+### 1. 源代码协议
+本仓库中的所有原创源代码均基于 **[GNU General Public License v3.0 (GPL-3.0)](./LICENSE)** 协议开源。你可以自由地使用、修改和分发这些代码。
+
+### 2. 第三方数据协议
+本项目运行所依赖的《英雄联盟》海克斯大乱斗相关统计数据来源于开源仓库 [czgreat/aramhex-data](https://github.com/czgreat/aramhex-data)（已获作者在 [Issue #4](https://github.com/czgreat/aramhex-data/issues/4) 中明确授权使用）。
+
+* **数据许可协议**：该部分数据独立遵循 **[CC BY-NC 4.0（署名-非商业性使用 4.0 国际许可协议）](https://creativecommons.org/licenses/by-nc/4.0/deed.zh-hans)**（协议原文：[LICENSE](https://github.com/czgreat/aramhex-data/blob/main/LICENSE)），**不受本项目的 GPL-3.0 协议管辖**。
+* **修改说明**：本项目对原数据进行了筛选与结构重组（结合贝叶斯平滑与 CommunityDragon / Data Dragon 基础元数据，构建本地只读 SQLite 索引与六神装推荐方案）。
+* **商业使用提示**：Hexrs 本身完全免费且无商业用途。如果你计划基于 GPL-3.0 协议对本项目进行商业化分发或二次开发，**必须先移除 `aramhex-data` 相关数据并替换为自有数据源**，以免违反 CC BY-NC 4.0 的非商业性条款。

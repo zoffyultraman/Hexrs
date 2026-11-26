@@ -35,7 +35,7 @@ pub struct IconCache {
 }
 
 impl IconCache {
-    /// Creates an `IconCache` backed by `%LOCALAPPDATA%/Hexrs/cache/icons`.
+    /// Creates an `IconCache` backed by `<exe_dir>/data/cache/icons` (with `%LOCALAPPDATA%/Hexrs` fallback).
     pub fn new(on_ready_tx: Sender<()>) -> Self {
         let cache_dir = data_dir().join("cache").join("icons");
         let _ = fs::create_dir_all(&cache_dir);

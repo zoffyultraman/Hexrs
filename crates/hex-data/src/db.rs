@@ -7,7 +7,7 @@ use std::fs::File;
 #[cfg(has_bundled_meta_db)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -28,11 +28,44 @@ const SQLITE_MAGIC_HEADER: &[u8] = b"SQLite format 3\0";
 #[cfg(has_bundled_meta_db)]
 const BUNDLED_META_DB_ZST: &[u8] = include_bytes!("../assets/meta.db.zst");
 
-/// Returns the local application data directory (`%LOCALAPPDATA%/Hexrs` on Windows).
+static DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+fn is_dir_writable(dir: &Path) -> bool {
+    if fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(format!(".hexrs_write_probe_{}", std::process::id()));
+    match fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Returns the portable `<exe_dir>/data` directory, falling back to `%LOCALAPPDATA%/Hexrs` if unavailable or read-only.
 pub fn data_dir() -> PathBuf {
-    dirs::data_local_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Hexrs")
+    DATA_DIR
+        .get_or_init(|| {
+            if let Some(exe_data_dir) = std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(|dir| dir.join("data")))
+            {
+                if is_dir_writable(&exe_data_dir) {
+                    return exe_data_dir;
+                }
+            }
+            dirs::data_local_dir()
+                .unwrap_or_else(std::env::temp_dir)
+                .join("Hexrs")
+        })
+        .clone()
 }
 
 /// Returns the default path to the local `meta.db` database file.
@@ -177,7 +210,7 @@ pub struct MetaEngine {
 }
 
 impl MetaEngine {
-    /// Opens the default `%LOCALAPPDATA%/Hexrs/meta.db`, installing bundled/seed data if missing or outdated, and loads into RAM.
+    /// Opens the default `<exe_dir>/data/meta.db` (or `%LOCALAPPDATA%/Hexrs/meta.db` fallback), installing bundled/seed data if missing or outdated, and loads into RAM.
     pub fn open_default() -> Result<Self> {
         let dir = data_dir();
         fs::create_dir_all(&dir)
