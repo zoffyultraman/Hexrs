@@ -15,7 +15,7 @@ use hex_data::{
     HeroPreview, HeroStats, IconCache, MetaEngine, TeamRecommendations, UpdateOutcome,
     UpdaterConfig,
 };
-use hex_vision::{SharedRoiManifest, VisionController};
+use hex_vision::{SharedRoiManifest, VisionController, VisionGameContext};
 use tracing::{debug, info, warn};
 
 use crate::lobby_view;
@@ -25,7 +25,7 @@ use crate::theme;
 use crate::tray::{TrayAction, TrayController};
 use crate::win32::{self, OverlayCorner, WindowRectInfo};
 
-const BENCH_HIGHLIGHT_LIMIT: usize = 3;
+const BENCH_HIGHLIGHT_LIMIT: usize = 12;
 const TEAM_RECOMMENDATION_LIMIT: usize = 5;
 const PREVIEW_YASUO_HERO_ID: i32 = 157;
 
@@ -42,6 +42,7 @@ pub struct HexOverlayApp {
     pub champ_select: Option<ChampSelectState>,
     pub active_champ_select_hero_id: Option<i32>,
     pub live_game: Option<LiveGameState>,
+    pub team_hero_stats: Vec<HeroStats>,
     pub bench_highlights: Vec<BenchHighlight>,
     pub team_recs: TeamRecommendations,
     pub current_hero_stats: Option<HeroStats>,
@@ -77,6 +78,9 @@ pub struct HexOverlayApp {
     last_diagnostics_sync: bool,
     last_dormant_hidden: bool,
     auto_elevation_prompted: bool,
+    last_auto_expanded_hero_id: Option<i32>,
+    last_logged_hud_signature: Option<(Option<i32>, usize, bool)>,
+    pending_repaint_ticks: u8,
 }
 
 impl HexOverlayApp {
@@ -104,9 +108,18 @@ impl HexOverlayApp {
             .as_ref()
             .map(MetaEngine::list_augment_hashes)
             .unwrap_or_default();
+        let augment_names = meta
+            .as_ref()
+            .map(MetaEngine::list_augment_names)
+            .unwrap_or_default();
         let roi_manifest = Arc::new(RwLock::new(RoiManifest::default()));
         let (vision_tx, vision_rx) = unbounded::<AppEvent>();
-        let vision = VisionController::start(hashes, Arc::clone(&roi_manifest), vision_tx);
+        let vision = VisionController::start(
+            hashes,
+            augment_names,
+            Arc::clone(&roi_manifest),
+            vision_tx,
+        );
 
         let updater_config = UpdaterConfig::from_env();
         let (update_tx, update_rx) = unbounded::<anyhow::Result<UpdateOutcome>>();
@@ -132,6 +145,7 @@ impl HexOverlayApp {
             champ_select: None,
             active_champ_select_hero_id: None,
             live_game: None,
+            team_hero_stats: Vec::new(),
             bench_highlights: Vec::new(),
             team_recs: TeamRecommendations::default(),
             current_hero_stats: None,
@@ -167,6 +181,9 @@ impl HexOverlayApp {
             last_diagnostics_sync: false,
             last_dormant_hidden: false,
             auto_elevation_prompted: false,
+            last_auto_expanded_hero_id: None,
+            last_logged_hud_signature: None,
+            pending_repaint_ticks: 0,
         }
     }
 
@@ -210,6 +227,7 @@ impl HexOverlayApp {
                         match meta.reload_from_path(&db_path) {
                             Ok(()) => {
                                 self.vision.update_hashes(meta.list_augment_hashes());
+                                self.vision.update_augment_names(meta.list_augment_names());
                                 if let Some(cs) = self.champ_select.clone() {
                                     self.refresh_champ_select_data(&cs);
                                 }
@@ -247,12 +265,12 @@ impl HexOverlayApp {
                             .unwrap_or(!self.overlay_visible);
                         info!(visible = self.overlay_visible, "overlay visibility toggled via tray");
                         if self.mode == AppMode::InGameOverlay {
-                            let mode_str = self
+                            let ctx = self
                                 .live_game
                                 .as_ref()
-                                .map(|l| l.game_mode.as_str())
-                                .unwrap_or("");
-                            self.vision.set_active(self.overlay_visible, mode_str);
+                                .map(live_game_to_vision_ctx)
+                                .unwrap_or_default();
+                            self.vision.update_game_context(self.overlay_visible, ctx);
                         }
                         self.reset_window_sync_cache();
                         dirty = true;
@@ -358,7 +376,14 @@ impl HexOverlayApp {
             dirty = true;
         }
 
-        self.sync_window_mode(window);
+        if self.sync_window_mode(window) {
+            self.pending_repaint_ticks = 4;
+        }
+        if self.pending_repaint_ticks > 0 {
+            self.pending_repaint_ticks -= 1;
+            window.refresh();
+            dirty = true;
+        }
 
         if dirty {
             cx.notify();
@@ -467,6 +492,7 @@ impl HexOverlayApp {
         self.active_hero_name_zh = None;
         self.active_hero_icon = None;
         self.item_icons.clear();
+        self.last_logged_hud_signature = None;
     }
 
     fn handle_app_event(&mut self, event: AppEvent) {
@@ -492,6 +518,7 @@ impl HexOverlayApp {
                 if next_mode != AppMode::LobbyDocked {
                     self.expanded_hero_id = None;
                     self.selected_preview = None;
+                    self.last_auto_expanded_hero_id = None;
                 }
 
                 if next_mode == AppMode::InGameOverlay {
@@ -499,10 +526,12 @@ impl HexOverlayApp {
                         self.refresh_live_game_data(&live);
                     } else {
                         self.populate_hero_hud_state(self.active_champ_select_hero_id, None, &[]);
-                        self.vision.set_active(self.overlay_visible, "");
+                        self.vision
+                            .update_game_context(self.overlay_visible, VisionGameContext::default());
                     }
                 } else {
-                    self.vision.set_active(false, "");
+                    self.vision
+                        .update_game_context(false, VisionGameContext::default());
                     self.clear_in_game_hud_state();
                 }
             }
@@ -511,9 +540,13 @@ impl HexOverlayApp {
                 if !connected {
                     self.champ_select = None;
                     self.active_champ_select_hero_id = None;
+                    self.team_hero_stats.clear();
                     self.bench_highlights.clear();
                     self.team_recs = TeamRecommendations::default();
                     self.current_hero_stats = None;
+                    self.expanded_hero_id = None;
+                    self.selected_preview = None;
+                    self.last_auto_expanded_hero_id = None;
                 }
             }
             AppEvent::ChampSelectUpdated(state) => {
@@ -588,9 +621,9 @@ impl HexOverlayApp {
     }
 
     fn refresh_live_game_data(&mut self, live: &LiveGameState) {
-        self.vision.set_active(
+        self.vision.update_game_context(
             self.mode == AppMode::InGameOverlay && self.overlay_visible,
-            &live.game_mode,
+            live_game_to_vision_ctx(live),
         );
 
         let hero_id = live
@@ -626,6 +659,21 @@ impl HexOverlayApp {
         self.dynamic_build = self.meta.as_ref().map(|meta| {
             meta.get_dynamic_build_or_fallback(hero_id, &self.owned_augment_ids, owned_item_ids)
         });
+
+        let sig = (
+            self.active_hero_id,
+            self.dynamic_build.as_ref().map(|p| p.items.len()).unwrap_or(0),
+            self.dynamic_build.is_some(),
+        );
+        if self.last_logged_hud_signature != Some(sig) {
+            self.last_logged_hud_signature = Some(sig);
+            info!(
+                ?hero_id,
+                hero_name = ?self.active_hero_name_zh,
+                item_count = sig.1,
+                "updated in-game equipment HUD"
+            );
+        }
 
         self.refresh_active_icons();
     }
@@ -666,6 +714,25 @@ impl HexOverlayApp {
             None
         };
 
+        let mut seen_team_ids = Vec::with_capacity(state.my_team.len() + 1);
+        if active_hero_id > 0 {
+            seen_team_ids.push(active_hero_id);
+        }
+        for slot in &state.my_team {
+            let slot_hero_id = if slot.champion_id > 0 {
+                slot.champion_id
+            } else {
+                slot.pick_intent
+            };
+            if slot_hero_id > 0 && !seen_team_ids.contains(&slot_hero_id) {
+                seen_team_ids.push(slot_hero_id);
+            }
+        }
+        self.team_hero_stats = seen_team_ids
+            .iter()
+            .filter_map(|&id| meta.get_hero_stats(id))
+            .collect();
+
         self.bench_highlights = meta.highlight_bench(&state.bench_champions, BENCH_HIGHLIGHT_LIMIT);
 
         let teammate_ids: Vec<i32> = state
@@ -688,12 +755,23 @@ impl HexOverlayApp {
             TEAM_RECOMMENDATION_LIMIT,
         );
 
-        if let Some(hero_id) = self.expanded_hero_id {
-            self.selected_preview = meta.get_hero_preview(hero_id);
+        if active_hero_id > 0 {
+            if self.last_auto_expanded_hero_id != Some(active_hero_id) {
+                self.last_auto_expanded_hero_id = Some(active_hero_id);
+                self.expanded_hero_id = Some(active_hero_id);
+                self.selected_preview = meta.get_hero_preview(active_hero_id);
+            } else if let Some(hero_id) = self.expanded_hero_id {
+                self.selected_preview = meta.get_hero_preview(hero_id);
+            }
+        } else {
+            self.last_auto_expanded_hero_id = None;
+            if let Some(hero_id) = self.expanded_hero_id {
+                self.selected_preview = meta.get_hero_preview(hero_id);
+            }
         }
     }
 
-    fn sync_window_mode(&mut self, window: &Window) {
+    fn sync_window_mode(&mut self, window: &Window) -> bool {
         if self.diagnostics_open && self.preview_mode.is_none() {
             if !self.last_diagnostics_sync {
                 if let Err(err) = win32::set_diagnostics_window_mode(window) {
@@ -701,8 +779,9 @@ impl HexOverlayApp {
                 }
                 self.last_diagnostics_sync = true;
                 self.last_dormant_hidden = false;
+                return true;
             }
-            return;
+            return false;
         }
         self.last_diagnostics_sync = false;
 
@@ -736,7 +815,9 @@ impl HexOverlayApp {
                         warn!(error = %err, "failed to dock lobby sidebar");
                     }
                     self.last_lobby_sync = Some(state);
+                    return true;
                 }
+                false
             }
             AppMode::InGameOverlay => {
                 let detected_rect = win32::find_league_game_window(self.core_handle.game_pid());
@@ -776,7 +857,9 @@ impl HexOverlayApp {
                         warn!(error = %err, has_augment_offer, "failed to update in-game overlay window");
                     }
                     self.last_overlay_sync = Some(state);
+                    return true;
                 }
+                false
             }
             AppMode::Dormant => {
                 if !self.last_dormant_hidden {
@@ -785,8 +868,19 @@ impl HexOverlayApp {
                     }
                     self.last_dormant_hidden = true;
                 }
+                false
             }
         }
+    }
+}
+
+fn live_game_to_vision_ctx(live: &LiveGameState) -> VisionGameContext {
+    VisionGameContext {
+        game_mode: live.game_mode.clone(),
+        level: live.level,
+        game_time_secs: live.game_time_secs,
+        is_dead: live.is_dead,
+        respawn_timer: live.respawn_timer,
     }
 }
 
@@ -831,12 +925,25 @@ fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
 
     let lobby_rect_str = format_rect_info(lobby_rect);
     let game_rect_str = format_rect_info(game_rect);
-    let (meta_status, counts_str) = match app.meta.as_ref() {
+    let (meta_status, counts_str, data_version_str) = match app.meta.as_ref() {
         Some(engine) => {
             let (champs, augs) = engine.stats_counts();
-            ("已加载内存 SQLite", format!("{champs} 英雄 / {augs} 海克斯"))
+            let version = engine.data_version();
+            (
+                "已加载内存 SQLite",
+                format!("{champs} 英雄 / {augs} 海克斯"),
+                if version.is_empty() {
+                    "-".to_owned()
+                } else {
+                    version
+                },
+            )
         }
-        None => ("未加载", "0 英雄 / 0 海克斯".to_owned()),
+        None => (
+            "未加载",
+            "0 英雄 / 0 海克斯".to_owned(),
+            "-".to_owned(),
+        ),
     };
 
     div()
@@ -943,6 +1050,7 @@ fn render_diagnostics_panel(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
                         ))
                         .child(diag_row("MetaEngine 数据库", meta_status.to_owned()))
                         .child(diag_row("特征库规模", counts_str))
+                        .child(diag_row("数据版本", data_version_str))
                         .child(diag_row_colored(
                             "当前权限",
                             if diag.is_elevated {

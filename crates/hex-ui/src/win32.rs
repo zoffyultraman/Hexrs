@@ -9,8 +9,8 @@ pub const DIAGNOSTICS_WIDTH_DIP: f32 = 440.0;
 pub const DIAGNOSTICS_HEIGHT_DIP: f32 = 560.0;
 
 /// Compact in-game corner HUD dimensions in DIPs.
-pub const IN_GAME_HUD_WIDTH_DIP: f32 = 304.0;
-pub const IN_GAME_HUD_HEIGHT_DIP: f32 = 126.0;
+pub const IN_GAME_HUD_WIDTH_DIP: f32 = 324.0;
+pub const IN_GAME_HUD_HEIGHT_DIP: f32 = 136.0;
 
 /// Corner anchor for the compact in-game HUD card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -354,12 +354,12 @@ mod imp {
         let work = primary_work_area();
         let w = (work.right - work.left).min(1280);
         let h = (work.bottom - work.top).min(760);
-        let left = work.left + ((work.right - work.left - w) / 2).max(0);
+        let left = work.left + ((work.right - work.left - w) / 2).max(340);
         let top = work.top + ((work.bottom - work.top - h) / 2).max(0);
         WindowRectInfo {
             left,
             top,
-            right: left + w - 340,
+            right: (left + w - 340).min(work.right),
             bottom: top + h,
             dpi: 96,
         }
@@ -584,14 +584,14 @@ mod imp {
             let max_width = (bounds.right - bounds.left).max(200);
             let width_px = width_px.min(max_width);
 
-            let mut x = target.right + gap_px;
-            if x + width_px > bounds.right {
-                let left_dock = target.left - width_px - gap_px;
-                if left_dock >= bounds.left {
-                    x = left_dock;
+            let mut x = target.left - width_px - gap_px;
+            if x < bounds.left {
+                let right_dock = target.right + gap_px;
+                x = if right_dock + width_px <= bounds.right {
+                    right_dock
                 } else {
-                    x = (bounds.right - width_px).max(bounds.left);
-                }
+                    bounds.left
+                };
             }
 
             let y = target

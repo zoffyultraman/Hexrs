@@ -1,4 +1,4 @@
-//! In-game overlay views: compact `304x126` corner HUD and non-blocking 3-column S+~D augment strip.
+//! In-game overlay views: compact `324x136` corner HUD and non-blocking 3-column S+~D augment strip.
 
 use std::path::PathBuf;
 
@@ -227,14 +227,20 @@ fn render_hero_header(
             .child("HEX"),
     };
 
+    let tag_badge = playstyle_tag.map(|tag| truncate_label(&tag, 7));
+
     div()
+        .w_full()
+        .h(px(38.0))
         .flex()
+        .flex_row()
         .items_center()
         .justify_between()
         .gap_2()
         .child(
             div()
                 .flex()
+                .flex_row()
                 .items_center()
                 .gap_2()
                 .child(portrait)
@@ -246,7 +252,7 @@ fn render_hero_header(
                         .child(hero_name),
                 ),
         )
-        .when_some(playstyle_tag, |row, tag| {
+        .when_some(tag_badge, |row, tag| {
             row.child(
                 div()
                     .px(px(6.0))
@@ -266,7 +272,8 @@ fn render_hero_header(
 fn render_item_row(app: &HexOverlayApp, build: Option<&DynamicBuildPlan>) -> Div {
     let Some(plan) = build else {
         return div()
-            .flex_1()
+            .w_full()
+            .h(px(74.0))
             .flex()
             .items_center()
             .justify_center()
@@ -275,7 +282,26 @@ fn render_item_row(app: &HexOverlayApp, build: Option<&DynamicBuildPlan>) -> Div
             .child("正在加载推荐出装...");
     };
 
-    let mut row = div().flex().gap_1();
+    if plan.items.is_empty() {
+        return div()
+            .w_full()
+            .h(px(74.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_xs()
+            .text_color(theme::text_muted())
+            .child("暂无推荐装备");
+    }
+
+    let mut row = div()
+        .w_full()
+        .h(px(74.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(6.0));
     for item in plan.items.iter().take(3) {
         let icon_path = app.item_icons.get(&item.id).cloned();
         row = row.child(render_item_slot(item, icon_path));
@@ -300,22 +326,22 @@ fn render_item_slot(item: &BuildItemInfo, icon_path: Option<PathBuf>) -> Div {
 
     let icon = match icon_path {
         Some(path) => div()
-            .w(px(28.0))
-            .h(px(28.0))
+            .w(px(30.0))
+            .h(px(30.0))
             .rounded_md()
             .overflow_hidden()
             .border_1()
             .border_color(border)
             .child(
                 img(path)
-                    .w(px(28.0))
-                    .h(px(28.0))
+                    .w(px(30.0))
+                    .h(px(30.0))
                     .rounded_md()
                     .object_fit(ObjectFit::Cover),
             ),
         None => div()
-            .w(px(28.0))
-            .h(px(28.0))
+            .w(px(30.0))
+            .h(px(30.0))
             .rounded_md()
             .bg(theme::card_elevated_bg())
             .border_1()
@@ -330,7 +356,8 @@ fn render_item_slot(item: &BuildItemInfo, icon_path: Option<PathBuf>) -> Div {
     };
 
     div()
-        .flex_1()
+        .w(px(96.0))
+        .h(px(70.0))
         .p(px(4.0))
         .rounded_lg()
         .bg(bg)
@@ -340,7 +367,7 @@ fn render_item_slot(item: &BuildItemInfo, icon_path: Option<PathBuf>) -> Div {
         .flex_col()
         .items_center()
         .justify_center()
-        .gap(px(3.0))
+        .gap(px(4.0))
         .child(icon)
         .child(
             div()

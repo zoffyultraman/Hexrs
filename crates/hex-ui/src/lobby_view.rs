@@ -18,6 +18,7 @@ pub fn render_lobby_sidebar(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
     let lcu_connected = app.lcu_connected;
     let current_hero = app.current_hero_stats.as_ref();
     let active_hero_id = app.active_champ_select_hero_id;
+    let team_heroes = &app.team_hero_stats;
     let bench = &app.bench_highlights;
     let recs = &app.team_recs;
     let expanded_hero_id = app.expanded_hero_id;
@@ -52,6 +53,15 @@ pub fn render_lobby_sidebar(app: &HexOverlayApp, cx: &mut Context<HexOverlayApp>
                     selected_preview,
                     cx,
                 ))
+                .when(!team_heroes.is_empty(), |parent| {
+                    parent.child(render_team_heroes_section(
+                        team_heroes,
+                        active_hero_id,
+                        expanded_hero_id,
+                        selected_preview,
+                        cx,
+                    ))
+                })
                 .when(!bench.is_empty(), |parent| {
                     parent.child(render_bench_section(
                         bench,
@@ -334,6 +344,99 @@ fn render_active_hero_section(
         })
 }
 
+fn render_team_heroes_section(
+    team_heroes: &[HeroStats],
+    active_hero_id: Option<i32>,
+    expanded_hero_id: Option<i32>,
+    selected_preview: Option<&HeroPreview>,
+    cx: &mut Context<HexOverlayApp>,
+) -> Div {
+    let mut pills = div().flex().flex_wrap().gap_1();
+    for hero in team_heroes {
+        let hero_id = hero.hero_id;
+        let is_local = active_hero_id == Some(hero_id);
+        let is_expanded = expanded_hero_id == Some(hero_id);
+        pills = pills.child(
+            div()
+                .id(SharedString::from(format!("team-hero-{hero_id}")))
+                .cursor_pointer()
+                .px_2()
+                .py(px(4.0))
+                .rounded_md()
+                .bg(if is_local {
+                    theme::cyan_dim()
+                } else {
+                    theme::card_elevated_bg()
+                })
+                .border_1()
+                .border_color(if is_expanded || is_local {
+                    theme::border_cyan()
+                } else {
+                    theme::border_subtle()
+                })
+                .hover(|s| s.bg(theme::gold_dim()))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.toggle_hero_preview(hero_id, cx);
+                }))
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(tier_badge(hero.tier))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(hero.name_zh.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::cyan())
+                        .child(format!("{:.1}%", hero.win_rate)),
+                ),
+        );
+    }
+
+    let preview_for_team = selected_preview.filter(|p| {
+        expanded_hero_id == Some(p.hero_id)
+            && active_hero_id != Some(p.hero_id)
+            && team_heroes.iter().any(|h| h.hero_id == p.hero_id)
+    });
+
+    div()
+        .p_3()
+        .rounded_lg()
+        .bg(theme::card_bg())
+        .border_1()
+        .border_color(theme::border_subtle())
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::cyan())
+                        .child("我方阵容胜率"),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child("点击切换预览"),
+                ),
+        )
+        .child(pills)
+        .when_some(preview_for_team, |container, preview| {
+            container.child(render_hero_preview_drawer(preview))
+        })
+}
+
 fn render_bench_section(
     bench: &[BenchHighlight],
     expanded_hero_id: Option<i32>,
@@ -404,13 +507,13 @@ fn render_bench_section(
                         .text_xs()
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme::gold())
-                        .child("备选池高亮"),
+                        .child("备选池全部胜率"),
                 )
                 .child(
                     div()
                         .text_xs()
                         .text_color(theme::text_muted())
-                        .child("高胜优先抢选"),
+                        .child("按胜率排序"),
                 ),
         )
         .child(pills)
