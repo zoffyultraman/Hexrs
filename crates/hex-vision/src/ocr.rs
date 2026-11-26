@@ -1,5 +1,6 @@
 //! Windows native WinRT OCR (`Windows.Media.Ocr`) and augment title text matching.
 
+use hex_core::AugmentOfferLayout;
 use hex_data::AugmentNameEntry;
 
 const BAND_X_MIN: f32 = 0.02;
@@ -15,6 +16,13 @@ pub struct OcrLineHit {
     pub text: String,
     pub center_x_norm: f32,
     pub center_y_norm: f32,
+}
+
+/// Matched 3-slot augment offer IDs together with detected screen-space layout anchors.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OcrOfferMatch {
+    pub candidates: Vec<i32>,
+    pub layout: AugmentOfferLayout,
 }
 
 #[derive(Debug, Clone)]
@@ -69,11 +77,21 @@ impl AugmentTextMatcher {
     }
 
     /// Matches recognized OCR lines aligned on a horizontal card title row into `[left, mid, right]`.
+    pub fn match_ocr_lines_to_offer(&self, lines: &[OcrLineHit]) -> Option<Vec<i32>> {
+        self.match_ocr_lines_to_offer_with_layout(lines)
+            .map(|matched| matched.candidates)
+    }
+
+    /// Matches recognized OCR lines aligned on a horizontal card title row into `[left, mid, right]`
+    /// and computes normalized screen-space card anchor coordinates (`AugmentOfferLayout`).
     ///
     /// Works across both centered 16:9 and left-shifted 21:9/ultrawide layouts without hardcoded
-    /// column boundaries. Returns `Some([left, mid, right])` with `0` placeholders only when at
-    /// least 2 distinct horizontally separated cards align on the same title row.
-    pub fn match_ocr_lines_to_offer(&self, lines: &[OcrLineHit]) -> Option<Vec<i32>> {
+    /// column boundaries. Returns `Some(...)` with `0` placeholders only when at least 2 distinct
+    /// horizontally separated cards align on the same title row.
+    pub fn match_ocr_lines_to_offer_with_layout(
+        &self,
+        lines: &[OcrLineHit],
+    ) -> Option<OcrOfferMatch> {
         if self.entries.is_empty() || lines.is_empty() {
             return None;
         }
@@ -153,21 +171,43 @@ impl AugmentTextMatcher {
         winners.sort_by(|a, b| a.cx.total_cmp(&b.cx));
 
         if winners.len() >= 3 {
-            Some(vec![
-                winners[0].aug_id,
-                winners[1].aug_id,
-                winners[2].aug_id,
-            ])
+            let layout = AugmentOfferLayout {
+                slot_centers_x: [winners[0].cx, winners[1].cx, winners[2].cx],
+                title_y: (winners[0].cy + winners[1].cy + winners[2].cy) / 3.0,
+            };
+            Some(OcrOfferMatch {
+                candidates: vec![winners[0].aug_id, winners[1].aug_id, winners[2].aug_id],
+                layout,
+            })
         } else {
             let h0 = winners[0];
             let h1 = winners[1];
             let gap = h1.cx - h0.cx;
+            let title_y = (h0.cy + h1.cy) * 0.5;
             if gap > 0.36 {
-                Some(vec![h0.aug_id, 0, h1.aug_id])
+                Some(OcrOfferMatch {
+                    candidates: vec![h0.aug_id, 0, h1.aug_id],
+                    layout: AugmentOfferLayout {
+                        slot_centers_x: [h0.cx, (h0.cx + h1.cx) * 0.5, h1.cx],
+                        title_y,
+                    },
+                })
             } else if (h0.cx + h1.cx) * 0.5 < 0.48 {
-                Some(vec![h0.aug_id, h1.aug_id, 0])
+                Some(OcrOfferMatch {
+                    candidates: vec![h0.aug_id, h1.aug_id, 0],
+                    layout: AugmentOfferLayout {
+                        slot_centers_x: [h0.cx, h1.cx, (h1.cx + gap).min(0.95)],
+                        title_y,
+                    },
+                })
             } else {
-                Some(vec![0, h0.aug_id, h1.aug_id])
+                Some(OcrOfferMatch {
+                    candidates: vec![0, h0.aug_id, h1.aug_id],
+                    layout: AugmentOfferLayout {
+                        slot_centers_x: [(h0.cx - gap).max(0.05), h0.cx, h1.cx],
+                        title_y,
+                    },
+                })
             }
         }
     }
@@ -526,5 +566,55 @@ mod tests {
         ];
 
         assert_eq!(matcher.match_ocr_lines_to_offer(&hits), None);
+    }
+
+    #[test]
+    fn computes_layout_anchors_for_three_hit_and_partial_two_hit_offers() {
+        let matcher = AugmentTextMatcher::new(sample_entries());
+
+        let three_hits = vec![
+            OcrLineHit {
+                text: "急速之追求".to_owned(),
+                center_x_norm: 0.11,
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "杀戮时间到了".to_owned(),
+                center_x_norm: 0.36,
+                center_y_norm: 0.43,
+            },
+            OcrLineHit {
+                text: "拯救".to_owned(),
+                center_x_norm: 0.60,
+                center_y_norm: 0.42,
+            },
+        ];
+        let full_match = matcher
+            .match_ocr_lines_to_offer_with_layout(&three_hits)
+            .expect("3-card match should succeed");
+        assert_eq!(full_match.candidates, vec![101, 102, 103]);
+        assert!((full_match.layout.slot_centers_x[0] - 0.11).abs() < 1e-4);
+        assert!((full_match.layout.slot_centers_x[1] - 0.36).abs() < 1e-4);
+        assert!((full_match.layout.slot_centers_x[2] - 0.60).abs() < 1e-4);
+        assert!((full_match.layout.title_y - 0.42).abs() < 1e-4);
+
+        let two_hits_left = vec![
+            OcrLineHit {
+                text: "急速之追求".to_owned(),
+                center_x_norm: 0.12,
+                center_y_norm: 0.44,
+            },
+            OcrLineHit {
+                text: "杀戮时间到了".to_owned(),
+                center_x_norm: 0.36,
+                center_y_norm: 0.44,
+            },
+        ];
+        let left_pair = matcher
+            .match_ocr_lines_to_offer_with_layout(&two_hits_left)
+            .expect("left-pair match should extrapolate right center");
+        assert_eq!(left_pair.candidates, vec![101, 102, 0]);
+        assert!((left_pair.layout.slot_centers_x[2] - 0.60).abs() < 1e-4);
+        assert!((left_pair.layout.title_y - 0.44).abs() < 1e-4);
     }
 }

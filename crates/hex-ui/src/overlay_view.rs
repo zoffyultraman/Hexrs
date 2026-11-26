@@ -58,7 +58,12 @@ pub fn render_in_game_overlay(app: &HexOverlayApp) -> Div {
 }
 
 fn render_augment_offer_bar(app: &HexOverlayApp) -> Div {
-    let mut columns = div().size_full().flex().gap_2().text_color(theme::text_primary());
+    let mut columns = div()
+        .size_full()
+        .flex()
+        .flex_row()
+        .gap(px(app.augment_bar_gap_dip))
+        .text_color(theme::text_primary());
     for eval in app.offered_augments.iter().take(3) {
         columns = columns.child(render_augment_slot_card(eval));
     }
@@ -69,6 +74,7 @@ fn render_augment_slot_card(eval: &AugmentEvaluation) -> Div {
     if eval.augment_id <= 0 {
         return div()
             .flex_1()
+            .h_full()
             .p_2()
             .rounded_xl()
             .bg(theme::overlay_card_bg())
@@ -98,6 +104,7 @@ fn render_augment_slot_card(eval: &AugmentEvaluation) -> Div {
 
     div()
         .flex_1()
+        .h_full()
         .p_2()
         .rounded_xl()
         .bg(theme::overlay_card_bg())
@@ -182,13 +189,49 @@ fn render_augment_slot_card(eval: &AugmentEvaluation) -> Div {
             )
         })
         .when(eval.synergy_alert.is_none(), |card| {
-            card.child(
-                div()
-                    .text_xs()
-                    .text_color(theme::text_muted())
-                    .child(truncate_label(&eval.desc_zh, 24)),
-            )
+            let clean_desc = sanitize_augment_desc(&eval.desc_zh);
+            if clean_desc.is_empty() {
+                card
+            } else {
+                card.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_muted())
+                        .child(truncate_label(&clean_desc, 22)),
+                )
+            }
         })
+}
+
+fn sanitize_augment_desc(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            let mut tag = String::new();
+            for next in chars.by_ref() {
+                if next == '>' {
+                    break;
+                }
+                tag.push(next);
+            }
+            let lower = tag.trim().to_ascii_lowercase();
+            if lower.starts_with("br") {
+                out.push(' ');
+            }
+        } else if ch == '@' {
+            for next in chars.by_ref() {
+                if next == '@' {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn render_hero_header(

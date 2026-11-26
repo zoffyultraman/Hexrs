@@ -466,8 +466,8 @@ mod win_capture {
                 hits.and_then(|lines| {
                     let text_matcher = self.shared.text_matcher.read().ok()?;
                     text_matcher
-                        .match_ocr_lines_to_offer(&lines)
-                        .map(|candidates| (candidates, elapsed_ms))
+                        .match_ocr_lines_to_offer_with_layout(&lines)
+                        .map(|matched| (matched.candidates, elapsed_ms, Some(matched.layout)))
                 })
             } else {
                 let manifest = match self.shared.manifest.read() {
@@ -485,13 +485,15 @@ mod win_capture {
                         .load(Ordering::Acquire)
                         .min(FALLBACK_MAX_DISTANCE);
                     matcher.set_max_distance(strict_dist);
-                    matcher.match_offer(rgba, width, height, &preset.card_icons)
+                    matcher
+                        .match_offer(rgba, width, height, &preset.card_icons)
+                        .map(|(candidates, ms)| (candidates, ms, None))
                 } else {
                     None
                 }
             };
 
-            if let Some((candidates, capture_ms)) = match_result {
+            if let Some((candidates, capture_ms, layout)) = match_result {
                 self.consecutive_misses = 0;
                 self.active_offer = true;
                 self.shared.set_offer_active(true);
@@ -503,10 +505,11 @@ mod win_capture {
                     .unwrap_or(false);
 
                 if !is_duplicate {
-                    debug!(?candidates, capture_ms, "detected hextech augment offer");
+                    debug!(?candidates, capture_ms, ?layout, "detected hextech augment offer");
                     let _ = self.shared.event_tx.send(AppEvent::AugmentOfferDetected {
                         candidates: candidates.clone(),
                         capture_ms,
+                        layout,
                     });
                     self.last_emitted = Some((candidates, Instant::now()));
                 }

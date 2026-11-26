@@ -7,8 +7,8 @@ use std::sync::{Arc, RwLock};
 use crossbeam_channel::{unbounded, Receiver};
 use gpui::{div, prelude::*, px, rgba, Context, Div, FontWeight, Render, Rgba, Window};
 use hex_core::{
-    AppEvent, AppMode, ChampSelectState, CoreDiagnostics, CoreHandle, HeroTier, LiveGameState,
-    RoiManifest,
+    AppEvent, AppMode, AugmentOfferLayout, ChampSelectState, CoreDiagnostics, CoreHandle,
+    HeroTier, LiveGameState, RoiManifest,
 };
 use hex_data::{
     spawn_background_update, AugmentEvaluation, BenchHighlight, DynamicBuildPlan, EogReporter,
@@ -50,6 +50,8 @@ pub struct HexOverlayApp {
     pub selected_preview: Option<HeroPreview>,
     pub owned_augment_ids: Vec<i32>,
     pub offered_augments: Vec<AugmentEvaluation>,
+    pub offered_augment_layout: Option<AugmentOfferLayout>,
+    pub augment_bar_gap_dip: f32,
     pub last_offer_capture_ms: Option<u64>,
     pub dynamic_build: Option<DynamicBuildPlan>,
     pub active_hero_id: Option<i32>,
@@ -74,7 +76,13 @@ pub struct HexOverlayApp {
     vision: VisionController,
     tray: Option<TrayController>,
     last_lobby_sync: Option<(Option<WindowRectInfo>, bool)>,
-    last_overlay_sync: Option<(Option<WindowRectInfo>, OverlayCorner, bool, bool)>,
+    last_overlay_sync: Option<(
+        Option<WindowRectInfo>,
+        OverlayCorner,
+        bool,
+        bool,
+        Option<([i32; 3], i32)>,
+    )>,
     last_diagnostics_sync: bool,
     last_dormant_hidden: bool,
     auto_elevation_prompted: bool,
@@ -152,6 +160,8 @@ impl HexOverlayApp {
             selected_preview: None,
             owned_augment_ids: Vec::new(),
             offered_augments: Vec::new(),
+            offered_augment_layout: None,
+            augment_bar_gap_dip: 28.0,
             last_offer_capture_ms: None,
             dynamic_build: None,
             active_hero_id: None,
@@ -288,8 +298,7 @@ impl HexOverlayApp {
                     TrayAction::ToggleDiagnostics => {
                         if self.preview_mode.is_some() {
                             self.preview_mode = None;
-                            self.offered_augments.clear();
-                            self.last_offer_capture_ms = None;
+                            self.clear_offered_augment_state();
                             self.diagnostics_open = true;
                             if let Some(ref tray_ctrl) = self.tray {
                                 tray_ctrl.set_diagnostics_checked(true);
@@ -401,8 +410,7 @@ impl HexOverlayApp {
     /// Sets or exits UI preview mode from the diagnostics panel.
     pub fn set_preview_mode(&mut self, mode: Option<AppMode>, cx: &mut Context<Self>) {
         self.preview_mode = mode;
-        self.offered_augments.clear();
-        self.last_offer_capture_ms = None;
+        self.clear_offered_augment_state();
         if mode == Some(AppMode::InGameOverlay) && self.live_game.is_none() {
             self.populate_hero_hud_state(Some(PREVIEW_YASUO_HERO_ID), None, &[]);
         } else if mode.is_none() && self.mode != AppMode::InGameOverlay {
@@ -431,7 +439,7 @@ impl HexOverlayApp {
             .unwrap_or_default();
 
         if !sample_ids.is_empty() {
-            self.evaluate_detected_offer(&sample_ids, 1);
+            self.evaluate_detected_offer(&sample_ids, 1, None);
         }
         self.reset_window_sync_cache();
         cx.notify();
@@ -441,8 +449,7 @@ impl HexOverlayApp {
     pub fn close_diagnostics(&mut self, cx: &mut Context<Self>) {
         self.diagnostics_open = false;
         self.preview_mode = None;
-        self.offered_augments.clear();
-        self.last_offer_capture_ms = None;
+        self.clear_offered_augment_state();
         if let Some(ref tray_ctrl) = self.tray {
             tray_ctrl.set_diagnostics_checked(false);
         }
@@ -475,10 +482,15 @@ impl HexOverlayApp {
         self.last_dormant_hidden = false;
     }
 
+    fn clear_offered_augment_state(&mut self) {
+        self.offered_augments.clear();
+        self.offered_augment_layout = None;
+        self.last_offer_capture_ms = None;
+    }
+
     fn clear_in_game_hud_state(&mut self) {
         self.owned_augment_ids.clear();
-        self.offered_augments.clear();
-        self.last_offer_capture_ms = None;
+        self.clear_offered_augment_state();
         self.dynamic_build = None;
         self.active_hero_id = None;
         self.active_hero_alias = None;
@@ -553,15 +565,15 @@ impl HexOverlayApp {
             AppEvent::AugmentOfferDetected {
                 candidates,
                 capture_ms,
+                layout,
             } => {
-                debug!(?candidates, capture_ms, "augment offer detected by hex-vision");
-                self.evaluate_detected_offer(&candidates, capture_ms);
+                debug!(?candidates, capture_ms, ?layout, "augment offer detected by hex-vision");
+                self.evaluate_detected_offer(&candidates, capture_ms, layout);
             }
             AppEvent::AugmentOfferCleared => {
-                if !self.offered_augments.is_empty() {
+                if !self.offered_augments.is_empty() || self.offered_augment_layout.is_some() {
                     debug!("clearing augment offer strip");
-                    self.offered_augments.clear();
-                    self.last_offer_capture_ms = None;
+                    self.clear_offered_augment_state();
                     self.reset_window_sync_cache();
                 }
             }
@@ -579,7 +591,12 @@ impl HexOverlayApp {
         }
     }
 
-    fn evaluate_detected_offer(&mut self, candidates: &[i32], capture_ms: u64) {
+    fn evaluate_detected_offer(
+        &mut self,
+        candidates: &[i32],
+        capture_ms: u64,
+        layout: Option<AugmentOfferLayout>,
+    ) {
         let Some(meta) = self.meta.as_ref() else {
             return;
         };
@@ -608,6 +625,7 @@ impl HexOverlayApp {
 
         if matched_any {
             self.offered_augments = slots;
+            self.offered_augment_layout = layout;
             self.last_offer_capture_ms = Some(capture_ms);
             self.reset_window_sync_cache();
         }
@@ -841,14 +859,29 @@ impl HexOverlayApp {
                 };
                 let visible = is_preview || self.overlay_visible;
                 let has_augment_offer = !self.offered_augments.is_empty();
+                let offer_layout = has_augment_offer
+                    .then_some(self.offered_augment_layout)
+                    .flatten();
+                let quantized_layout = quantize_offer_layout(offer_layout);
+                if has_augment_offer {
+                    self.augment_bar_gap_dip =
+                        win32::compute_augment_bar_gap_dip(target_rect, offer_layout);
+                }
 
-                let state = (target_rect, self.overlay_corner, visible, has_augment_offer);
+                let state = (
+                    target_rect,
+                    self.overlay_corner,
+                    visible,
+                    has_augment_offer,
+                    quantized_layout,
+                );
                 if self.last_overlay_sync != Some(state) {
                     self.last_overlay_sync = Some(state);
                     let action = if has_augment_offer {
                         Win32WindowAction::InGameAugmentBar {
                             target_rect,
                             visible,
+                            layout: offer_layout,
                         }
                     } else {
                         Win32WindowAction::InGameOverlay {
@@ -873,6 +906,19 @@ impl HexOverlayApp {
             }
         }
     }
+}
+
+fn quantize_offer_layout(layout: Option<AugmentOfferLayout>) -> Option<([i32; 3], i32)> {
+    layout.map(|l| {
+        (
+            [
+                (l.slot_centers_x[0] * 100.0).round() as i32,
+                (l.slot_centers_x[1] * 100.0).round() as i32,
+                (l.slot_centers_x[2] * 100.0).round() as i32,
+            ],
+            (l.title_y * 100.0).round() as i32,
+        )
+    })
 }
 
 fn live_game_to_vision_ctx(live: &LiveGameState) -> VisionGameContext {
