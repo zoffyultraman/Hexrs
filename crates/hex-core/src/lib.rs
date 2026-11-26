@@ -9,8 +9,8 @@ pub mod state_machine;
 pub use lcu::{LcuClient, LcuWsEvent};
 pub use live::LiveClient;
 pub use models::{
-    AppEvent, AppMode, AspectRoiPreset, ChampSelectState, EndOfGameParticipant, EndOfGameStats,
-    HeroTier, LiveGameState, RoiManifest, RoiRect, TeamSlot,
+    AppEvent, AppMode, AspectRoiPreset, AugmentOfferLayout, ChampSelectState,
+    EndOfGameParticipant, EndOfGameStats, HeroTier, LiveGameState, RoiManifest, RoiRect, TeamSlot,
 };
 pub use process::{
     is_current_process_elevated, parse_raw_cmdline_credentials, LcuCredentials, ProcessMonitor,

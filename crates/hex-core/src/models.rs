@@ -236,6 +236,15 @@ impl Default for RoiManifest {
     }
 }
 
+/// Normalized screen-space anchor geometry of the 3 detected augment cards (`0.0..=1.0`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct AugmentOfferLayout {
+    /// Normalized `[left, mid, right]` card center X coordinates (`0.0..=1.0`).
+    pub slot_centers_x: [f32; 3],
+    /// Normalized Y coordinate of the card title row (`0.0..=1.0`).
+    pub title_y: f32,
+}
+
 /// Core events streamed from `hex-core` (and `hex-vision`) to the UI layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AppEvent {
@@ -246,6 +255,8 @@ pub enum AppEvent {
     AugmentOfferDetected {
         candidates: Vec<i32>,
         capture_ms: u64,
+        #[serde(default)]
+        layout: Option<AugmentOfferLayout>,
     },
     AugmentOfferCleared,
     LcuConnectionChanged(bool),
