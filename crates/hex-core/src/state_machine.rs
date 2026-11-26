@@ -1,4 +1,4 @@
-//! Background Tokio runtime & state machine coordinating process polling, LCU WS, and Live API.
+//! Background Tokio runtime & state machine coordinating process polling, LCU WS/REST, and Live API.
 
 use std::sync::{Arc, RwLock};
 use std::thread::{self, JoinHandle};
@@ -13,11 +13,25 @@ use tracing::{debug, info, warn};
 
 use crate::lcu::{LcuClient, LcuWsEvent};
 use crate::live::LiveClient;
-use crate::models::{AppEvent, AppMode, ChampSelectState};
+use crate::models::{AppEvent, AppMode, ChampSelectState, LiveGameState};
 use crate::process::{LcuCredentials, ProcessMonitor, ProcessSnapshot};
 
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(1500);
+const CHAMP_SELECT_REST_POLL_INTERVAL: Duration = Duration::from_millis(1500);
 const LIVE_API_POLL_INTERVAL: Duration = Duration::from_millis(2000);
+
+/// Diagnostic snapshot exposed via `CoreHandle::diagnostics()` for UI/tray inspection.
+#[derive(Debug, Clone, Default)]
+pub struct CoreDiagnostics {
+    pub mode: AppMode,
+    pub lcu_pid: Option<u32>,
+    pub lcu_port: Option<u16>,
+    pub lcu_connected_ws: bool,
+    pub in_champ_select: bool,
+    pub game_pid: Option<u32>,
+    pub game_running: bool,
+    pub live_api_active: bool,
+}
 
 #[derive(Debug, Default)]
 struct CoreSharedState {
@@ -25,6 +39,7 @@ struct CoreSharedState {
     snapshot: ProcessSnapshot,
     lcu_connected: bool,
     in_champ_select: bool,
+    live_api_active: bool,
 }
 
 /// Control handle for querying core state and cleanly shutting down the background service.
@@ -73,6 +88,23 @@ impl CoreHandle {
             .read()
             .map(|guard| guard.lcu_connected)
             .unwrap_or(false)
+    }
+
+    /// Returns full runtime diagnostics for debugging connection/mode state.
+    pub fn diagnostics(&self) -> CoreDiagnostics {
+        self.shared
+            .read()
+            .map(|guard| CoreDiagnostics {
+                mode: guard.mode,
+                lcu_pid: guard.snapshot.lcu_pid,
+                lcu_port: guard.snapshot.lcu.as_ref().map(|c| c.port),
+                lcu_connected_ws: guard.lcu_connected,
+                in_champ_select: guard.in_champ_select,
+                game_pid: guard.snapshot.game_pid,
+                game_running: guard.snapshot.game_running,
+                live_api_active: guard.live_api_active,
+            })
+            .unwrap_or_default()
     }
 
     /// Signals the background Tokio runtime to stop and joins its worker thread.
@@ -145,10 +177,13 @@ struct CoordinatorState {
     active_lcu: Option<LcuClient>,
     lcu_connected: bool,
     in_champ_select: bool,
+    live_api_active: bool,
     cached_game_mode: Option<String>,
     cached_queue_id: Option<i32>,
     last_champ_select: Option<ChampSelectState>,
     gameflow_fetch_in_flight: bool,
+    champ_poll_in_flight: bool,
+    live_poll_in_flight: bool,
     ws_shutdown_tx: Option<watch::Sender<bool>>,
     ws_task: Option<TokioJoinHandle<()>>,
 }
@@ -164,10 +199,13 @@ impl CoordinatorState {
             active_lcu: None,
             lcu_connected: false,
             in_champ_select: false,
+            live_api_active: false,
             cached_game_mode: None,
             cached_queue_id: None,
             last_champ_select: None,
             gameflow_fetch_in_flight: false,
+            champ_poll_in_flight: false,
+            live_poll_in_flight: false,
             ws_shutdown_tx: None,
             ws_task: None,
         }
@@ -184,7 +222,7 @@ impl CoordinatorState {
 
     fn sync_shared_and_mode(&mut self) {
         let next_mode = compute_mode(
-            self.snapshot.game_running,
+            self.snapshot.game_running || self.live_api_active,
             self.active_lcu.is_some(),
             self.in_champ_select,
         );
@@ -196,10 +234,17 @@ impl CoordinatorState {
             guard.snapshot = self.snapshot.clone();
             guard.lcu_connected = self.lcu_connected;
             guard.in_champ_select = self.in_champ_select;
+            guard.live_api_active = self.live_api_active;
         }
 
         if mode_changed {
-            info!(?next_mode, "overlay state machine mode transition");
+            info!(
+                ?next_mode,
+                game_running = self.snapshot.game_running,
+                live_api_active = self.live_api_active,
+                in_champ_select = self.in_champ_select,
+                "overlay state machine mode transition"
+            );
             let _ = self.event_tx.send(AppEvent::ModeChanged(next_mode));
         }
     }
@@ -221,6 +266,7 @@ impl CoordinatorState {
             self.cached_queue_id = None;
             self.last_champ_select = None;
             self.gameflow_fetch_in_flight = false;
+            self.champ_poll_in_flight = false;
             self.active_lcu = None;
             self.active_creds = self.snapshot.lcu.clone();
 
@@ -258,6 +304,24 @@ impl CoordinatorState {
         self.sync_shared_and_mode();
     }
 
+    fn normalize_champ_select(&mut self, mut state: ChampSelectState) -> ChampSelectState {
+        if state.game_mode.is_empty() {
+            if let Some(mode) = &self.cached_game_mode {
+                state.game_mode = mode.clone();
+            }
+        } else {
+            self.cached_game_mode = Some(state.game_mode.clone());
+        }
+
+        if state.queue_id.is_none() {
+            state.queue_id = self.cached_queue_id;
+        } else {
+            self.cached_queue_id = state.queue_id;
+        }
+
+        state
+    }
+
     fn handle_ws_event(
         &mut self,
         event: LcuWsEvent,
@@ -283,20 +347,9 @@ impl CoordinatorState {
                     let _ = self.event_tx.send(AppEvent::LcuConnectionChanged(false));
                 }
             }
-            LcuWsEvent::ChampSelectUpdated(mut state) => {
+            LcuWsEvent::ChampSelectUpdated(raw_state) => {
                 self.in_champ_select = true;
-                if state.game_mode.is_empty() {
-                    if let Some(mode) = &self.cached_game_mode {
-                        state.game_mode = mode.clone();
-                    }
-                } else {
-                    self.cached_game_mode = Some(state.game_mode.clone());
-                }
-                if state.queue_id.is_none() {
-                    state.queue_id = self.cached_queue_id;
-                } else {
-                    self.cached_queue_id = state.queue_id;
-                }
+                let state = self.normalize_champ_select(raw_state);
 
                 if state.game_mode.is_empty() && !self.gameflow_fetch_in_flight {
                     if let Some(client) = self.active_lcu.clone() {
@@ -329,6 +382,65 @@ impl CoordinatorState {
         }
 
         self.sync_shared_and_mode();
+    }
+
+    fn handle_champ_poll_result(
+        &mut self,
+        result: Result<Option<ChampSelectState>>,
+        ws_event_tx: &mpsc::UnboundedSender<LcuWsEvent>,
+        gameflow_tx: &mpsc::UnboundedSender<Option<(String, Option<i32>)>>,
+    ) {
+        self.champ_poll_in_flight = false;
+        match result {
+            Ok(Some(raw_session)) => {
+                let normalized = self.normalize_champ_select(raw_session);
+                if Some(&normalized) != self.last_champ_select.as_ref() {
+                    self.handle_ws_event(
+                        LcuWsEvent::ChampSelectUpdated(normalized),
+                        ws_event_tx,
+                        gameflow_tx,
+                    );
+                }
+            }
+            Ok(None) => {
+                if self.in_champ_select {
+                    self.handle_ws_event(LcuWsEvent::ChampSelectEnded, ws_event_tx, gameflow_tx);
+                }
+            }
+            Err(err) => {
+                debug!(error = %err, "LCU REST champ select poll fallback failed");
+            }
+        }
+    }
+
+    fn handle_live_poll_result(&mut self, result: Result<Option<LiveGameState>>) {
+        self.live_poll_in_flight = false;
+        match result {
+            Ok(Some(live_state)) => {
+                if !self.live_api_active {
+                    info!(
+                        game_mode = %live_state.game_mode,
+                        "Live Client Data API (127.0.0.1:2999) detected active match"
+                    );
+                    self.live_api_active = true;
+                }
+                let _ = self.event_tx.send(AppEvent::LiveGameUpdated(live_state));
+                self.sync_shared_and_mode();
+            }
+            Ok(None) => {
+                if self.live_api_active {
+                    self.live_api_active = false;
+                    self.sync_shared_and_mode();
+                }
+            }
+            Err(err) => {
+                debug!(error = %err, "Live API poll failed");
+                if self.live_api_active {
+                    self.live_api_active = false;
+                    self.sync_shared_and_mode();
+                }
+            }
+        }
     }
 
     fn handle_gameflow_resolved(&mut self, resolved: Option<(String, Option<i32>)>) {
@@ -390,8 +502,8 @@ async fn emit_initial_champ_select(
     }
 }
 
-fn compute_mode(game_running: bool, lcu_active: bool, in_champ_select: bool) -> AppMode {
-    if game_running {
+fn compute_mode(in_game: bool, lcu_active: bool, in_champ_select: bool) -> AppMode {
+    if in_game {
         AppMode::InGameOverlay
     } else if lcu_active && in_champ_select {
         AppMode::LobbyDocked
@@ -416,6 +528,11 @@ async fn run_coordinator(
 
     let (ws_event_tx, mut ws_event_rx) = mpsc::unbounded_channel::<LcuWsEvent>();
     let (gameflow_tx, mut gameflow_rx) = mpsc::unbounded_channel::<Option<(String, Option<i32>)>>();
+    let (champ_poll_tx, mut champ_poll_rx) =
+        mpsc::unbounded_channel::<Result<Option<ChampSelectState>>>();
+    let (live_poll_tx, mut live_poll_rx) =
+        mpsc::unbounded_channel::<Result<Option<LiveGameState>>>();
+
     let mut state = CoordinatorState::new(event_tx.clone(), shared);
 
     // Perform an immediate initial process poll so startup doesn't wait 1.5s.
@@ -425,6 +542,10 @@ async fn run_coordinator(
     let mut process_tick = interval(PROCESS_POLL_INTERVAL);
     process_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     process_tick.tick().await;
+
+    let mut champ_poll_tick = interval(CHAMP_SELECT_REST_POLL_INTERVAL);
+    champ_poll_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    champ_poll_tick.tick().await;
 
     let mut live_tick = interval(LIVE_API_POLL_INTERVAL);
     live_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -441,23 +562,41 @@ async fn run_coordinator(
                 let snapshot = monitor.poll();
                 state.handle_process_snapshot(snapshot, &ws_event_tx);
             }
+            _ = champ_poll_tick.tick() => {
+                if !state.snapshot.game_running
+                    && !state.live_api_active
+                    && !state.champ_poll_in_flight
+                {
+                    if let Some(client) = state.active_lcu.clone() {
+                        state.champ_poll_in_flight = true;
+                        let tx = champ_poll_tx.clone();
+                        tokio::spawn(async move {
+                            let res = client.get_champ_select_session().await;
+                            let _ = tx.send(res);
+                        });
+                    }
+                }
+            }
             _ = live_tick.tick() => {
-                if state.snapshot.game_running {
-                    if let Some(client) = &live_client {
-                        match client.fetch_all_game_data().await {
-                            Ok(Some(live_state)) => {
-                                let _ = state.event_tx.send(AppEvent::LiveGameUpdated(live_state));
-                            }
-                            Ok(None) => {}
-                            Err(err) => {
-                                debug!(error = %err, "Live API poll failed");
-                            }
-                        }
+                if !state.live_poll_in_flight {
+                    if let Some(client) = live_client.clone() {
+                        state.live_poll_in_flight = true;
+                        let tx = live_poll_tx.clone();
+                        tokio::spawn(async move {
+                            let res = client.fetch_all_game_data().await;
+                            let _ = tx.send(res);
+                        });
                     }
                 }
             }
             Some(ws_event) = ws_event_rx.recv() => {
                 state.handle_ws_event(ws_event, &ws_event_tx, &gameflow_tx);
+            }
+            Some(champ_res) = champ_poll_rx.recv() => {
+                state.handle_champ_poll_result(champ_res, &ws_event_tx, &gameflow_tx);
+            }
+            Some(live_res) = live_poll_rx.recv() => {
+                state.handle_live_poll_result(live_res);
             }
             Some(resolved) = gameflow_rx.recv() => {
                 state.handle_gameflow_resolved(resolved);

@@ -13,7 +13,7 @@ pub use models::{
     HeroTier, LiveGameState, RoiManifest, RoiRect, TeamSlot,
 };
 pub use process::{LcuCredentials, ProcessMonitor, ProcessSnapshot};
-pub use state_machine::{spawn_core_service, CoreHandle, CoreRuntime};
+pub use state_machine::{spawn_core_service, CoreDiagnostics, CoreHandle, CoreRuntime};
 
 /// Crate identifier helper verifying workspace linkage.
 pub fn crate_name() -> &'static str {
