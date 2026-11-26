@@ -777,10 +777,10 @@ impl HexrsApp {
     /// Builds a 5-slot `2+3` preview snapshot for demonstrating rating titles, streaks, and premade MVPs.
     pub fn preview_team_ratings(&self) -> TeamRatingsSnapshot {
         let specs = [
-            (0, SummonerRatingStatus::Ready, 88, 5, Some(1), true),
-            (1, SummonerRatingStatus::Ready, 76, 0, Some(1), false),
-            (2, SummonerRatingStatus::Ready, 64, -3, Some(2), false),
-            (3, SummonerRatingStatus::Ready, 83, 0, Some(2), true),
+            (0, SummonerRatingStatus::Ready, 86, 5, Some(1), true),
+            (1, SummonerRatingStatus::Ready, 74, 0, Some(1), false),
+            (2, SummonerRatingStatus::Ready, 62, -3, Some(2), false),
+            (3, SummonerRatingStatus::Ready, 51, 0, Some(2), true),
             (4, SummonerRatingStatus::Private, 0, 0, Some(2), false),
         ];
 

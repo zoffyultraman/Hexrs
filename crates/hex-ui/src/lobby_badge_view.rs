@@ -301,12 +301,12 @@ impl Render for TeamBadgeOverlay {
 
                 line2 = match sum.status {
                     SummonerRatingStatus::Ready => {
-                        let (bg, score_color, title_color) = if sum.tier_index <= 2 {
-                            (rgba(0x0F172A73), rgb(0xF0C46C), rgb(0xE2E8F0))
-                        } else if sum.tier_index == 3 {
-                            (rgba(0x0F172A73), rgb(0xCBD5E1), rgb(0x94A3B8))
-                        } else {
-                            (rgba(0xEF444424), rgb(0xFDA4AF), rgb(0xF87171))
+                        let (bg, score_color, title_color) = match sum.tier_index {
+                            0 => (rgba(0x0F172A73), rgb(0xFDE047), rgb(0xF0C46C)),
+                            1 => (rgba(0x0F172A73), rgb(0xF0C46C), rgb(0xE2E8F0)),
+                            2 => (rgba(0x0F172A73), rgb(0x4ADE80), rgb(0xE2E8F0)),
+                            3 => (rgba(0x0F172A73), rgb(0xCBD5E1), rgb(0x94A3B8)),
+                            _ => (rgba(0xEF444424), rgb(0xFDA4AF), rgb(0xF87171)),
                         };
                         let compact_title: String = sum.title.chars().take(4).collect();
                         line2
