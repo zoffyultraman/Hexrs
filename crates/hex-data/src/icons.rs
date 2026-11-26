@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fs::{self, File};
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -71,57 +72,25 @@ impl IconCache {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
-        let state = Arc::clone(&self.state);
-        let http = self.http.clone();
-        let on_ready_tx = self.on_ready_tx.clone();
 
-        if thread::Builder::new()
-            .name("hex-icon-fetch".to_owned())
-            .spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    finish_fetch(&state, &key, false);
-                    return;
-                };
+        self.spawn_icon_fetch(key, target, move |http, state| async move {
+            let cdragon_url = format!(
+                "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/champion-icons/{hero_id}.png"
+            );
+            let mut png_bytes = fetch_png_bytes(&http, &cdragon_url).await;
 
-                let ok = rt.block_on(async {
-                    let cdragon_url = format!(
-                        "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/champion-icons/{hero_id}.png"
+            if png_bytes.is_none() {
+                if let Some(alias_name) = alias_owned.as_deref() {
+                    let ver = resolve_dd_version(&http, &state).await;
+                    let dd_url = format!(
+                        "https://ddragon.leagueoflegends.com/cdn/{ver}/img/champion/{alias_name}.png"
                     );
-                    let mut png_bytes = fetch_png_bytes(&http, &cdragon_url).await;
-
-                    if png_bytes.is_none() {
-                        if let Some(alias_name) = alias_owned.as_deref() {
-                            let ver = resolve_dd_version(&http, &state).await;
-                            let dd_url = format!(
-                                "https://ddragon.leagueoflegends.com/cdn/{ver}/img/champion/{alias_name}.png"
-                            );
-                            png_bytes = fetch_png_bytes(&http, &dd_url).await;
-                        }
-                    }
-
-                    if let Some(bytes) = png_bytes {
-                        match write_atomic_png(&target, &bytes) {
-                            Ok(()) => return true,
-                            Err(err) => {
-                                debug!(error = %err, path = %target.display(), "failed to write cached champion icon");
-                            }
-                        }
-                    }
-                    false
-                });
-
-                finish_fetch(&state, &key, ok);
-                if ok {
-                    let _ = on_ready_tx.send(());
+                    png_bytes = fetch_png_bytes(&http, &dd_url).await;
                 }
-            })
-            .is_err()
-        {
-            finish_fetch(&self.state, &key, false);
-        }
+            }
+
+            png_bytes
+        });
 
         None
     }
@@ -142,6 +111,22 @@ impl IconCache {
             return None;
         }
 
+        self.spawn_icon_fetch(key, target, move |http, state| async move {
+            let ver = resolve_dd_version(&http, &state).await;
+            let dd_url =
+                format!("https://ddragon.leagueoflegends.com/cdn/{ver}/img/item/{item_id}.png");
+            fetch_png_bytes(&http, &dd_url).await
+        });
+
+        None
+    }
+
+    fn spawn_icon_fetch<F, Fut>(&self, key: String, target: PathBuf, fetcher: F)
+    where
+        F: FnOnce(reqwest::Client, Arc<Mutex<IconCacheState>>) -> Fut + Send + 'static,
+        Fut: Future<Output = Option<Vec<u8>>>,
+    {
+        let key_for_thread = key.clone();
         let state = Arc::clone(&self.state);
         let http = self.http.clone();
         let on_ready_tx = self.on_ready_tx.clone();
@@ -153,27 +138,23 @@ impl IconCache {
                     .enable_all()
                     .build()
                 else {
-                    finish_fetch(&state, &key, false);
+                    finish_fetch(&state, &key_for_thread, false);
                     return;
                 };
 
                 let ok = rt.block_on(async {
-                    let ver = resolve_dd_version(&http, &state).await;
-                    let dd_url = format!(
-                        "https://ddragon.leagueoflegends.com/cdn/{ver}/img/item/{item_id}.png"
-                    );
-                    if let Some(bytes) = fetch_png_bytes(&http, &dd_url).await {
+                    if let Some(bytes) = fetcher(http, Arc::clone(&state)).await {
                         match write_atomic_png(&target, &bytes) {
                             Ok(()) => return true,
                             Err(err) => {
-                                debug!(error = %err, path = %target.display(), "failed to write cached item icon");
+                                debug!(error = %err, path = %target.display(), "failed to write cached icon");
                             }
                         }
                     }
                     false
                 });
 
-                finish_fetch(&state, &key, ok);
+                finish_fetch(&state, &key_for_thread, ok);
                 if ok {
                     let _ = on_ready_tx.send(());
                 }
@@ -182,8 +163,6 @@ impl IconCache {
         {
             finish_fetch(&self.state, &key, false);
         }
-
-        None
     }
 
     fn try_mark_in_flight(&self, key: &str) -> bool {
