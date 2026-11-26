@@ -314,7 +314,7 @@ impl CoordinatorState {
                         let fetch_client = client.clone();
                         let tx_init = ws_event_tx.clone();
                         tokio::spawn(async move {
-                            emit_initial_champ_select(&fetch_client, &tx_init).await;
+                            emit_initial_champ_select(&fetch_client, &tx_init, true).await;
                         });
 
                         self.active_lcu = Some(client);
@@ -372,7 +372,7 @@ impl CoordinatorState {
                 if let Some(client) = self.active_lcu.clone() {
                     let tx = ws_event_tx.clone();
                     tokio::spawn(async move {
-                        emit_initial_champ_select(&client, &tx).await;
+                        emit_initial_champ_select(&client, &tx, true).await;
                     });
                 }
             }
@@ -389,11 +389,13 @@ impl CoordinatorState {
                 debug!(%phase, "LCU gameflow phase changed");
                 if phase == "ChampSelect" {
                     self.in_champ_select = true;
-                    if let Some(client) = self.active_lcu.clone() {
-                        let tx = ws_event_tx.clone();
-                        tokio::spawn(async move {
-                            emit_initial_champ_select(&client, &tx).await;
-                        });
+                    if self.last_champ_select.is_none() {
+                        if let Some(client) = self.active_lcu.clone() {
+                            let tx = ws_event_tx.clone();
+                            tokio::spawn(async move {
+                                emit_initial_champ_select(&client, &tx, false).await;
+                            });
+                        }
                     }
                 } else if matches!(
                     phase.as_str(),
@@ -456,13 +458,15 @@ impl CoordinatorState {
                 }
             }
             Ok(None) => {
-                self.last_lcu_error = None;
+                let cleared_err = self.last_lcu_error.take().is_some();
+                let mut synced = false;
                 match outcome.phase.as_deref() {
                     Some("ChampSelect") => {
                         if !self.in_champ_select {
                             info!("LCU gameflow-phase=ChampSelect detected via REST fallback");
                             self.in_champ_select = true;
                             self.sync_shared_and_mode();
+                            synced = true;
                         }
                     }
                     Some("None" | "Lobby" | "Matchmaking" | "EndOfGame") => {
@@ -472,6 +476,7 @@ impl CoordinatorState {
                                 ws_event_tx,
                                 gameflow_tx,
                             );
+                            synced = true;
                         }
                     }
                     _ => {
@@ -481,8 +486,12 @@ impl CoordinatorState {
                                 ws_event_tx,
                                 gameflow_tx,
                             );
+                            synced = true;
                         }
                     }
+                }
+                if cleared_err && !synced {
+                    self.sync_shared_and_mode();
                 }
             }
             Err(err) => {
@@ -554,6 +563,7 @@ impl CoordinatorState {
 async fn emit_initial_champ_select(
     client: &LcuClient,
     ws_event_tx: &mpsc::UnboundedSender<LcuWsEvent>,
+    allow_phase_fallback: bool,
 ) {
     let mode_and_queue = match client.get_current_game_mode_and_queue().await {
         Ok(info) => info,
@@ -576,9 +586,11 @@ async fn emit_initial_champ_select(
             let _ = ws_event_tx.send(LcuWsEvent::ChampSelectUpdated(session));
         }
         Ok(None) => {
-            if let Ok(Some(phase)) = client.get_gameflow_phase().await {
-                if phase == "ChampSelect" {
-                    let _ = ws_event_tx.send(LcuWsEvent::GameflowPhase(phase));
+            if allow_phase_fallback {
+                if let Ok(Some(phase)) = client.get_gameflow_phase().await {
+                    if phase == "ChampSelect" {
+                        let _ = ws_event_tx.send(LcuWsEvent::GameflowPhase(phase));
+                    }
                 }
             }
         }
