@@ -801,7 +801,7 @@ impl HexOverlayApp {
             .and_then(|id| self.icon_cache.champion_icon(id, self.active_hero_alias.as_deref()));
 
         if let Some(plan) = self.dynamic_build.as_ref() {
-            for item in plan.items.iter().take(3) {
+            for item in plan.items.iter().take(6) {
                 if let Some(path) = self.icon_cache.item_icon(item.id) {
                     self.item_icons.insert(item.id, path);
                 }

@@ -672,7 +672,7 @@ fn render_recommendations_section(
                     div()
                         .text_xs()
                         .text_color(theme::text_muted())
-                        .child("点击查看核心海克斯与三件套"),
+                        .child("点击查看核心海克斯与六神装"),
                 ),
         )
         .child(list)
@@ -826,7 +826,7 @@ fn render_hero_preview_drawer(preview: &HeroPreview) -> Div {
                 .text_xs()
                 .font_weight(FontWeight::BOLD)
                 .text_color(theme::gold())
-                .child("核心三件套"),
+                .child("推荐六神装"),
         )
         .child(build_list)
 }

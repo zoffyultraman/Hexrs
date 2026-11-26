@@ -1,4 +1,4 @@
-//! In-game overlay views: compact `324x136` corner HUD and non-blocking 3-column S+~D augment strip.
+//! In-game overlay views: compact `324x204` corner HUD and non-blocking 3-column S+~D augment strip.
 
 use std::path::PathBuf;
 
@@ -54,7 +54,7 @@ pub fn render_in_game_overlay(app: &HexOverlayApp) -> Div {
             hero_name,
             playstyle_tag,
         ))
-        .child(render_item_row(app, app.dynamic_build.as_ref()))
+        .child(render_item_grid(app, app.dynamic_build.as_ref()))
 }
 
 fn render_augment_offer_bar(app: &HexOverlayApp) -> Div {
@@ -312,11 +312,11 @@ fn render_hero_header(
         })
 }
 
-fn render_item_row(app: &HexOverlayApp, build: Option<&DynamicBuildPlan>) -> Div {
+fn render_item_grid(app: &HexOverlayApp, build: Option<&DynamicBuildPlan>) -> Div {
     let Some(plan) = build else {
         return div()
             .w_full()
-            .h(px(74.0))
+            .h(px(142.0))
             .flex()
             .items_center()
             .justify_center()
@@ -328,7 +328,7 @@ fn render_item_row(app: &HexOverlayApp, build: Option<&DynamicBuildPlan>) -> Div
     if plan.items.is_empty() {
         return div()
             .w_full()
-            .h(px(74.0))
+            .h(px(142.0))
             .flex()
             .items_center()
             .justify_center()
@@ -337,19 +337,35 @@ fn render_item_row(app: &HexOverlayApp, build: Option<&DynamicBuildPlan>) -> Div
             .child("暂无推荐装备");
     }
 
-    let mut row = div()
+    let items: Vec<&BuildItemInfo> = plan.items.iter().take(6).collect();
+    let mut grid = div()
         .w_full()
-        .h(px(74.0))
+        .h(px(142.0))
         .flex()
-        .flex_row()
-        .items_center()
+        .flex_col()
         .justify_between()
         .gap(px(6.0));
-    for item in plan.items.iter().take(3) {
-        let icon_path = app.item_icons.get(&item.id).cloned();
-        row = row.child(render_item_slot(item, icon_path));
+
+    for chunk in items.chunks(3) {
+        let mut row = div()
+            .w_full()
+            .h(px(68.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(6.0));
+        for item in chunk {
+            let icon_path = app.item_icons.get(&item.id).cloned();
+            row = row.child(render_item_slot(item, icon_path));
+        }
+        for _ in chunk.len()..3 {
+            row = row.child(div().w(px(96.0)).h(px(66.0)));
+        }
+        grid = grid.child(row);
     }
-    row
+
+    grid
 }
 
 fn render_item_slot(item: &BuildItemInfo, icon_path: Option<PathBuf>) -> Div {
@@ -400,7 +416,7 @@ fn render_item_slot(item: &BuildItemInfo, icon_path: Option<PathBuf>) -> Div {
 
     div()
         .w(px(96.0))
-        .h(px(70.0))
+        .h(px(66.0))
         .p(px(4.0))
         .rounded_lg()
         .bg(bg)

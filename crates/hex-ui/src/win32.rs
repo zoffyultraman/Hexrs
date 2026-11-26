@@ -12,7 +12,7 @@ pub const DIAGNOSTICS_HEIGHT_DIP: f32 = 560.0;
 
 /// Compact in-game corner HUD dimensions in DIPs.
 pub const IN_GAME_HUD_WIDTH_DIP: f32 = 324.0;
-pub const IN_GAME_HUD_HEIGHT_DIP: f32 = 136.0;
+pub const IN_GAME_HUD_HEIGHT_DIP: f32 = 204.0;
 
 const CARD_WIDTH_RATIO: f32 = 0.86;
 const CARD_GAP_RATIO: f32 = 0.14;
@@ -599,7 +599,7 @@ mod imp {
         }
     }
 
-    /// Anchors the compact `324x136` click-through corner HUD onto `League of Legends.exe`.
+    /// Anchors the compact `324x204` click-through corner HUD onto `League of Legends.exe`.
     fn set_in_game_overlay_mode_hwnd(
         hwnd: HWND,
         target_rect: Option<WindowRectInfo>,
