@@ -16,7 +16,11 @@ pub const IN_GAME_HUD_HEIGHT_DIP: f32 = 204.0;
 
 const CARD_WIDTH_RATIO: f32 = 0.86;
 const CARD_GAP_RATIO: f32 = 0.14;
-const AUGMENT_BAR_HEIGHT_DIP: f32 = 94.0;
+pub const AUGMENT_BAR_TOP_PAD_DIP: f32 = 12.0;
+pub const AUGMENT_BAR_CARD_HEIGHT_DIP: f32 = 46.0;
+const AUGMENT_BAR_BOTTOM_PAD_DIP: f32 = 2.0;
+const AUGMENT_BAR_HEIGHT_DIP: f32 =
+    AUGMENT_BAR_TOP_PAD_DIP + AUGMENT_BAR_CARD_HEIGHT_DIP + AUGMENT_BAR_BOTTOM_PAD_DIP;
 
 /// Pixel-calibrated Champ Select bench strip geometry relative to `LeagueClientUx.exe`.
 pub const BENCH_SLOT0_CX: f32 = 0.2906;
@@ -178,7 +182,7 @@ fn compute_augment_bar_geometry(
                     as i32;
                 let card_top_px =
                     target.top + (l.title_y * target_h as f32 - spacing_px * 0.69).round() as i32;
-                let v_gap_px = (8.0 * scale).round() as i32;
+                let v_gap_px = (4.0 * scale).round() as i32;
                 let y = (card_top_px - height_px - v_gap_px).clamp(
                     target.top + (4.0 * scale).round() as i32,
                     (target.bottom - height_px).max(target.top),

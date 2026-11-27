@@ -2,11 +2,16 @@
 
 use std::path::PathBuf;
 
-use gpui::{div, img, prelude::*, px, rgb, rgba, Div, FontWeight, ObjectFit};
+use gpui::{
+    div, img, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba, Div, FontWeight,
+    ObjectFit, Rgba,
+};
+use hex_core::HeroTier;
 use hex_data::{AugmentEvaluation, BuildItemInfo, DynamicBuildPlan};
 
 use crate::app::HexrsApp;
-use crate::theme::{self, tier_badge};
+use crate::theme;
+use crate::win32::{AUGMENT_BAR_CARD_HEIGHT_DIP, AUGMENT_BAR_TOP_PAD_DIP};
 
 /// Renders either the 3-card augment strip (when an offer is active) or the compact corner equipment HUD.
 pub fn render_in_game_overlay(app: &HexrsApp) -> Div {
@@ -57,239 +62,273 @@ pub fn render_in_game_overlay(app: &HexrsApp) -> Div {
         .child(render_item_grid(app, app.dynamic_build.as_ref()))
 }
 
+fn pick_recommended_augment_index(evals: &[AugmentEvaluation]) -> Option<usize> {
+    let (best_idx, best_eval) = evals
+        .iter()
+        .take(4)
+        .enumerate()
+        .filter(|(_, eval)| eval.augment_id > 0 && !eval.low_sample)
+        .min_by(|(idx_a, a), (idx_b, b)| {
+            a.tier
+                .sort_rank()
+                .cmp(&b.tier.sort_rank())
+                .then_with(|| b.win_rate.total_cmp(&a.win_rate))
+                .then_with(|| b.pick_rate.total_cmp(&a.pick_rate))
+                .then_with(|| idx_a.cmp(idx_b))
+        })?;
+
+    if best_eval.win_rate < 48.5 || matches!(best_eval.tier, HeroTier::C | HeroTier::D) {
+        return None;
+    }
+
+    Some(best_idx)
+}
+
+fn augment_tier_badge_colors(tier: HeroTier) -> (Rgba, Rgba, Rgba) {
+    match tier {
+        HeroTier::SPlus => (rgb(0xFDE047), rgba(0xEAB30838), rgba(0xFACC15A6)),
+        HeroTier::S => (rgb(0x2DD4BF), rgba(0x2DD4BF2E), rgba(0x2DD4BF8C)),
+        HeroTier::A | HeroTier::B => (rgb(0x4ADE80), rgba(0x4ADE8024), rgba(0x4ADE8066)),
+        HeroTier::C | HeroTier::D => (rgb(0x94A3B8), rgba(0x94A3B81F), rgba(0x94A3B84D)),
+    }
+}
+
+fn augment_win_rate_colors(win_rate: f64) -> (Rgba, Rgba) {
+    if win_rate >= 52.0 {
+        (rgb(0x2DD4BF), rgba(0x2DD4BFBF))
+    } else if win_rate >= 50.0 {
+        (rgb(0xF1F5F9), rgba(0xF1F5F9BF))
+    } else if win_rate >= 48.0 {
+        (rgb(0x94A3B8), rgba(0x94A3B8BF))
+    } else {
+        (rgb(0xF87171), rgba(0xF87171BF))
+    }
+}
+
 fn render_augment_offer_bar(app: &HexrsApp) -> Div {
+    let recommended_idx = pick_recommended_augment_index(&app.offered_augments);
     let mut columns = div()
         .size_full()
+        .pt(px(AUGMENT_BAR_TOP_PAD_DIP))
+        .pb(px(2.0))
+        .bg(rgba(0x00000000))
         .flex()
         .flex_row()
         .gap(px(app.augment_bar_gap_dip))
         .text_color(theme::text_primary());
-    for eval in app.offered_augments.iter().take(4) {
-        columns = columns.child(render_augment_slot_card(eval));
+    for (idx, eval) in app.offered_augments.iter().take(4).enumerate() {
+        columns = columns.child(render_augment_slot_card(eval, recommended_idx == Some(idx)));
     }
     columns
 }
 
-fn render_augment_slot_card(eval: &AugmentEvaluation) -> Div {
+fn render_augment_slot_card(eval: &AugmentEvaluation, is_recommended: bool) -> Div {
     if eval.augment_id <= 0 {
         return div()
             .flex_1()
             .min_w_0()
-            .h_full()
-            .overflow_hidden()
-            .p_2()
-            .rounded_xl()
-            .bg(theme::overlay_card_bg())
-            .border_1()
-            .border_color(theme::border_subtle())
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
-            .gap_1()
+            .h(px(AUGMENT_BAR_CARD_HEIGHT_DIP))
+            .relative()
             .child(
                 div()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::text_muted())
-                    .child("海克斯未识别"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme::text_muted())
-                    .child("OCR 未匹配，请按实际效果选择"),
+                    .size_full()
+                    .overflow_hidden()
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(4.0))
+                    .bg(rgba(0x0B121EDB))
+                    .border_1()
+                    .border_color(rgba(0x47556973))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(rgb(0x94A3B8))
+                            .child("海克斯未识别 · 请按效果选择"),
+                    ),
             );
     }
 
     if eval.low_sample {
-        let sub = if eval.sample_size > 0 {
-            format!("该英雄仅 {} 场统计", eval.sample_size)
-        } else {
-            "数据库暂无该英雄此海克斯样本".to_owned()
-        };
-
         return div()
             .flex_1()
             .min_w_0()
-            .h_full()
-            .overflow_hidden()
-            .p_2()
-            .rounded_xl()
-            .bg(theme::overlay_card_bg())
-            .border_1()
-            .border_color(rgba(0xF59E0B99))
-            .flex()
-            .flex_col()
-            .justify_between()
-            .gap_1()
+            .h(px(AUGMENT_BAR_CARD_HEIGHT_DIP))
+            .relative()
             .child(
                 div()
+                    .size_full()
+                    .overflow_hidden()
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(4.0))
+                    .bg(rgba(0x1C1014E0))
+                    .border_1()
+                    .border_color(rgba(0xEF444459))
                     .flex()
+                    .flex_row()
                     .items_center()
-                    .justify_between()
-                    .gap_1()
+                    .justify_center()
+                    .gap(px(6.0))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .px(px(5.0))
-                                    .py(px(1.0))
-                                    .rounded(px(3.0))
-                                    .bg(rgba(0xF59E0B2E))
-                                    .border_1()
-                                    .border_color(rgba(0xF59E0B99))
-                                    .text_xs()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(rgb(0xFBBF24))
-                                    .child("低样本"),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme::text_primary())
-                                    .child(truncate_label(&eval.name_zh, 8)),
-                            ),
+                            .text_size(px(13.5))
+                            .text_color(rgb(0xF87171))
+                            .child("⚠"),
                     )
                     .child(
                         div()
-                            .px(px(5.0))
-                            .py(px(1.0))
-                            .rounded_md()
-                            .bg(theme::card_bg())
-                            .border_1()
-                            .border_color(theme::border_subtle())
-                            .text_xs()
-                            .text_color(theme::gold())
-                            .child(eval.rarity.clone()),
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(0xFCA5A5))
+                            .child("数据过少 · 建议刷新"),
                     ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0xFBBF24))
-                    .child("样本量过低，建议刷新"),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme::text_muted())
-                    .child(sub),
             );
     }
 
-    let has_synergy = eval.synergy_alert.is_some();
+    let (tier_text, tier_bg, tier_border) = augment_tier_badge_colors(eval.tier);
+    let (wr_color, wr_suffix_color) = augment_win_rate_colors(eval.win_rate);
+
+    let inner_base = div()
+        .size_full()
+        .overflow_hidden()
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded(px(4.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(6.0));
+
+    let inner = if is_recommended {
+        let rec_border = if eval.tier == HeroTier::S {
+            rgb(0x2DD4BF)
+        } else if eval.tier == HeroTier::SPlus {
+            rgb(0xEAB308)
+        } else {
+            rgb(0xF0C46C)
+        };
+        inner_base
+            .bg(linear_gradient(
+                180.0,
+                linear_color_stop(rgba(0x242A36F0), 0.0),
+                linear_color_stop(rgba(0x0D192BF0), 1.0),
+            ))
+            .border_2()
+            .border_color(rec_border)
+    } else {
+        inner_base
+            .bg(rgba(0x0B121EDB))
+            .border_1()
+            .border_color(rgba(0x47556973))
+    }
+    .child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .min_w_0()
+            .child(
+                div()
+                    .min_w(px(30.0))
+                    .h(px(30.0))
+                    .px(px(4.0))
+                    .rounded(px(3.0))
+                    .bg(tier_bg)
+                    .border_1()
+                    .border_color(tier_border)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(18.0))
+                    .font_weight(FontWeight::EXTRA_BOLD)
+                    .text_color(tier_text)
+                    .child(eval.tier.label()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_end()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .text_size(px(17.5))
+                            .font_weight(FontWeight::BOLD)
+                            .font_family("Consolas")
+                            .text_color(wr_color)
+                            .child(format!("{:.1}%", eval.win_rate)),
+                    )
+                    .child(
+                        div()
+                            .pb(px(1.5))
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(wr_suffix_color)
+                            .child("胜率"),
+                    ),
+            ),
+    )
+    .child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(3.0))
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(rgb(0x94A3B8))
+                    .child("选取"),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .font_weight(FontWeight::MEDIUM)
+                    .font_family("Consolas")
+                    .text_color(rgb(0x94A3B8))
+                    .child(format!("{:.1}%", eval.pick_rate)),
+            ),
+    );
 
     div()
         .flex_1()
         .min_w_0()
-        .h_full()
-        .overflow_hidden()
-        .p_2()
-        .rounded_xl()
-        .bg(theme::overlay_card_bg())
-        .border_1()
-        .border_color(if has_synergy {
-            theme::synergy_gold_border()
-        } else {
-            theme::border_gold()
-        })
-        .flex()
-        .flex_col()
-        .justify_between()
-        .gap_1()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_1()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .child(tier_badge(eval.tier))
-                        .child(
-                            div()
-                                .text_sm()
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(theme::text_primary())
-                                .child(truncate_label(&eval.name_zh, 9)),
-                        ),
-                )
-                .child(
-                    div()
-                        .px(px(5.0))
-                        .py(px(1.0))
-                        .rounded_md()
-                        .bg(theme::card_bg())
-                        .border_1()
-                        .border_color(theme::border_subtle())
-                        .text_xs()
-                        .text_color(theme::gold())
-                        .child(eval.rarity.clone()),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme::cyan())
-                        .child(format!("胜率 {:.1}%", eval.win_rate)),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::text_muted())
-                        .child(format!("选取 {:.1}%", eval.pick_rate)),
-                ),
-        )
-        .when_some(eval.synergy_alert.as_ref(), |card, alert| {
-            card.child(
+        .h(px(AUGMENT_BAR_CARD_HEIGHT_DIP))
+        .relative()
+        .child(inner)
+        .when(is_recommended, |slot| {
+            slot.child(
                 div()
-                    .px(px(5.0))
-                    .py(px(2.0))
-                    .rounded_md()
-                    .bg(theme::synergy_gold_bg())
-                    .border_1()
-                    .border_color(theme::synergy_gold_border())
-                    .text_xs()
+                    .absolute()
+                    .top(px(-9.0))
+                    .right(px(8.0))
+                    .h(px(18.0))
+                    .px(px(7.0))
+                    .rounded_full()
+                    .bg(linear_gradient(
+                        90.0,
+                        linear_color_stop(rgb(0xF0C46C), 0.0),
+                        linear_color_stop(rgb(0xD97706), 1.0),
+                    ))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(10.5))
                     .font_weight(FontWeight::BOLD)
-                    .text_color(theme::synergy_gold_text())
-                    .child(format!(
-                        "{} · 与【{}】Lift {:.2}",
-                        alert.badge, alert.partner_name_zh, alert.lift_score
-                    )),
+                    .text_color(rgb(0x0F172A))
+                    .child("★ 推荐"),
             )
-        })
-        .when(eval.synergy_alert.is_none(), |card| {
-            let clean_desc = sanitize_augment_desc(&eval.desc_zh);
-            if clean_desc.is_empty() {
-                card
-            } else {
-                card.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::text_muted())
-                        .child(truncate_label(&clean_desc, 22)),
-                )
-            }
         })
 }
 
+#[allow(dead_code)]
 fn sanitize_augment_desc(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
@@ -566,7 +605,30 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_augment_desc;
+    use super::{pick_recommended_augment_index, sanitize_augment_desc};
+    use hex_core::HeroTier;
+    use hex_data::AugmentEvaluation;
+
+    fn make_eval(
+        augment_id: i32,
+        tier: HeroTier,
+        win_rate: f64,
+        pick_rate: f64,
+        low_sample: bool,
+    ) -> AugmentEvaluation {
+        AugmentEvaluation {
+            augment_id,
+            name_zh: format!("aug_{augment_id}"),
+            rarity: "黄金".to_owned(),
+            desc_zh: String::new(),
+            tier,
+            win_rate,
+            pick_rate,
+            sample_size: if low_sample { 12 } else { 200 },
+            low_sample,
+            synergy_alert: None,
+        }
+    }
 
     #[test]
     fn sanitizes_cdragon_mustache_inline_icons_and_html_tokens() {
@@ -584,5 +646,43 @@ mod tests {
             ),
             "获得%暴击几率。 50%有效"
         );
+    }
+
+    #[test]
+    fn pick_recommended_augment_respects_tier_winrate_and_filters() {
+        // 1. Picks highest tier (S > A > B), breaking same-tier ties by highest win_rate.
+        let tier_and_tie = vec![
+            make_eval(1, HeroTier::A, 56.0, 20.0, false),
+            make_eval(2, HeroTier::S, 51.2, 12.0, false),
+            make_eval(3, HeroTier::S, 54.0, 10.0, false),
+        ];
+        assert_eq!(pick_recommended_augment_index(&tier_and_tie), Some(2));
+
+        // 2. Ignores low_sample = true and augment_id <= 0 even if their win_rate/tier is high.
+        let filtered = vec![
+            make_eval(0, HeroTier::SPlus, 60.0, 30.0, false),
+            make_eval(10, HeroTier::SPlus, 59.0, 25.0, true),
+            make_eval(11, HeroTier::A, 50.5, 14.0, false),
+        ];
+        assert_eq!(pick_recommended_augment_index(&filtered), Some(2));
+
+        // 3. Returns None when best card has win_rate < 48.5 OR all valid are C/D OR all low_sample.
+        let low_wr = vec![
+            make_eval(20, HeroTier::B, 48.4, 15.0, false),
+            make_eval(21, HeroTier::C, 53.0, 12.0, false),
+        ];
+        assert_eq!(pick_recommended_augment_index(&low_wr), None);
+
+        let only_cd = vec![
+            make_eval(30, HeroTier::C, 55.0, 18.0, false),
+            make_eval(31, HeroTier::D, 52.0, 10.0, false),
+        ];
+        assert_eq!(pick_recommended_augment_index(&only_cd), None);
+
+        let all_low_sample = vec![
+            make_eval(40, HeroTier::SPlus, 58.0, 20.0, true),
+            make_eval(41, HeroTier::S, 54.0, 15.0, true),
+        ];
+        assert_eq!(pick_recommended_augment_index(&all_low_sample), None);
     }
 }
