@@ -14,8 +14,8 @@ pub const DIAGNOSTICS_HEIGHT_DIP: f32 = 560.0;
 pub const IN_GAME_HUD_WIDTH_DIP: f32 = 324.0;
 pub const IN_GAME_HUD_HEIGHT_DIP: f32 = 204.0;
 
-const CARD_WIDTH_RATIO: f32 = 0.86;
-const CARD_GAP_RATIO: f32 = 0.14;
+const CARD_WIDTH_RATIO: f32 = 0.78;
+const CARD_GAP_RATIO: f32 = 0.22;
 pub const AUGMENT_BAR_TOP_PAD_DIP: f32 = 12.0;
 pub const AUGMENT_BAR_CARD_HEIGHT_DIP: f32 = 46.0;
 const AUGMENT_BAR_BOTTOM_PAD_DIP: f32 = 2.0;
@@ -181,7 +181,7 @@ fn compute_augment_bar_geometry(
                     .clamp(min_w.min(target_w) as f32, target_w as f32)
                     as i32;
                 let card_top_px =
-                    target.top + (l.title_y * target_h as f32 - spacing_px * 0.69).round() as i32;
+                    target.top + (l.title_y * target_h as f32 - spacing_px * 0.66).round() as i32;
                 let v_gap_px = (4.0 * scale).round() as i32;
                 let y = (card_top_px - height_px - v_gap_px).clamp(
                     target.top + (4.0 * scale).round() as i32,

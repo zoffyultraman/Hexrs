@@ -84,24 +84,24 @@ fn pick_recommended_augment_index(evals: &[AugmentEvaluation]) -> Option<usize> 
     Some(best_idx)
 }
 
-fn augment_tier_badge_colors(tier: HeroTier) -> (Rgba, Rgba, Rgba) {
+fn augment_tier_text_color(tier: HeroTier) -> Rgba {
     match tier {
-        HeroTier::SPlus => (rgb(0xFDE047), rgba(0xEAB30838), rgba(0xFACC15A6)),
-        HeroTier::S => (rgb(0x2DD4BF), rgba(0x2DD4BF2E), rgba(0x2DD4BF8C)),
-        HeroTier::A | HeroTier::B => (rgb(0x4ADE80), rgba(0x4ADE8024), rgba(0x4ADE8066)),
-        HeroTier::C | HeroTier::D => (rgb(0x94A3B8), rgba(0x94A3B81F), rgba(0x94A3B84D)),
+        HeroTier::SPlus => rgb(0xFDE047),
+        HeroTier::S => rgb(0xF3D078),
+        HeroTier::A | HeroTier::B => rgb(0x4ADE80),
+        HeroTier::C | HeroTier::D => rgb(0x94A3B8),
     }
 }
 
 fn augment_win_rate_colors(win_rate: f64) -> (Rgba, Rgba) {
     if win_rate >= 52.0 {
-        (rgb(0x2DD4BF), rgba(0x2DD4BFBF))
+        (rgb(0x52E5D8), rgba(0x52E5D8E0))
     } else if win_rate >= 50.0 {
-        (rgb(0xF1F5F9), rgba(0xF1F5F9BF))
+        (rgb(0xF1F5F9), rgba(0xF1F5F9CC))
     } else if win_rate >= 48.0 {
-        (rgb(0x94A3B8), rgba(0x94A3B8BF))
+        (rgb(0x94A3B8), rgba(0x94A3B8CC))
     } else {
-        (rgb(0xF87171), rgba(0xF87171BF))
+        (rgb(0xC9767D), rgba(0xC9767DCC))
     }
 }
 
@@ -135,10 +135,10 @@ fn render_augment_slot_card(eval: &AugmentEvaluation, is_recommended: bool) -> D
                     .overflow_hidden()
                     .px(px(10.0))
                     .py(px(6.0))
-                    .rounded(px(4.0))
-                    .bg(rgba(0x0B121EDB))
+                    .rounded(px(6.0))
+                    .bg(rgba(0x101828EB))
                     .border_1()
-                    .border_color(rgba(0x47556973))
+                    .border_color(rgba(0x64748B73))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -164,138 +164,196 @@ fn render_augment_slot_card(eval: &AugmentEvaluation, is_recommended: bool) -> D
                     .overflow_hidden()
                     .px(px(10.0))
                     .py(px(6.0))
-                    .rounded(px(4.0))
-                    .bg(rgba(0x1C1014E0))
+                    .rounded(px(6.0))
+                    .bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(rgba(0x2C131AE8), 0.0),
+                        linear_color_stop(rgba(0x1B0D12EE), 1.0),
+                    ))
                     .border_1()
-                    .border_color(rgba(0xEF444459))
+                    .border_color(rgba(0xC25A6599))
                     .flex()
                     .flex_row()
                     .items_center()
                     .justify_center()
-                    .gap(px(6.0))
+                    .gap(px(8.0))
                     .child(
                         div()
-                            .text_size(px(13.5))
-                            .text_color(rgb(0xF87171))
+                            .text_size(px(15.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(rgb(0xC95B63))
                             .child("⚠"),
                     )
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(px(14.5))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(0xFCA5A5))
+                            .text_color(rgb(0xD4747A))
                             .child("数据过少 · 建议刷新"),
                     ),
             );
     }
 
-    let (tier_text, tier_bg, tier_border) = augment_tier_badge_colors(eval.tier);
+    let tier_text_color = augment_tier_text_color(eval.tier);
     let (wr_color, wr_suffix_color) = augment_win_rate_colors(eval.win_rate);
 
-    let inner_base = div()
+    let tier_block = div()
+        .w(px(46.0))
+        .h_full()
+        .bg(if is_recommended {
+            linear_gradient(
+                180.0,
+                linear_color_stop(rgba(0x2D2412F5), 0.0),
+                linear_color_stop(rgba(0x1B160CF7), 1.0),
+            )
+        } else {
+            linear_gradient(
+                180.0,
+                linear_color_stop(rgba(0x233044EC), 0.0),
+                linear_color_stop(rgba(0x192334F0), 1.0),
+            )
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(21.0))
+        .font_weight(FontWeight::EXTRA_BOLD)
+        .text_color(tier_text_color)
+        .child(eval.tier.label());
+
+    let divider = if is_recommended {
+        div().w(px(1.5)).h_full().bg(rgba(0xE8C66DE6))
+    } else {
+        div().w(px(1.0)).h_full().bg(rgba(0x64748B66))
+    };
+
+    let content_row = div()
+        .relative()
         .size_full()
-        .overflow_hidden()
-        .px(px(10.0))
-        .py(px(6.0))
-        .rounded(px(4.0))
+        .px(px(12.0))
         .flex()
         .flex_row()
         .items_center()
         .justify_between()
-        .gap(px(6.0));
+        .gap(px(6.0))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_end()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .text_size(px(if is_recommended { 18.5 } else { 18.0 }))
+                        .font_weight(FontWeight::BOLD)
+                        .font_family("Consolas")
+                        .text_color(wr_color)
+                        .child(format!("{:.1}%", eval.win_rate)),
+                )
+                .child(
+                    div()
+                        .pb(px(1.5))
+                        .text_size(px(if is_recommended { 13.0 } else { 12.5 }))
+                        .font_weight(if is_recommended {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        })
+                        .text_color(wr_suffix_color)
+                        .child("胜率"),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(3.0))
+                .when(is_recommended, |pick| pick.pt(px(5.0)))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(if is_recommended {
+                            rgb(0xB8C7D9)
+                        } else {
+                            rgb(0x8896AA)
+                        })
+                        .child("选取"),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .font_family("Consolas")
+                        .text_color(if is_recommended {
+                            rgb(0xCBD5E1)
+                        } else {
+                            rgb(0x94A3B8)
+                        })
+                        .child(format!("{:.1}%", eval.pick_rate)),
+                ),
+        );
 
-    let inner = if is_recommended {
-        let rec_border = if eval.tier == HeroTier::S {
-            rgb(0x2DD4BF)
-        } else if eval.tier == HeroTier::SPlus {
-            rgb(0xEAB308)
-        } else {
-            rgb(0xF0C46C)
-        };
-        inner_base
+    let data_body = if is_recommended {
+        div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .relative()
             .bg(linear_gradient(
                 180.0,
-                linear_color_stop(rgba(0x242A36F0), 0.0),
-                linear_color_stop(rgba(0x0D192BF0), 1.0),
+                linear_color_stop(rgba(0x0E1F33F2), 0.0),
+                linear_color_stop(rgba(0x103546F7), 1.0),
             ))
-            .border_2()
-            .border_color(rec_border)
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .top(px(0.0))
+                    .h(px(1.0))
+                    .bg(rgba(0x38E2D440)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .bottom(px(0.0))
+                    .h(px(2.5))
+                    .bg(rgba(0x38E2D499)),
+            )
+            .child(content_row)
     } else {
-        inner_base
-            .bg(rgba(0x0B121EDB))
-            .border_1()
-            .border_color(rgba(0x47556973))
-    }
-    .child(
         div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(10.0))
+            .flex_1()
             .min_w_0()
-            .child(
-                div()
-                    .min_w(px(30.0))
-                    .h(px(30.0))
-                    .px(px(4.0))
-                    .rounded(px(3.0))
-                    .bg(tier_bg)
-                    .border_1()
-                    .border_color(tier_border)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(18.0))
-                    .font_weight(FontWeight::EXTRA_BOLD)
-                    .text_color(tier_text)
-                    .child(eval.tier.label()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_end()
-                    .gap(px(3.0))
-                    .child(
-                        div()
-                            .text_size(px(17.5))
-                            .font_weight(FontWeight::BOLD)
-                            .font_family("Consolas")
-                            .text_color(wr_color)
-                            .child(format!("{:.1}%", eval.win_rate)),
-                    )
-                    .child(
-                        div()
-                            .pb(px(1.5))
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(wr_suffix_color)
-                            .child("胜率"),
-                    ),
-            ),
-    )
-    .child(
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(3.0))
-            .child(
-                div()
-                    .text_size(px(11.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(0x94A3B8))
-                    .child("选取"),
-            )
-            .child(
-                div()
-                    .text_size(px(11.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .font_family("Consolas")
-                    .text_color(rgb(0x94A3B8))
-                    .child(format!("{:.1}%", eval.pick_rate)),
-            ),
-    );
+            .h_full()
+            .relative()
+            .bg(linear_gradient(
+                180.0,
+                linear_color_stop(rgba(0x131D2EEB), 0.0),
+                linear_color_stop(rgba(0x0D1422F0), 1.0),
+            ))
+            .child(content_row)
+    };
+
+    let inner = div()
+        .size_full()
+        .overflow_hidden()
+        .rounded(px(6.0))
+        .flex()
+        .flex_row()
+        .when(is_recommended, |bar| {
+            bar.border_2().border_color(rgb(0xE8C66D))
+        })
+        .when(!is_recommended, |bar| {
+            bar.border_1().border_color(rgba(0x64748B80))
+        })
+        .child(tier_block)
+        .child(divider)
+        .child(data_body);
 
     div()
         .flex_1()
@@ -308,21 +366,23 @@ fn render_augment_slot_card(eval: &AugmentEvaluation, is_recommended: bool) -> D
                 div()
                     .absolute()
                     .top(px(-9.0))
-                    .right(px(8.0))
+                    .right(px(6.0))
                     .h(px(18.0))
-                    .px(px(7.0))
-                    .rounded_full()
+                    .px(px(7.5))
+                    .rounded(px(4.0))
                     .bg(linear_gradient(
                         90.0,
-                        linear_color_stop(rgb(0xF0C46C), 0.0),
-                        linear_color_stop(rgb(0xD97706), 1.0),
+                        linear_color_stop(rgb(0xF8E3A3), 0.0),
+                        linear_color_stop(rgb(0xD9A74A), 1.0),
                     ))
+                    .border_1()
+                    .border_color(rgba(0xFFF3C4CC))
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_size(px(10.5))
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0x0F172A))
+                    .text_color(rgb(0x1C1406))
                     .child("★ 推荐"),
             )
         })
