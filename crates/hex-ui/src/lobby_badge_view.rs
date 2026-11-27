@@ -82,7 +82,7 @@ impl Render for BenchBadgeOverlay {
         let w = self.state.client_width_dip;
         let h = self.state.client_height_dip;
         let raw_slot_w = w * BENCH_SLOT_WIDTH_FRAC;
-        let slot_w = raw_slot_w.clamp(40.0, 140.0);
+        let slot_w = raw_slot_w.clamp(34.0, 140.0);
         let slot_h = (h * BENCH_SLOT_HEIGHT_FRAC).clamp(18.0, 40.0);
         let bench_font_px = (slot_w * 0.140).clamp(8.5, 11.2);
 
