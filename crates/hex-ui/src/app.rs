@@ -1357,6 +1357,8 @@ fn placeholder_augment_eval() -> AugmentEvaluation {
         tier: HeroTier::B,
         win_rate: 50.0,
         pick_rate: 0.0,
+        sample_size: 0,
+        low_sample: false,
         synergy_alert: None,
     }
 }

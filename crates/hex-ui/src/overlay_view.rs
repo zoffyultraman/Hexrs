@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use gpui::{div, img, prelude::*, px, rgba, Div, FontWeight, ObjectFit};
+use gpui::{div, img, prelude::*, px, rgb, rgba, Div, FontWeight, ObjectFit};
 use hex_data::{AugmentEvaluation, BuildItemInfo, DynamicBuildPlan};
 
 use crate::app::HexrsApp;
@@ -92,13 +92,96 @@ fn render_augment_slot_card(eval: &AugmentEvaluation) -> Div {
                     .text_xs()
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text_muted())
-                    .child("未匹配卡槽"),
+                    .child("海克斯未识别"),
             )
             .child(
                 div()
                     .text_xs()
                     .text_color(theme::text_muted())
-                    .child("请按实际效果选择"),
+                    .child("OCR 未匹配，请按实际效果选择"),
+            );
+    }
+
+    if eval.low_sample {
+        let sub = if eval.sample_size > 0 {
+            format!("该英雄仅 {} 场统计", eval.sample_size)
+        } else {
+            "数据库暂无该英雄此海克斯样本".to_owned()
+        };
+
+        return div()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .overflow_hidden()
+            .p_2()
+            .rounded_xl()
+            .bg(theme::overlay_card_bg())
+            .border_1()
+            .border_color(rgba(0xF59E0B99))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .px(px(5.0))
+                                    .py(px(1.0))
+                                    .rounded(px(3.0))
+                                    .bg(rgba(0xF59E0B2E))
+                                    .border_1()
+                                    .border_color(rgba(0xF59E0B99))
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(0xFBBF24))
+                                    .child("低样本"),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(theme::text_primary())
+                                    .child(truncate_label(&eval.name_zh, 8)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(5.0))
+                            .py(px(1.0))
+                            .rounded_md()
+                            .bg(theme::card_bg())
+                            .border_1()
+                            .border_color(theme::border_subtle())
+                            .text_xs()
+                            .text_color(theme::gold())
+                            .child(eval.rarity.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(0xFBBF24))
+                    .child("样本量过低，建议刷新"),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme::text_muted())
+                    .child(sub),
             );
     }
 

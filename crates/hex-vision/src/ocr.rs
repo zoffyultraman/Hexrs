@@ -64,7 +64,7 @@ impl AugmentTextMatcher {
                 }
                 let norm_name = normalize_ocr_text(&entry.name_zh);
                 let char_count = norm_name.chars().count();
-                if char_count < 2 {
+                if char_count == 0 || (char_count == 1 && norm_name.is_ascii()) {
                     return None;
                 }
                 Some(NormalizedAugmentEntry {
@@ -96,17 +96,19 @@ impl AugmentTextMatcher {
             return None;
         }
 
-        let mut matched = Vec::new();
-        for hit in lines {
-            if !(BAND_X_MIN..=BAND_X_MAX).contains(&hit.center_x_norm)
-                || !(BAND_Y_MIN..=BAND_Y_MAX).contains(&hit.center_y_norm)
-            {
-                continue;
-            }
+        let in_band: Vec<&OcrLineHit> = lines
+            .iter()
+            .filter(|hit| {
+                (BAND_X_MIN..=BAND_X_MAX).contains(&hit.center_x_norm)
+                    && (BAND_Y_MIN..=BAND_Y_MAX).contains(&hit.center_y_norm)
+            })
+            .collect();
 
+        let mut matched = Vec::new();
+        for &hit in &in_band {
             let hit_norm = normalize_ocr_text(&hit.text);
             let hit_len = hit_norm.chars().count();
-            if hit_len < 2 {
+            if hit_len == 0 || (hit_len == 1 && hit_norm.is_ascii()) {
                 continue;
             }
 
@@ -117,6 +119,35 @@ impl AugmentTextMatcher {
                     cx: hit.center_x_norm,
                     cy: hit.center_y_norm,
                 });
+            }
+        }
+
+        // Synthesize 2-line wrapped augment titles (e.g., "升级：" + "米凯尔的祝福").
+        for &a in &in_band {
+            for &b in &in_band {
+                let dy = b.center_y_norm - a.center_y_norm;
+                if !(0.005..=0.055).contains(&dy) {
+                    continue;
+                }
+                if (a.center_x_norm - b.center_x_norm).abs() > 0.06 {
+                    continue;
+                }
+
+                let merged_raw = format!("{}{}", a.text, b.text);
+                let merged_norm = normalize_ocr_text(&merged_raw);
+                let merged_len = merged_norm.chars().count();
+                if !(4..=16).contains(&merged_len) {
+                    continue;
+                }
+
+                if let Some((aug_id, score)) = self.score_line(&merged_norm, merged_len) {
+                    matched.push(MatchedHit {
+                        aug_id,
+                        score,
+                        cx: (a.center_x_norm + b.center_x_norm) * 0.5,
+                        cy: (a.center_y_norm + b.center_y_norm) * 0.5,
+                    });
+                }
             }
         }
 
@@ -257,12 +288,25 @@ impl AugmentTextMatcher {
 }
 
 fn score_pair(hit_norm: &str, hit_len: usize, entry_norm: &str, entry_len: usize) -> i32 {
+    if entry_len == 1 {
+        return if hit_norm == entry_norm { 960 } else { 0 };
+    }
+
     if hit_norm == entry_norm {
         return 1000 + entry_len as i32 * 5;
     }
 
-    // Strict guard for 2-char augment names ("拯救", "灵巧") so they never false-match substrings.
-    if entry_len <= 2 {
+    // Strict guard for 2-char augment names ("拯救", "灵巧") with 1 stray ASCII glyph tolerance.
+    if entry_len == 2 {
+        if hit_len == 3 && hit_norm.contains(entry_norm) {
+            let leftover = hit_norm.replacen(entry_norm, "", 1);
+            let mut chars = leftover.chars();
+            if let (Some(ch), None) = (chars.next(), chars.next()) {
+                if ch.is_ascii_alphanumeric() {
+                    return 760;
+                }
+            }
+        }
         return 0;
     }
 
@@ -729,5 +773,137 @@ mod tests {
             .expect("4-card missing slot 2 should interpolate");
         assert_eq!(m2.candidates, vec![101, 102, 0, 104]);
         assert!((m2.layout.slot_centers_x[2] - 0.62).abs() < 1e-4);
+    }
+
+    #[test]
+    fn matches_single_char_bang_noisy_two_char_and_two_line_wrapped_titles() {
+        let mut entries = sample_entries();
+        entries.push(AugmentNameEntry {
+            augment_id: 2111,
+            name_zh: "邦！".to_owned(),
+            rarity: "黄金".to_owned(),
+        });
+        entries.push(AugmentNameEntry {
+            augment_id: 2112,
+            name_zh: "升级：米凯尔的祝福".to_owned(),
+            rarity: "黄金".to_owned(),
+        });
+        let matcher = AugmentTextMatcher::new(entries);
+
+        // (a) 1-char "邦！" matches in a 3-card row, and does not false-match standalone or noisy text.
+        let bang_row = vec![
+            OcrLineHit {
+                text: "邦！".to_owned(),
+                center_x_norm: 0.32,
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "急速之追求".to_owned(),
+                center_x_norm: 0.50,
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "杀戮时间到了".to_owned(),
+                center_x_norm: 0.68,
+                center_y_norm: 0.41,
+            },
+        ];
+        assert_eq!(
+            matcher.match_ocr_lines_to_offer(&bang_row),
+            Some(vec![2111, 101, 102])
+        );
+        let bang_standalone_or_noise = vec![
+            OcrLineHit {
+                text: "邦！".to_owned(),
+                center_x_norm: 0.32,
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "邦1".to_owned(),
+                center_x_norm: 0.50,
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "邦一下".to_owned(),
+                center_x_norm: 0.68,
+                center_y_norm: 0.41,
+            },
+        ];
+        assert_eq!(
+            matcher.match_ocr_lines_to_offer(&bang_standalone_or_noise),
+            None
+        );
+
+        // (b) Noisy 2-char "l灵巧" / "灵巧1" match "灵巧", while CJK substrings remain rejected.
+        let noisy_two_char_hits = vec![
+            OcrLineHit {
+                text: "l灵巧".to_owned(),
+                center_x_norm: 0.32,
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "1拯救".to_owned(),
+                center_x_norm: 0.50,
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "拯救一下".to_owned(),
+                center_x_norm: 0.68,
+                center_y_norm: 0.41,
+            },
+        ];
+        assert_eq!(
+            matcher.match_ocr_lines_to_offer(&noisy_two_char_hits),
+            Some(vec![104, 103, 0])
+        );
+        let noisy_two_char_tail = vec![
+            OcrLineHit {
+                text: "灵巧1".to_owned(),
+                center_x_norm: 0.32,
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "急速之追求".to_owned(),
+                center_x_norm: 0.50,
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "灵巧走位".to_owned(),
+                center_x_norm: 0.68,
+                center_y_norm: 0.41,
+            },
+        ];
+        assert_eq!(
+            matcher.match_ocr_lines_to_offer(&noisy_two_char_tail),
+            Some(vec![104, 101, 0])
+        );
+
+        // (c) 2-line wrapped "升级：" + "米凯尔的祝福" merges cleanly.
+        let wrapped_hits = vec![
+            OcrLineHit {
+                text: "急速之追求".to_owned(),
+                center_x_norm: 0.32,
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "升级：".to_owned(),
+                center_x_norm: 0.50,
+                center_y_norm: 0.395,
+            },
+            OcrLineHit {
+                text: "米凯尔的祝福".to_owned(),
+                center_x_norm: 0.505,
+                center_y_norm: 0.425,
+            },
+            OcrLineHit {
+                text: "拯救".to_owned(),
+                center_x_norm: 0.68,
+                center_y_norm: 0.41,
+            },
+        ];
+        assert_eq!(
+            matcher.match_ocr_lines_to_offer(&wrapped_hits),
+            Some(vec![101, 2112, 103])
+        );
     }
 }
