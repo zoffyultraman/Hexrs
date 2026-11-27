@@ -29,8 +29,8 @@ pub const BENCH_STRIP_LEFT_FRAC: f32 = BENCH_SLOT0_CX - BENCH_SLOT_WIDTH_FRAC * 
 pub const PICK_CARD_WIDTH_FRAC: f32 = 0.1401;
 pub const PICK_CARD_GAP_FRAC: f32 = 0.0283;
 pub const PICK_CARD_PITCH_FRAC: f32 = PICK_CARD_WIDTH_FRAC + PICK_CARD_GAP_FRAC;
-pub const PICK_CARD_STRIP_Y_FRAC: f32 = 0.6660;
-pub const PICK_CARD_BADGE_HEIGHT_FRAC: f32 = 0.0360;
+pub const PICK_CARD_STRIP_Y_FRAC: f32 = 0.6740;
+pub const PICK_CARD_BADGE_HEIGHT_FRAC: f32 = 0.0340;
 
 /// Pixel-calibrated Champ Select allied team badge strip right-edge anchor relative to `LeagueClientUx.exe`.
 pub const TEAM_STRIP_RIGHT_FRAC: f32 = 0.2580;
@@ -248,11 +248,11 @@ mod imp {
 
     use super::{
         compute_augment_bar_geometry, AugmentOfferLayout, OverlayCorner, Win32WindowAction,
-        Win32WindowCommand, WindowRectInfo, BENCH_SLOT_PITCH_FRAC, BENCH_SLOT_WIDTH_FRAC,
-        BENCH_STRIP_LEFT_FRAC, DIAGNOSTICS_HEIGHT_DIP, DIAGNOSTICS_WIDTH_DIP,
-        IN_GAME_HUD_HEIGHT_DIP, IN_GAME_HUD_WIDTH_DIP, PICK_CARD_BADGE_HEIGHT_FRAC,
-        PICK_CARD_GAP_FRAC, PICK_CARD_STRIP_Y_FRAC, PICK_CARD_WIDTH_FRAC, SIDEBAR_WIDTH_DIP,
-        TEAM_STRIP_RIGHT_FRAC,
+        Win32WindowCommand, WindowRectInfo, BENCH_SLOT_HEIGHT_FRAC, BENCH_SLOT_PITCH_FRAC,
+        BENCH_SLOT_WIDTH_FRAC, BENCH_STRIP_LEFT_FRAC, DIAGNOSTICS_HEIGHT_DIP,
+        DIAGNOSTICS_WIDTH_DIP, IN_GAME_HUD_HEIGHT_DIP, IN_GAME_HUD_WIDTH_DIP,
+        PICK_CARD_BADGE_HEIGHT_FRAC, PICK_CARD_GAP_FRAC, PICK_CARD_STRIP_Y_FRAC,
+        PICK_CARD_WIDTH_FRAC, SIDEBAR_WIDTH_DIP, TEAM_STRIP_RIGHT_FRAC,
     };
 
     const MIN_TARGET_WINDOW_DIM: i32 = 200;
@@ -823,9 +823,10 @@ mod imp {
             let max_h = (target.bottom - y).max(1);
             let min_h = (18.0 * scale).round() as i32;
             let cap_h = (40.0 * scale).round() as i32;
-            let h = ((0.0290 * target_h as f32).round() as i32)
+            let raw_h = ((BENCH_SLOT_HEIGHT_FRAC * target_h as f32).round() as i32)
                 .clamp(min_h, cap_h)
-                .min(max_h);
+                + (6.0 * scale).round() as i32;
+            let h = raw_h.min(max_h);
 
             SetWindowPos(
                 hwnd,
@@ -934,9 +935,10 @@ mod imp {
             let y = (target.top + (PICK_CARD_STRIP_Y_FRAC * target_h as f32).round() as i32)
                 .clamp(target.top, target.bottom.saturating_sub(1));
             let max_h = (target.bottom - y).max(1);
-            let h = ((PICK_CARD_BADGE_HEIGHT_FRAC * target_h as f32).round() as i32)
-                .clamp((22.0 * scale).round() as i32, (44.0 * scale).round() as i32)
-                .min(max_h);
+            let raw_h = ((PICK_CARD_BADGE_HEIGHT_FRAC * target_h as f32).round() as i32)
+                .clamp((22.0 * scale).round() as i32, (38.0 * scale).round() as i32)
+                + (12.0 * scale).round() as i32;
+            let h = raw_h.min(max_h);
 
             SetWindowPos(
                 hwnd,

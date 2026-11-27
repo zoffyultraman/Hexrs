@@ -467,7 +467,7 @@ impl Render for CardBadgeOverlay {
         let w = self.state.client_width_dip;
         let h = self.state.client_height_dip;
         let col_w = w * PICK_CARD_WIDTH_FRAC;
-        let badge_h = (h * PICK_CARD_BADGE_HEIGHT_FRAC).clamp(22.0, 44.0);
+        let badge_h = (h * PICK_CARD_BADGE_HEIGHT_FRAC).clamp(22.0, 38.0);
         let font_px = (badge_h * 0.42).clamp(10.0, 14.0);
         let show_name = col_w >= 140.0;
 
@@ -477,17 +477,17 @@ impl Render for CardBadgeOverlay {
             let Some(card) = slot.as_ref() else {
                 continue;
             };
-            let (bg, border, text) = theme::tier_colors(card.tier);
+            let (tier_main, tier_bg, tier_border) = hextech_tier_colors(card.tier);
             let left = idx as f32 * (w * PICK_CARD_PITCH_FRAC);
             let compact_name: String = card.name_zh.chars().take(5).collect();
 
             let mut pill = div()
                 .h(px(badge_h))
                 .px(px(8.0))
-                .rounded_md()
-                .bg(rgba(0x0B101BE8))
+                .rounded(px(3.0))
+                .bg(rgba(0x091428EB))
                 .border_1()
-                .border_color(theme::border_gold())
+                .border_color(tier_border)
                 .overflow_hidden()
                 .flex()
                 .flex_row()
@@ -498,28 +498,29 @@ impl Render for CardBadgeOverlay {
                     div()
                         .px(px(4.0))
                         .py(px(1.0))
-                        .rounded_sm()
-                        .bg(bg)
+                        .rounded(px(2.0))
+                        .bg(tier_bg)
                         .border_1()
-                        .border_color(border)
+                        .border_color(tier_border)
                         .font_weight(FontWeight::BOLD)
-                        .text_color(text)
+                        .text_color(tier_main)
                         .child(card.tier.label()),
                 );
 
             if show_name && !compact_name.is_empty() {
                 pill = pill.child(
                     div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text_primary())
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgb(0xE2E8F0))
                         .child(compact_name),
                 );
             }
 
             pill = pill.child(
                 div()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme::cyan())
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(0xF1F5F9))
+                    .font_family("Consolas")
                     .child(format!("{:.1}%", card.win_rate)),
             );
 
@@ -527,7 +528,7 @@ impl Render for CardBadgeOverlay {
                 div()
                     .absolute()
                     .left(px(left))
-                    .top(px(0.0))
+                    .top(px(2.0))
                     .w(px(col_w))
                     .h(px(badge_h))
                     .flex()
