@@ -923,7 +923,7 @@ mod imp {
 
             let strip_w_frac =
                 count as f32 * PICK_CARD_WIDTH_FRAC + (count - 1) as f32 * PICK_CARD_GAP_FRAC;
-            let strip_left_frac = (0.4985 - strip_w_frac * 0.5).max(0.0);
+            let strip_left_frac = (0.4965 - strip_w_frac * 0.5).max(0.0);
 
             let x = (target.left + (strip_left_frac * target_w as f32).round() as i32)
                 .clamp(target.left, target.right.saturating_sub(1));

@@ -613,10 +613,9 @@ impl HexrsApp {
                 .collect();
             let cards = if cs.local_champion_id == 0 && (2..=3).contains(&cs.subset_champions.len())
             {
-                cs.subset_champions
-                    .iter()
-                    .take(3)
-                    .map(|&id| self.lookup_card_slot_badge(id))
+                order_subset_cards_for_display(&cs.subset_champions)
+                    .into_iter()
+                    .map(|id| self.lookup_card_slot_badge(id))
                     .collect()
             } else {
                 Vec::new()
@@ -1742,6 +1741,14 @@ fn diag_row_colored(label: &str, value: String, value_color: Rgba) -> Div {
         )
 }
 
+fn order_subset_cards_for_display(ids: &[i32]) -> Vec<i32> {
+    if ids.len() == 3 {
+        vec![ids[0], ids[2], ids[1]]
+    } else {
+        ids.iter().copied().take(3).collect()
+    }
+}
+
 fn format_rect_info(rect: Option<WindowRectInfo>) -> String {
     match rect {
         Some(r) => format!(
@@ -1753,5 +1760,19 @@ fn format_rect_info(rect: Option<WindowRectInfo>) -> String {
             r.dpi
         ),
         None => "未找到可见窗口".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::order_subset_cards_for_display;
+
+    #[test]
+    fn subset_cards_visual_order_places_third_blessed_card_in_center() {
+        assert_eq!(order_subset_cards_for_display(&[10, 20]), vec![10, 20]);
+        assert_eq!(
+            order_subset_cards_for_display(&[14, 517, 497]),
+            vec![14, 497, 517]
+        );
     }
 }
