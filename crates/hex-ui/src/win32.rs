@@ -19,9 +19,9 @@ const CARD_GAP_RATIO: f32 = 0.14;
 const AUGMENT_BAR_HEIGHT_DIP: f32 = 94.0;
 
 /// Pixel-calibrated Champ Select bench strip geometry relative to `LeagueClientUx.exe`.
-pub const BENCH_SLOT0_CX: f32 = 0.2912;
-pub const BENCH_SLOT_PITCH_FRAC: f32 = 0.0460;
-pub const BENCH_SLOT_WIDTH_FRAC: f32 = 0.0400;
+pub const BENCH_SLOT0_CX: f32 = 0.2901;
+pub const BENCH_SLOT_PITCH_FRAC: f32 = 0.04568;
+pub const BENCH_SLOT_WIDTH_FRAC: f32 = 0.0384;
 pub const BENCH_SLOT_HEIGHT_FRAC: f32 = 0.0285;
 pub const BENCH_STRIP_LEFT_FRAC: f32 = BENCH_SLOT0_CX - BENCH_SLOT_WIDTH_FRAC * 0.5;
 

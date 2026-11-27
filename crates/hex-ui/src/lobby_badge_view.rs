@@ -103,7 +103,7 @@ impl Render for BenchBadgeOverlay {
                     .w(px(slot_w))
                     .h(px(slot_h))
                     .overflow_hidden()
-                    .rounded_md()
+                    .rounded(px(2.0))
                     .bg(rgba(0x0B101BE8))
                     .border_1()
                     .border_color(border_color)
