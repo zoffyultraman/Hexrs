@@ -1,10 +1,12 @@
 //! Click-through, DirectComposition-safe razor-thin strip overlays anchored strictly to
 //! non-interactive regions of `LeagueClientUx.exe` (`RCLIENT`) during Champ Select.
 
-use gpui::{div, prelude::*, px, rgb, rgba, Context, Div, FontWeight, Render, Rgba};
+use gpui::{
+    div, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba, Context, Div, FontWeight,
+    Render, Rgba,
+};
 use hex_core::{HeroTier, SummonerRatingStatus};
 
-use crate::theme;
 use crate::win32::{
     BENCH_SLOT_HEIGHT_FRAC, BENCH_SLOT_PITCH_FRAC, BENCH_SLOT_WIDTH_FRAC,
     PICK_CARD_BADGE_HEIGHT_FRAC, PICK_CARD_PITCH_FRAC, PICK_CARD_WIDTH_FRAC,
@@ -83,8 +85,9 @@ impl Render for BenchBadgeOverlay {
         let h = self.state.client_height_dip;
         let raw_slot_w = w * BENCH_SLOT_WIDTH_FRAC;
         let slot_w = raw_slot_w.clamp(34.0, 140.0);
-        let slot_h = (h * BENCH_SLOT_HEIGHT_FRAC).clamp(18.0, 40.0);
-        let bench_font_px = (slot_w * 0.140).clamp(8.5, 11.2);
+        let slot_h = (h * BENCH_SLOT_HEIGHT_FRAC).clamp(16.0, 18.0);
+        let bench_font_px = (slot_w * 0.175).clamp(9.0, 11.0);
+        let gap_px = if slot_w >= 48.0 { 4.0 } else { 2.5 };
 
         let mut canvas: Div = div().size_full().relative().bg(rgba(0x00000000));
 
@@ -92,7 +95,17 @@ impl Render for BenchBadgeOverlay {
             let Some(badge) = slot.as_ref() else {
                 continue;
             };
-            let (_bg, border_color, text_color) = theme::tier_colors(badge.tier);
+            let (tier_main, _, _) = hextech_tier_colors(badge.tier);
+            let frame_border = match badge.tier {
+                HeroTier::SPlus => rgba(0xF0C46C66),
+                HeroTier::S => rgba(0x2DD4BF66),
+                _ => rgba(0x384E6A73),
+            };
+            let winrate_color = if matches!(badge.tier, HeroTier::SPlus | HeroTier::S) {
+                rgb(0xF8FAFC)
+            } else {
+                rgb(0xE2E8F0)
+            };
             let left = idx as f32 * (w * BENCH_SLOT_PITCH_FRAC) + (raw_slot_w - slot_w) * 0.5;
 
             canvas = canvas.child(
@@ -103,28 +116,40 @@ impl Render for BenchBadgeOverlay {
                     .w(px(slot_w))
                     .h(px(slot_h))
                     .overflow_hidden()
-                    .rounded(px(2.0))
-                    .bg(rgba(0x0B101BE8))
-                    .border_1()
-                    .border_color(border_color)
+                    .rounded_bl(px(2.0))
+                    .rounded_br(px(2.0))
+                    .bg(rgba(0x0B1220EB))
+                    .border_l_1()
+                    .border_r_1()
+                    .border_t_1()
+                    .border_color(frame_border)
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(2.0))
-                    .text_size(px(bench_font_px))
+                    .flex_col()
                     .child(
                         div()
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(text_color)
-                            .child(badge.tier.label()),
+                            .flex_1()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_center()
+                            .gap(px(gap_px))
+                            .text_size(px(bench_font_px))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(tier_main)
+                                    .child(badge.tier.label()),
+                            )
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_family("Consolas")
+                                    .text_color(winrate_color)
+                                    .child(format!("{:.1}%", badge.win_rate)),
+                            ),
                     )
-                    .child(
-                        div()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text_primary())
-                            .child(format!("{:.1}%", badge.win_rate)),
-                    ),
+                    .child(div().w_full().h(px(2.0)).bg(tier_main)),
             );
         }
 
@@ -163,13 +188,14 @@ impl TeamBadgeOverlay {
     }
 }
 
-/// Returns `(main_text_and_bar, badge_bg, border)` for the Hextech team strip tier accents.
+/// Returns `(main_text_and_bar, badge_bg, border)` for the unified V2 Hextech hero tier tokens.
 fn hextech_tier_colors(tier: HeroTier) -> (Rgba, Rgba, Rgba) {
     match tier {
         HeroTier::SPlus => (rgb(0xF0C46C), rgba(0xF0C46C29), rgba(0xF0C46C80)),
         HeroTier::S => (rgb(0x2DD4BF), rgba(0x2DD4BF29), rgba(0x2DD4BF73)),
         HeroTier::A | HeroTier::B => (rgb(0x4ADE80), rgba(0x4ADE8024), rgba(0x4ADE8066)),
-        HeroTier::C | HeroTier::D => (rgb(0x94A3B8), rgba(0x94A3B824), rgba(0x94A3B859)),
+        HeroTier::C => (rgb(0x94A3B8), rgba(0x94A3B824), rgba(0x94A3B859)),
+        HeroTier::D => (rgb(0xF472B6), rgba(0xF472B61F), rgba(0xF472B659)),
     }
 }
 
@@ -181,27 +207,37 @@ fn premade_ghost_colors(group_id: u8) -> (Rgba, Rgba, Rgba) {
     }
 }
 
-fn scrim_layer(width_dip: f32, bg: Rgba) -> Div {
+fn player_silhouette_icon() -> Div {
     div()
-        .absolute()
-        .top(px(0.0))
-        .right(px(2.0))
-        .w(px(width_dip))
-        .h_full()
-        .bg(bg)
+        .w(px(10.0))
+        .h(px(10.0))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(1.0))
+        .child(div().w(px(4.0)).h(px(4.0)).rounded_full().bg(rgb(0x94A3B8)))
+        .child(
+            div()
+                .w(px(8.0))
+                .h(px(4.0))
+                .rounded_tl(px(4.0))
+                .rounded_tr(px(4.0))
+                .bg(rgb(0x94A3B8)),
+        )
 }
 
 fn ghost_pill(bg: Rgba, border: Rgba, text_color: Rgba, label: String) -> Div {
     div()
-        .h(px(17.0))
-        .px(px(4.5))
+        .h(px(16.0))
+        .px(px(5.0))
         .rounded(px(2.0))
         .bg(bg)
         .border_1()
         .border_color(border)
         .flex()
         .items_center()
-        .text_size(px(9.5))
+        .text_size(px(10.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(text_color)
         .child(label)
@@ -223,7 +259,6 @@ impl Render for TeamBadgeOverlay {
         let h = self.state.client_height_dip;
         let row_pitch_h = TEAM_ROW_PITCH_FRAC * h;
         let row_h = (row_pitch_h - 2.0).max(20.0);
-        let sw = self.state.strip_width_dip.max(112.0);
 
         let mut canvas: Div = div().size_full().relative().bg(rgba(0x00000000));
 
@@ -241,7 +276,7 @@ impl Render for TeamBadgeOverlay {
                 .relative()
                 .size_full()
                 .pl(px(14.0))
-                .pr(px(10.0))
+                .pr(px(11.0))
                 .py(px(4.0))
                 .flex()
                 .flex_col()
@@ -254,32 +289,29 @@ impl Render for TeamBadgeOverlay {
                 let (tier_main, tier_bg, tier_border) = hextech_tier_colors(badge.tier);
                 content_col = content_col.child(
                     div()
-                        .px(px(6.0))
-                        .py(px(2.0))
-                        .rounded(px(3.0))
-                        .bg(rgba(0x0F172AA6))
-                        .border_1()
-                        .border_color(tier_border)
                         .flex()
                         .flex_row()
                         .items_center()
-                        .gap(px(5.0))
-                        .overflow_hidden()
+                        .justify_end()
+                        .gap(px(6.0))
                         .child(
                             div()
-                                .px(px(3.0))
+                                .px(px(5.0))
+                                .py(px(1.0))
                                 .rounded(px(2.0))
                                 .bg(tier_bg)
-                                .text_size(px(12.5))
+                                .border_1()
+                                .border_color(tier_border)
+                                .text_size(px(12.0))
                                 .font_weight(FontWeight::BOLD)
                                 .text_color(tier_main)
                                 .child(badge.tier.label()),
                         )
                         .child(
                             div()
-                                .text_size(px(12.5))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(rgb(0xF1F5F9))
+                                .text_size(px(13.5))
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(0xF8FAFC))
                                 .font_family("Consolas")
                                 .child(format!("{:.1}%", badge.win_rate)),
                         ),
@@ -288,42 +320,46 @@ impl Render for TeamBadgeOverlay {
 
             if let Some(sum) = slot.summoner.as_ref() {
                 let mut line2 = div()
-                    .px(px(5.0))
-                    .py(px(1.0))
-                    .rounded(px(2.0))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(3.0))
+                    .justify_end()
+                    .gap(px(3.5))
                     .text_size(px(11.0))
                     .font_weight(FontWeight::MEDIUM)
-                    .overflow_hidden();
+                    .overflow_hidden()
+                    .child(player_silhouette_icon());
 
                 line2 = match sum.status {
                     SummonerRatingStatus::Ready => {
-                        let (bg, score_color, title_color) = match sum.tier_index {
-                            0 => (rgba(0x0F172A73), rgb(0xFDE047), rgb(0xF0C46C)),
-                            1 => (rgba(0x0F172A73), rgb(0xF0C46C), rgb(0xE2E8F0)),
-                            2 => (rgba(0x0F172A73), rgb(0x4ADE80), rgb(0xE2E8F0)),
-                            3 => (rgba(0x0F172A73), rgb(0xCBD5E1), rgb(0x94A3B8)),
-                            _ => (rgba(0xEF444424), rgb(0xFDA4AF), rgb(0xF87171)),
+                        let (score_color, title_color) = match sum.tier_index {
+                            0 => (rgb(0xFDE047), rgb(0xFEF08A)),
+                            1 => (rgb(0xF0C46C), rgb(0xE2E8F0)),
+                            2 => (rgb(0x4ADE80), rgb(0xCBD5E1)),
+                            3 => (rgb(0xCBD5E1), rgb(0x94A3B8)),
+                            _ => (rgb(0xFDA4AF), rgb(0xF87171)),
                         };
                         let compact_title: String = sum.title.chars().take(4).collect();
                         line2
-                            .bg(bg)
-                            .child(div().text_color(score_color).child(sum.score.to_string()))
-                            .child(div().text_color(rgb(0x64748B)).child("·"))
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_family("Consolas")
+                                    .text_color(score_color)
+                                    .child(sum.score.to_string()),
+                            )
+                            .child(div().text_color(rgb(0x94A3B8)).child("·"))
                             .child(div().text_color(title_color).child(compact_title))
                     }
-                    SummonerRatingStatus::Private => line2
-                        .bg(rgba(0x0F172A73))
-                        .child(div().text_color(rgb(0x94A3B8)).child("隐藏")),
-                    SummonerRatingStatus::InsufficientSamples => line2
-                        .bg(rgba(0x0F172A73))
-                        .child(div().text_color(rgb(0x94A3B8)).child("样本少")),
-                    SummonerRatingStatus::Loading => line2
-                        .bg(rgba(0x0F172A73))
-                        .child(div().text_color(rgb(0x94A3B8)).child("战绩…")),
+                    SummonerRatingStatus::Private => {
+                        line2.child(div().text_color(rgb(0x94A3B8)).child("隐藏"))
+                    }
+                    SummonerRatingStatus::InsufficientSamples => {
+                        line2.child(div().text_color(rgb(0x94A3B8)).child("样本少"))
+                    }
+                    SummonerRatingStatus::Loading => {
+                        line2.child(div().text_color(rgb(0x94A3B8)).child("战绩…"))
+                    }
                 };
 
                 content_col = content_col.child(line2);
@@ -382,17 +418,17 @@ impl Render for TeamBadgeOverlay {
             let row_inner = div()
                 .relative()
                 .size_full()
-                .child(scrim_layer(sw * 0.96, rgba(0x09142818)))
-                .child(scrim_layer(sw * 0.82, rgba(0x09142826)))
-                .child(scrim_layer(sw * 0.68, rgba(0x09142838)))
-                .child(scrim_layer(sw * 0.52, rgba(0x0914284D)))
-                .child(scrim_layer(sw * 0.36, rgba(0x091428B8)))
+                .bg(linear_gradient(
+                    90.0,
+                    linear_color_stop(rgba(0x09142800), 0.0),
+                    linear_color_stop(rgba(0x091428E6), 0.72),
+                ))
                 .child(
                     div()
                         .absolute()
                         .top(px(0.0))
                         .right(px(0.0))
-                        .w(px(2.0))
+                        .w(px(3.0))
                         .h_full()
                         .bg(tier_bar_color),
                 )

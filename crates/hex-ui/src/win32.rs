@@ -22,7 +22,8 @@ const AUGMENT_BAR_HEIGHT_DIP: f32 = 94.0;
 pub const BENCH_SLOT0_CX: f32 = 0.2906;
 pub const BENCH_SLOT_PITCH_FRAC: f32 = 0.04594;
 pub const BENCH_SLOT_WIDTH_FRAC: f32 = 0.0384;
-pub const BENCH_SLOT_HEIGHT_FRAC: f32 = 0.0285;
+pub const BENCH_SLOT_HEIGHT_FRAC: f32 = 0.0195;
+pub const BENCH_STRIP_Y_FRAC: f32 = 0.0824;
 pub const BENCH_STRIP_LEFT_FRAC: f32 = BENCH_SLOT0_CX - BENCH_SLOT_WIDTH_FRAC * 0.5;
 
 /// Pixel-calibrated Champ Select center champion pick card strip geometry relative to `LeagueClientUx.exe`.
@@ -37,7 +38,7 @@ pub const TEAM_STRIP_RIGHT_FRAC: f32 = 0.2580;
 
 /// Computes the logical DIP width of `TeamBadgeStrip` from the client width in DIPs.
 pub fn compute_team_strip_width_dip(target_width_dip: f32) -> f32 {
-    (target_width_dip * 0.078).clamp(112.0, 134.0)
+    (target_width_dip * 0.076).clamp(110.0, 125.0)
 }
 
 /// Corner anchor for the compact in-game HUD card.
@@ -249,7 +250,7 @@ mod imp {
     use super::{
         compute_augment_bar_geometry, AugmentOfferLayout, OverlayCorner, Win32WindowAction,
         Win32WindowCommand, WindowRectInfo, BENCH_SLOT_HEIGHT_FRAC, BENCH_SLOT_PITCH_FRAC,
-        BENCH_SLOT_WIDTH_FRAC, BENCH_STRIP_LEFT_FRAC, DIAGNOSTICS_HEIGHT_DIP,
+        BENCH_SLOT_WIDTH_FRAC, BENCH_STRIP_LEFT_FRAC, BENCH_STRIP_Y_FRAC, DIAGNOSTICS_HEIGHT_DIP,
         DIAGNOSTICS_WIDTH_DIP, IN_GAME_HUD_HEIGHT_DIP, IN_GAME_HUD_WIDTH_DIP,
         PICK_CARD_BADGE_HEIGHT_FRAC, PICK_CARD_GAP_FRAC, PICK_CARD_STRIP_Y_FRAC,
         PICK_CARD_WIDTH_FRAC, SIDEBAR_WIDTH_DIP, TEAM_STRIP_RIGHT_FRAC,
@@ -818,11 +819,11 @@ mod imp {
                 + (8.0 * scale).round() as i32;
             let w = raw_w.max((40.0 * scale).round() as i32).min(max_w);
 
-            let y = (target.top + (0.0835 * target_h as f32).round() as i32)
+            let y = (target.top + (BENCH_STRIP_Y_FRAC * target_h as f32).round() as i32)
                 .clamp(target.top, target.bottom.saturating_sub(1));
             let max_h = (target.bottom - y).max(1);
-            let min_h = (18.0 * scale).round() as i32;
-            let cap_h = (40.0 * scale).round() as i32;
+            let min_h = (16.0 * scale).round() as i32;
+            let cap_h = (18.0 * scale).round() as i32;
             let raw_h = ((BENCH_SLOT_HEIGHT_FRAC * target_h as f32).round() as i32)
                 .clamp(min_h, cap_h)
                 + (6.0 * scale).round() as i32;
@@ -864,8 +865,8 @@ mod imp {
             let target_w = target.width().max(320);
             let target_h = target.height().max(200);
 
-            let mut w = ((target_w as f32 * 0.078).round() as i32)
-                .clamp((112.0 * scale).round() as i32, (134.0 * scale).round() as i32);
+            let mut w = ((target_w as f32 * 0.076).round() as i32)
+                .clamp((110.0 * scale).round() as i32, (125.0 * scale).round() as i32);
             let right_px = target.left + (TEAM_STRIP_RIGHT_FRAC * target_w as f32).round() as i32;
             let min_left_px = target.left + (0.1650 * target_w as f32).round() as i32;
             let x = (right_px - w)
