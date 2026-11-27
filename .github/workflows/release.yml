@@ -89,7 +89,7 @@ jobs:
           Copy-Item "crates/hex-data/assets/meta.db" "$dataDir/meta.db" -Force
           Copy-Item "licenses/CC-BY-NC-4.0-LICENSE" "$dataDir/LICENSE" -Force
 
-          python -c "import json, pathlib; m = json.loads(pathlib.Path('crates/hex-data/assets/manifest.json').read_text(encoding='utf-8')); pathlib.Path('release_stage/Hexrs/data/version.txt').write_text(m.get('version', 'aramhex6'), encoding='utf-8'); t = {'tiers': [{'min_score': 82, 'label': '\u592f'}, {'min_score': 70, 'label': '\u9876\u7ea7'}, {'min_score': 58, 'label': '\u4eba\u4e0a\u4eba'}, {'min_score': 45, 'label': 'NPC'}, {'min_score': 0, 'label': '\u62c9\u5b8c\u4e86'}], 'insufficient_samples': '\u6837\u672c\u5c11', 'private_profile': '\u9690\u85cf'}; pathlib.Path('release_stage/Hexrs/data/rating_titles.json').write_text(json.dumps(t, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')"
+          python -c "import json, pathlib; m = json.loads(pathlib.Path('crates/hex-data/assets/manifest.json').read_text(encoding='utf-8')); pathlib.Path('release_stage/Hexrs/data/version.txt').write_text(m.get('version', 'aramhex7'), encoding='utf-8'); t = {'tiers': [{'min_score': 82, 'label': '\u592f'}, {'min_score': 70, 'label': '\u9876\u7ea7'}, {'min_score': 58, 'label': '\u4eba\u4e0a\u4eba'}, {'min_score': 45, 'label': 'NPC'}, {'min_score': 0, 'label': '\u62c9\u5b8c\u4e86'}], 'insufficient_samples': '\u6837\u672c\u5c11', 'private_profile': '\u9690\u85cf'}; pathlib.Path('release_stage/Hexrs/data/rating_titles.json').write_text(json.dumps(t, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $zipPath = "dist/Hexrs-$tag-windows-x86_64.zip"

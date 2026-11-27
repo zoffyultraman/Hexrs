@@ -11,6 +11,7 @@ pub use db::{
     bayesian_smoothed_win_rate, data_dir, db_path, AugmentEvaluation, AugmentHashEntry,
     AugmentNameEntry, BenchHighlight, BuildItemInfo, DynamicBuildPlan, HeroPreview, HeroStats,
     MetaEngine, SynergyAlert, SynergyRecommendation, TeamDiagnosis, TeamRecommendations,
+    AUGMENT_MIN_HERO_SAMPLES,
 };
 pub use icons::IconCache;
 pub use reporter::{EogReporter, ReporterConfig};

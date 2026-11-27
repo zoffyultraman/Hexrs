@@ -570,11 +570,12 @@ def init_sqlite_schema(conn: sqlite3.Connection, data_version: str) -> None:
         );
 
         CREATE TABLE IF NOT EXISTS hero_augment_stats (
-            hero_id    INTEGER NOT NULL,
-            augment_id INTEGER NOT NULL,
-            tier       TEXT NOT NULL,
-            win_rate   REAL NOT NULL,
-            pick_rate  REAL NOT NULL,
+            hero_id     INTEGER NOT NULL,
+            augment_id  INTEGER NOT NULL,
+            tier        TEXT NOT NULL,
+            win_rate    REAL NOT NULL,
+            pick_rate   REAL NOT NULL,
+            sample_size INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (hero_id, augment_id)
         );
 
@@ -886,8 +887,8 @@ def build_meta_database(
                 wr_pct = round(wr * 100.0, 1)
                 pick_rate = round((g / hero_total_g) * 100.0, 1)
                 conn.execute(
-                    "INSERT OR REPLACE INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate) VALUES (?, ?, ?, ?, ?)",
-                    (hid, aid, aug_tier_from_wr_pct(wr_pct), wr_pct, pick_rate),
+                    "INSERT OR REPLACE INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate, sample_size) VALUES (?, ?, ?, ?, ?, ?)",
+                    (hid, aid, aug_tier_from_wr_pct(wr_pct), wr_pct, pick_rate, g),
                 )
 
         aug_id_by_name: dict[str, int] = {}
@@ -926,8 +927,8 @@ def build_meta_database(
                 tier, wr_pct, pick_rate = _deterministic_baseline_aug_stats(aug_id, name_zh, rarity)
 
             conn.execute(
-                "INSERT OR REPLACE INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate) VALUES (?, ?, ?, ?, ?)",
-                (0, aug_id, tier, wr_pct, pick_rate),
+                "INSERT OR REPLACE INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate, sample_size) VALUES (?, ?, ?, ?, ?, ?)",
+                (0, aug_id, tier, wr_pct, pick_rate, gg if gg > 0 else 0),
             )
 
         # Overlay real crowdsourced sample stats if provided
@@ -938,8 +939,8 @@ def build_meta_database(
             wr_pct = round(wr * 100.0, 1)
             pick_rate = round((g / max(hg, 1)) * 100.0, 1)
             conn.execute(
-                "INSERT OR REPLACE INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate) VALUES (?, ?, ?, ?, ?)",
-                (hero_id, aug_id, aug_tier_from_wr_pct(wr_pct), wr_pct, pick_rate),
+                "INSERT OR REPLACE INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate, sample_size) VALUES (?, ?, ?, ?, ?, ?)",
+                (hero_id, aug_id, aug_tier_from_wr_pct(wr_pct), wr_pct, pick_rate, g),
             )
 
         for name_a, name_b, lift, n in CURATED_AUGMENT_SYNERGIES_BY_NAME:
@@ -1073,7 +1074,7 @@ def main() -> None:
     if args.version:
         version = args.version
     elif aramhex_data is not None:
-        version = f"aramhex6-{aramhex_data['patch']}-{today_str}"
+        version = f"aramhex7-{aramhex_data['patch']}-{today_str}"
     else:
         version = f"cdragon-{today_str}"
 

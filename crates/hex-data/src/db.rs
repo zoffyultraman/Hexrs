@@ -165,6 +165,9 @@ pub struct SynergyAlert {
     pub badge: String,
 }
 
+/// Minimum recorded hero×augment sample games required to show reliable hero stats.
+pub const AUGMENT_MIN_HERO_SAMPLES: i32 = 30;
+
 /// Evaluation of an offered hextech augment card for the active champion.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AugmentEvaluation {
@@ -175,6 +178,10 @@ pub struct AugmentEvaluation {
     pub tier: HeroTier,
     pub win_rate: f64,
     pub pick_rate: f64,
+    #[serde(default)]
+    pub sample_size: i32,
+    #[serde(default)]
+    pub low_sample: bool,
     pub synergy_alert: Option<SynergyAlert>,
 }
 
@@ -247,7 +254,7 @@ impl MetaEngine {
             hero_count == 0
                 || (cfg!(has_bundled_meta_db)
                     && (aug_count < 100
-                        || !data_version.starts_with("aramhex6-")
+                        || !data_version.starts_with("aramhex7-")
                         || builds_hero_count < 100))
         };
 
@@ -295,16 +302,23 @@ impl MetaEngine {
         .unwrap_or_default()
     }
 
-    /// Lists all non-empty augment names and rarities stored in `augment_meta`.
+    /// Lists all non-empty augment names and rarities stored in `augment_meta`,
+    /// prioritizing augments that have real `hero_id > 0` statistics over duplicate-named Arena IDs.
     pub fn list_augment_names(&self) -> Vec<AugmentNameEntry> {
         let Ok(conn) = self.conn.lock() else {
             return Vec::new();
         };
         let Ok(mut stmt) = conn.prepare(
-            "SELECT augment_id, name_zh, rarity
-             FROM augment_meta
-             WHERE TRIM(name_zh) != ''
-             ORDER BY augment_id ASC",
+            "SELECT m.augment_id, m.name_zh, m.rarity
+             FROM augment_meta m
+             LEFT JOIN (
+                 SELECT augment_id, COUNT(*) AS hero_cnt
+                 FROM hero_augment_stats
+                 WHERE hero_id > 0
+                 GROUP BY augment_id
+             ) h ON h.augment_id = m.augment_id
+             WHERE TRIM(m.name_zh) != ''
+             ORDER BY COALESCE(h.hero_cnt, 0) DESC, m.augment_id DESC",
         ) else {
             return Vec::new();
         };
@@ -540,40 +554,82 @@ impl MetaEngine {
         }
     }
 
-    /// Returns a champion's pre-match preview (top 3 augments + core 3-item builds).
+    /// Returns a champion's pre-match preview (top 3 augments + core 6-item builds).
     pub fn get_hero_preview(&self, hero_id: i32) -> Option<HeroPreview> {
         let conn = self.conn.lock().ok()?;
         let stats = query_hero_stats(&conn, hero_id)?;
+        let has_sample_col = has_hero_augment_sample_size_col(&conn);
 
-        let mut aug_stmt = conn
-            .prepare(
-                "SELECT m.augment_id, m.name_zh, m.rarity, m.desc_zh, s.tier, s.win_rate, s.pick_rate
-                 FROM hero_augment_stats s
-                 JOIN augment_meta m ON m.augment_id = s.augment_id
-                 WHERE s.hero_id = ?1
-                 ORDER BY s.win_rate DESC
-                 LIMIT 3",
-            )
-            .ok()?;
+        let top_augments = if has_sample_col {
+            let mut aug_stmt = conn
+                .prepare(
+                    "SELECT m.augment_id, m.name_zh, m.rarity, m.desc_zh, s.tier, s.win_rate, s.pick_rate, s.sample_size
+                     FROM hero_augment_stats s
+                     JOIN augment_meta m ON m.augment_id = s.augment_id
+                     WHERE s.hero_id = ?1
+                     ORDER BY CASE WHEN s.sample_size >= ?2 THEN 0 ELSE 1 END, s.win_rate DESC
+                     LIMIT 3",
+                )
+                .ok()?;
 
-        let top_augments = aug_stmt
-            .query_map(params![hero_id], |row| {
-                let tier_str: String = row.get(4)?;
-                let win_rate: f64 = row.get(5)?;
-                Ok(AugmentEvaluation {
-                    augment_id: row.get(0)?,
-                    name_zh: row.get(1)?,
-                    rarity: row.get(2)?,
-                    desc_zh: row.get(3)?,
-                    tier: HeroTier::from_label(&tier_str).unwrap_or_else(|| tier_from_win_rate(win_rate)),
-                    win_rate,
-                    pick_rate: row.get(6)?,
-                    synergy_alert: None,
+            let mapped = aug_stmt
+                .query_map(params![hero_id, AUGMENT_MIN_HERO_SAMPLES], |row| {
+                    let tier_str: String = row.get(4)?;
+                    let win_rate: f64 = row.get(5)?;
+                    let sample_size: i32 = row.get(7)?;
+                    Ok(AugmentEvaluation {
+                        augment_id: row.get(0)?,
+                        name_zh: row.get(1)?,
+                        rarity: row.get(2)?,
+                        desc_zh: row.get(3)?,
+                        tier: HeroTier::from_label(&tier_str)
+                            .unwrap_or_else(|| tier_from_win_rate(win_rate)),
+                        win_rate,
+                        pick_rate: row.get(6)?,
+                        sample_size,
+                        low_sample: sample_size < AUGMENT_MIN_HERO_SAMPLES,
+                        synergy_alert: None,
+                    })
                 })
-            })
-            .ok()?
-            .flatten()
-            .collect();
+                .ok()?
+                .flatten()
+                .collect::<Vec<_>>();
+            mapped
+        } else {
+            let mut aug_stmt = conn
+                .prepare(
+                    "SELECT m.augment_id, m.name_zh, m.rarity, m.desc_zh, s.tier, s.win_rate, s.pick_rate
+                     FROM hero_augment_stats s
+                     JOIN augment_meta m ON m.augment_id = s.augment_id
+                     WHERE s.hero_id = ?1
+                     ORDER BY s.win_rate DESC
+                     LIMIT 3",
+                )
+                .ok()?;
+
+            let mapped = aug_stmt
+                .query_map(params![hero_id], |row| {
+                    let tier_str: String = row.get(4)?;
+                    let win_rate: f64 = row.get(5)?;
+                    Ok(AugmentEvaluation {
+                        augment_id: row.get(0)?,
+                        name_zh: row.get(1)?,
+                        rarity: row.get(2)?,
+                        desc_zh: row.get(3)?,
+                        tier: HeroTier::from_label(&tier_str)
+                            .unwrap_or_else(|| tier_from_win_rate(win_rate)),
+                        win_rate,
+                        pick_rate: row.get(6)?,
+                        sample_size: 0,
+                        low_sample: false,
+                        synergy_alert: None,
+                    })
+                })
+                .ok()?
+                .flatten()
+                .collect::<Vec<_>>();
+            mapped
+        };
 
         let core_builds = query_hero_builds(&conn, hero_id, &[]);
 
@@ -612,7 +668,8 @@ impl MetaEngine {
             .collect()
     }
 
-    /// Evaluates 3 offered augments for `hero_id`, flagging golden `⚡ 完美协同` against `owned_aug_ids`.
+    /// Evaluates offered augments for `hero_id`, flagging golden `⚡ 完美协同` against `owned_aug_ids`
+    /// and marking hero×augment entries missing or below `AUGMENT_MIN_HERO_SAMPLES` as `low_sample`.
     pub fn evaluate_augment_offer(
         &self,
         hero_id: i32,
@@ -622,6 +679,7 @@ impl MetaEngine {
         let Ok(conn) = self.conn.lock() else {
             return Vec::new();
         };
+        let has_sample_col = has_hero_augment_sample_size_col(&conn);
 
         let mut results = Vec::with_capacity(offered_aug_ids.len());
         for &aug_id in offered_aug_ids {
@@ -638,41 +696,69 @@ impl MetaEngine {
                 continue;
             };
 
-            let hero_stat = conn
-                .query_row(
-                    "SELECT tier, win_rate, pick_rate
-                     FROM hero_augment_stats
-                     WHERE hero_id = ?1 AND augment_id = ?2",
-                    params![hero_id, aug_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?, row.get::<_, f64>(2)?)),
-                )
-                .optional()
-                .ok()
-                .flatten();
+            let (tier, win_rate, pick_rate, sample_size, low_sample, synergy_alert) = if hero_id > 0 {
+                let primary = query_hero_augment_stat(&conn, hero_id, aug_id, has_sample_col);
+                let best = match primary {
+                    Some((_, _, _, n)) if n >= AUGMENT_MIN_HERO_SAMPLES => {
+                        primary.map(|(t, wr, pr, n)| (aug_id, t, wr, pr, n))
+                    }
+                    _ => {
+                        let primary_n = primary.as_ref().map(|(_, _, _, n)| *n).unwrap_or(-1);
+                        let sibling = query_sibling_hero_augment_stat(
+                            &conn,
+                            hero_id,
+                            &name_zh,
+                            aug_id,
+                            has_sample_col,
+                        );
+                        match (primary, sibling) {
+                            (Some(p), Some(s)) => {
+                                if s.4 > primary_n {
+                                    Some(s)
+                                } else {
+                                    Some((aug_id, p.0, p.1, p.2, p.3))
+                                }
+                            }
+                            (Some(p), None) => Some((aug_id, p.0, p.1, p.2, p.3)),
+                            (None, Some(s)) => Some(s),
+                            (None, None) => None,
+                        }
+                    }
+                };
 
-            let (tier, win_rate, pick_rate) = match hero_stat {
-                Some((tier_str, wr, pr)) => (
-                    HeroTier::from_label(&tier_str).unwrap_or_else(|| tier_from_win_rate(wr)),
-                    wr,
-                    pr,
-                ),
-                None => {
-                    let avg: Option<(f64, f64)> = conn
-                        .query_row(
-                            "SELECT AVG(win_rate), AVG(pick_rate) FROM hero_augment_stats WHERE augment_id = ?1",
-                            params![aug_id],
-                            |row| Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<f64>>(1)?)),
-                        )
-                        .optional()
-                        .ok()
-                        .flatten()
-                        .and_then(|(w, p)| Some((w?, p?)));
-                    let (wr, pr) = avg.unwrap_or((50.0, 5.0));
-                    (tier_from_win_rate(wr), (wr * 10.0).round() / 10.0, pr)
+                match best {
+                    Some((resolved_aug_id, tier_str, wr, pr, n)) if n >= AUGMENT_MIN_HERO_SAMPLES => (
+                        HeroTier::from_label(&tier_str).unwrap_or_else(|| tier_from_win_rate(wr)),
+                        wr,
+                        pr,
+                        n,
+                        false,
+                        find_best_augment_synergy(&conn, hero_id, resolved_aug_id, owned_aug_ids),
+                    ),
+                    Some((_, _, wr, pr, n)) => (HeroTier::D, wr, pr, n.max(0), true, None),
+                    None => (HeroTier::D, 0.0, 0.0, 0, true, None),
                 }
+            } else {
+                let avg: Option<(f64, f64)> = conn
+                    .query_row(
+                        "SELECT AVG(win_rate), AVG(pick_rate) FROM hero_augment_stats WHERE augment_id = ?1",
+                        params![aug_id],
+                        |row| Ok((row.get::<_, Option<f64>>(0)?, row.get::<_, Option<f64>>(1)?)),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .and_then(|(w, p)| Some((w?, p?)));
+                let (wr, pr) = avg.unwrap_or((50.0, 5.0));
+                (
+                    tier_from_win_rate(wr),
+                    (wr * 10.0).round() / 10.0,
+                    pr,
+                    0,
+                    false,
+                    find_best_augment_synergy(&conn, hero_id, aug_id, owned_aug_ids),
+                )
             };
-
-            let synergy_alert = find_best_augment_synergy(&conn, hero_id, aug_id, owned_aug_ids);
 
             results.push(AugmentEvaluation {
                 augment_id: aug_id,
@@ -682,6 +768,8 @@ impl MetaEngine {
                 tier,
                 win_rate,
                 pick_rate,
+                sample_size,
+                low_sample,
                 synergy_alert,
             });
         }
@@ -1170,6 +1258,93 @@ fn normalize_identifier(raw: &str) -> String {
         .collect()
 }
 
+fn has_hero_augment_sample_size_col(conn: &Connection) -> bool {
+    let Ok(mut stmt) = conn.prepare("PRAGMA table_info(hero_augment_stats)") else {
+        return false;
+    };
+    let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else {
+        return false;
+    };
+    rows.flatten().any(|name| name == "sample_size")
+}
+
+fn query_hero_augment_stat(
+    conn: &Connection,
+    hero_id: i32,
+    aug_id: i32,
+    has_sample_col: bool,
+) -> Option<(String, f64, f64, i32)> {
+    if has_sample_col {
+        conn.query_row(
+            "SELECT tier, win_rate, pick_rate, sample_size
+             FROM hero_augment_stats
+             WHERE hero_id = ?1 AND augment_id = ?2",
+            params![hero_id, aug_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    } else {
+        conn.query_row(
+            "SELECT tier, win_rate, pick_rate
+             FROM hero_augment_stats
+             WHERE hero_id = ?1 AND augment_id = ?2",
+            params![hero_id, aug_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, AUGMENT_MIN_HERO_SAMPLES)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+}
+
+fn query_sibling_hero_augment_stat(
+    conn: &Connection,
+    hero_id: i32,
+    name_zh: &str,
+    exclude_aug_id: i32,
+    has_sample_col: bool,
+) -> Option<(i32, String, f64, f64, i32)> {
+    if has_sample_col {
+        conn.query_row(
+            "SELECT m.augment_id, s.tier, s.win_rate, s.pick_rate, s.sample_size
+             FROM augment_meta m
+             JOIN hero_augment_stats s ON s.augment_id = m.augment_id AND s.hero_id = ?1
+             WHERE m.name_zh = ?2 AND m.augment_id != ?3
+             ORDER BY s.sample_size DESC, s.win_rate DESC
+             LIMIT 1",
+            params![hero_id, name_zh, exclude_aug_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    } else {
+        conn.query_row(
+            "SELECT m.augment_id, s.tier, s.win_rate, s.pick_rate
+             FROM augment_meta m
+             JOIN hero_augment_stats s ON s.augment_id = m.augment_id AND s.hero_id = ?1
+             WHERE m.name_zh = ?2 AND m.augment_id != ?3
+             ORDER BY s.win_rate DESC
+             LIMIT 1",
+            params![hero_id, name_zh, exclude_aug_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    AUGMENT_MIN_HERO_SAMPLES,
+                ))
+            },
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+}
+
 fn tier_from_win_rate(win_rate: f64) -> HeroTier {
     if win_rate >= 57.0 {
         HeroTier::SPlus
@@ -1183,5 +1358,96 @@ fn tier_from_win_rate(win_rate: f64) -> HeroTier {
         HeroTier::C
     } else {
         HeroTier::D
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_engine_with_fixture() -> MetaEngine {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        init_schema(&conn).expect("init schema");
+
+        conn.execute(
+            "INSERT INTO augment_meta (augment_id, name_zh, rarity, phash, desc_zh) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![6, "全能", "黄金", "0000000000000000", "Arena duplicate"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO augment_meta (augment_id, name_zh, rarity, phash, desc_zh) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![1006, "全能", "黄金", "0000000000000000", "ARAM Mayhem variant"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO augment_meta (augment_id, name_zh, rarity, phash, desc_zh) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![2001, "稀有海克斯", "棱彩", "0000000000000000", "Low sample test"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO augment_meta (augment_id, name_zh, rarity, phash, desc_zh) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![2002, "无统计海克斯", "白银", "0000000000000000", "Missing stats test"],
+        )
+        .unwrap();
+
+        // 1006 has real hero stats (hero_id=157, sample_size=120 >= 30); 6 has 0 hero stats.
+        conn.execute(
+            "INSERT INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate, sample_size) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![157, 1006, "S", 55.4, 18.2, 120],
+        )
+        .unwrap();
+        // 2001 has < 30 samples for hero 157.
+        conn.execute(
+            "INSERT INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate, sample_size) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![157, 2001, "S+", 61.0, 2.1, 12],
+        )
+        .unwrap();
+        // Global row for 6 has zero hero stats (hero_id = 0).
+        conn.execute(
+            "INSERT INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate, sample_size) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![0, 6, "B", 50.5, 4.0, 0],
+        )
+        .unwrap();
+
+        MetaEngine {
+            conn: Mutex::new(conn),
+        }
+    }
+
+    #[test]
+    fn list_augment_names_prioritizes_real_hero_stats_over_duplicate_names() {
+        let engine = test_engine_with_fixture();
+        let names = engine.list_augment_names();
+        let ids: Vec<i32> = names
+            .into_iter()
+            .filter(|e| e.name_zh == "全能")
+            .map(|e| e.augment_id)
+            .collect();
+        assert_eq!(ids, vec![1006, 6]);
+    }
+
+    #[test]
+    fn evaluate_augment_offer_flags_low_sample_and_missing_and_resolves_sibling() {
+        let engine = test_engine_with_fixture();
+        let evals = engine.evaluate_augment_offer(157, &[6, 2001, 2002], &[]);
+        assert_eq!(evals.len(), 3);
+
+        // 6 resolves to sibling 1006's real hero stats (sample_size = 120 >= 30)
+        assert!(!evals[0].low_sample);
+        assert_eq!(evals[0].sample_size, 120);
+        assert_eq!(evals[0].tier, HeroTier::S);
+        assert!((evals[0].win_rate - 55.4).abs() < 1e-6);
+
+        // 2001 has 12 < 30 samples -> flagged low_sample
+        assert!(evals[1].low_sample);
+        assert_eq!(evals[1].sample_size, 12);
+        assert_eq!(evals[1].tier, HeroTier::D);
+        assert!(evals[1].synergy_alert.is_none());
+
+        // 2002 missing completely -> sample_size == 0 & low_sample == true
+        assert!(evals[2].low_sample);
+        assert_eq!(evals[2].sample_size, 0);
+        assert_eq!(evals[2].tier, HeroTier::D);
+        assert!((evals[2].win_rate - 0.0).abs() < 1e-6);
     }
 }

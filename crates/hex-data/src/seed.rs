@@ -823,8 +823,8 @@ fn populate_inner(conn: &Connection) -> Result<()> {
             };
 
             conn.execute(
-                "INSERT OR REPLACE INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![champ.hero_id, aug.augment_id, tier, win_rate, aug.default_pick_rate],
+                "INSERT OR REPLACE INTO hero_augment_stats (hero_id, augment_id, tier, win_rate, pick_rate, sample_size) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![champ.hero_id, aug.augment_id, tier, win_rate, aug.default_pick_rate, 200_i32],
             )?;
         }
     }

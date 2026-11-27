@@ -56,11 +56,12 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         );
 
         CREATE TABLE IF NOT EXISTS hero_augment_stats (
-            hero_id    INTEGER NOT NULL,
-            augment_id INTEGER NOT NULL,
-            tier       TEXT NOT NULL,
-            win_rate   REAL NOT NULL,
-            pick_rate  REAL NOT NULL,
+            hero_id     INTEGER NOT NULL,
+            augment_id  INTEGER NOT NULL,
+            tier        TEXT NOT NULL,
+            win_rate    REAL NOT NULL,
+            pick_rate   REAL NOT NULL,
+            sample_size INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (hero_id, augment_id)
         );
 
