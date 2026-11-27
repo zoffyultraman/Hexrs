@@ -1265,7 +1265,8 @@ fn has_hero_augment_sample_size_col(conn: &Connection) -> bool {
     let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(1)) else {
         return false;
     };
-    rows.flatten().any(|name| name == "sample_size")
+    let found = rows.flatten().any(|name| name == "sample_size");
+    found
 }
 
 fn query_hero_augment_stat(
