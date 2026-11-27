@@ -292,29 +292,55 @@ fn render_augment_slot_card(eval: &AugmentEvaluation) -> Div {
 
 fn sanitize_augment_desc(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars();
+    let mut rest = raw;
 
-    while let Some(ch) = chars.next() {
-        if ch == '<' {
-            let mut tag = String::new();
-            for next in chars.by_ref() {
-                if next == '>' {
-                    break;
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix("{{") {
+            if let Some(end) = after.find("}}") {
+                let inner = after[..end].trim();
+                if inner.eq_ignore_ascii_case("Item_Keyword_OnHit") {
+                    out.push_str("攻击特效");
                 }
-                tag.push(next);
+                rest = &after[end + 2..];
+            } else {
+                break;
             }
-            let lower = tag.trim().to_ascii_lowercase();
-            if lower.starts_with("br") {
-                out.push(' ');
-            }
-        } else if ch == '@' {
-            for next in chars.by_ref() {
-                if next == '@' {
-                    break;
+        } else if rest.starts_with("%i:") || rest.starts_with("%I:") {
+            let after = &rest[3..];
+            let token_end = after.find(|c: char| c == '%' || c.is_whitespace());
+            if let Some(idx) = token_end {
+                if after.as_bytes()[idx] == b'%' {
+                    rest = &after[idx + 1..];
+                    continue;
                 }
             }
-        } else {
+            out.push('%');
+            rest = &rest[1..];
+        } else if let Some(after) = rest.strip_prefix('<') {
+            if let Some(end) = after.find('>') {
+                let tag = after[..end].trim();
+                if tag
+                    .as_bytes()
+                    .get(..2)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"br"))
+                {
+                    out.push(' ');
+                }
+                rest = &after[end + 1..];
+            } else {
+                break;
+            }
+        } else if let Some(after) = rest.strip_prefix('@') {
+            if let Some(end) = after.find('@') {
+                rest = &after[end + 1..];
+            } else {
+                break;
+            }
+        } else if let Some(ch) = rest.chars().next() {
             out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        } else {
+            break;
         }
     }
 
@@ -535,5 +561,28 @@ fn truncate_label(text: &str, max_chars: usize) -> String {
         format!("{collected}…")
     } else {
         collected
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_augment_desc;
+
+    #[test]
+    fn sanitizes_cdragon_mustache_inline_icons_and_html_tokens() {
+        assert_eq!(
+            sanitize_augment_desc("你的技能可施加{{ Item_Keyword_OnHit }}。"),
+            "你的技能可施加攻击特效。"
+        );
+        assert_eq!(
+            sanitize_augment_desc("{{Cherry_SpiritLink@TeamSize@_Summary}}"),
+            ""
+        );
+        assert_eq!(
+            sanitize_augment_desc(
+                "获得<crit>%i:scaleCrit%@CritChance*100@%暴击几率</crit>。<br>50%有效"
+            ),
+            "获得%暴击几率。 50%有效"
+        );
     }
 }
