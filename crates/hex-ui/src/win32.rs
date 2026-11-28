@@ -243,15 +243,16 @@ pub struct LoadingLayoutGeometry {
     pub center_bar_h_dip: f32,
 }
 
-/// Computes the 10-card top/bottom strip and center VS summary bar layout for a loading screen window.
+/// Computes the 10-card top/bottom strip and top VS summary bar layout for a loading screen window.
 pub fn compute_loading_layout_dip(window_w_dip: f32, window_h_dip: f32) -> LoadingLayoutGeometry {
     let w = window_w_dip.max(320.0);
     let h = window_h_dip.max(200.0);
+    let ui_scale = (h / 1080.0).clamp(0.85, 1.35);
 
-    let raw_card_w = h * 0.285;
-    let raw_gap = h * 0.026;
+    let raw_card_w = h * 0.2328;
+    let raw_gap = h * 0.0411;
     let raw_total = 5.0 * raw_card_w + 4.0 * raw_gap;
-    let max_row_w = w * 0.92;
+    let max_row_w = w * 0.90;
     let (card_w_dip, card_gap_dip) = if raw_total > max_row_w && raw_total > 0.0 {
         let scale = max_row_w / raw_total;
         (raw_card_w * scale, raw_gap * scale)
@@ -260,26 +261,16 @@ pub fn compute_loading_layout_dip(window_w_dip: f32, window_h_dip: f32) -> Loadi
     };
 
     let row_w = 5.0 * card_w_dip + 4.0 * card_gap_dip;
-    let row_left_dip = ((w - row_w) * 0.5).max(0.0);
-    let card_strip_h_dip = (h * 0.044).clamp(44.0, 48.0);
-    let top_row_y_dip = h * 0.022;
-    let bottom_row_y_dip = h * 0.528;
+    let row_left_dip = ((w - row_w) * 0.5 - w * 0.0015).max(0.0);
+    let card_strip_h_dip = (48.0 * ui_scale).clamp(44.0, 62.0);
+    let top_row_y_dip = h * 0.067;
+    let bottom_row_y_dip = h * 0.553;
 
-    let center_bar_h_dip = 28.0_f32;
-    let min_center_y = top_row_y_dip + card_strip_h_dip + 2.0;
-    let max_center_y = (bottom_row_y_dip - center_bar_h_dip - 2.0).max(min_center_y);
-    let raw_center_y = (h * 0.500 - center_bar_h_dip * 0.5).max(min_center_y);
-    let center_bar_y_dip = if raw_center_y > max_center_y {
-        let avail =
-            (bottom_row_y_dip - (top_row_y_dip + card_strip_h_dip) - center_bar_h_dip).max(0.0);
-        top_row_y_dip + card_strip_h_dip + avail * 0.5
-    } else {
-        raw_center_y
-    };
-
+    let center_bar_h_dip = (29.0 * ui_scale).clamp(24.0, 34.0);
+    let center_bar_y_dip = (h * 0.028).min((top_row_y_dip - center_bar_h_dip - 4.0).max(2.0));
     let center_bar_w_dip = row_w
-        .min(680.0)
-        .max(360.0)
+        .min(660.0 * ui_scale)
+        .max(380.0)
         .min((w - 24.0).max(200.0));
     let center_bar_left_dip = ((w - center_bar_w_dip) * 0.5).max(0.0);
 
@@ -1478,8 +1469,8 @@ mod tests {
         ] {
             let g = compute_loading_layout_dip(w, h);
             assert!(
-                (44.0..=48.0).contains(&g.card_strip_h_dip),
-                "strip height {} out of 44..=48 at {w}x{h}",
+                (44.0..=62.0).contains(&g.card_strip_h_dip),
+                "strip height {} out of 44..=62 at {w}x{h}",
                 g.card_strip_h_dip
             );
             let row_w = 5.0 * g.card_w_dip + 4.0 * g.card_gap_dip;
@@ -1489,12 +1480,21 @@ mod tests {
                 "row overflows right edge at {w}x{h}"
             );
             assert!(
-                g.top_row_y_dip + g.card_strip_h_dip < g.center_bar_y_dip,
-                "top row overlaps center bar at {w}x{h}"
+                g.center_bar_y_dip >= 0.0
+                    && g.center_bar_y_dip + g.center_bar_h_dip <= g.top_row_y_dip,
+                "top VS bar overlaps top card row at {w}x{h}: bar_end={} top_row={}",
+                g.center_bar_y_dip + g.center_bar_h_dip,
+                g.top_row_y_dip
             );
             assert!(
-                g.center_bar_y_dip + g.center_bar_h_dip <= g.bottom_row_y_dip,
-                "center bar overlaps bottom row at {w}x{h}"
+                g.bottom_row_y_dip > h * 0.54,
+                "bottom row {} does not clear mid-screen lore tip (> {}) at {w}x{h}",
+                g.bottom_row_y_dip,
+                h * 0.54
+            );
+            assert!(
+                g.top_row_y_dip + g.card_strip_h_dip < g.bottom_row_y_dip,
+                "top row overlaps bottom row at {w}x{h}"
             );
             assert!(g.center_bar_left_dip >= 0.0, "center bar left < 0 at {w}x{h}");
             assert!(

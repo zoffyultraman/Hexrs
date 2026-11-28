@@ -63,7 +63,7 @@ pub fn render_in_game_overlay(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div
             playstyle_tag,
             true,
         ))
-        .child(render_hud_collapse_button(true, cx));
+        .child(render_hud_header_actions(app, true, cx));
     }
 
     components::hud_container(
@@ -81,6 +81,7 @@ pub fn render_in_game_overlay(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div
     .gap_1()
     .text_color(theme::text_primary())
     .child(render_hero_header(
+        app,
         app.active_hero_icon.clone(),
         hero_name,
         playstyle_tag,
@@ -347,6 +348,38 @@ fn sanitize_augment_desc(raw: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn render_hud_roster_button(
+    active: bool,
+    cx: &mut Context<HexrsApp>,
+) -> impl IntoElement {
+    let (bg, border, text) = if active {
+        (theme::cyan_dim(), theme::border_cyan(), theme::cyan())
+    } else {
+        (
+            theme::card_elevated_bg(),
+            theme::border_subtle(),
+            theme::text_secondary(),
+        )
+    };
+    div()
+        .id("toggle-in-game-roster-btn")
+        .cursor_pointer()
+        .px(px(6.0))
+        .py(px(2.0))
+        .rounded(px(3.0))
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .hover(|s| s.bg(theme::bg_highlight()))
+        .text_size(px(11.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(text)
+        .child("战绩")
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.toggle_manual_loading_overlay(cx);
+        }))
+}
+
 fn render_hud_collapse_button(
     collapsed: bool,
     cx: &mut Context<HexrsApp>,
@@ -369,6 +402,21 @@ fn render_hud_collapse_button(
         .on_click(cx.listener(|this, _event, _window, cx| {
             this.toggle_in_game_hud_collapsed(cx);
         }))
+}
+
+fn render_hud_header_actions(
+    app: &HexrsApp,
+    collapsed: bool,
+    cx: &mut Context<HexrsApp>,
+) -> Div {
+    let mut row = div().flex().flex_row().items_center().gap(px(4.0));
+    if app.last_match_loading_screen.is_some() {
+        row = row.child(render_hud_roster_button(
+            app.manual_loading_overlay_open,
+            cx,
+        ));
+    }
+    row.child(render_hud_collapse_button(collapsed, cx))
 }
 
 fn render_hero_identity(
@@ -448,6 +496,7 @@ fn render_hero_identity(
 }
 
 fn render_hero_header(
+    app: &HexrsApp,
     hero_icon: Option<PathBuf>,
     hero_name: String,
     playstyle_tag: Option<String>,
@@ -462,7 +511,7 @@ fn render_hero_header(
         .justify_between()
         .gap(px(6.0))
         .child(render_hero_identity(hero_icon, hero_name, playstyle_tag, false))
-        .child(render_hud_collapse_button(false, cx))
+        .child(render_hud_header_actions(app, false, cx))
 }
 
 fn render_item_grid(app: &HexrsApp, build: Option<&DynamicBuildPlan>) -> Div {

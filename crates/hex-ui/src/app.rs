@@ -76,6 +76,8 @@ pub struct HexrsApp {
     pub lobby_focused: bool,
     pub game_focused: bool,
     pub loading_screen: Option<LoadingScreenSnapshot>,
+    pub last_match_loading_screen: Option<LoadingScreenSnapshot>,
+    pub manual_loading_overlay_open: bool,
     pub preview_loading_screen: bool,
     meta: Option<MetaEngine>,
     icon_cache: IconCache,
@@ -209,6 +211,8 @@ impl HexrsApp {
             lobby_focused: false,
             game_focused: false,
             loading_screen: None,
+            last_match_loading_screen: None,
+            manual_loading_overlay_open: false,
             preview_loading_screen: false,
             meta,
             icon_cache,
@@ -459,6 +463,21 @@ impl HexrsApp {
         info!(
             collapsed = self.in_game_hud_collapsed,
             "toggled in-game corner build HUD collapsed state"
+        );
+        self.reset_window_sync_cache();
+        cx.notify();
+    }
+
+    /// Toggles the manual in-game 10-player roster/ratings overlay backed by the current match snapshot.
+    pub fn toggle_manual_loading_overlay(&mut self, cx: &mut Context<Self>) {
+        if self.last_match_loading_screen.is_none() {
+            self.manual_loading_overlay_open = false;
+            return;
+        }
+        self.manual_loading_overlay_open = !self.manual_loading_overlay_open;
+        info!(
+            open = self.manual_loading_overlay_open,
+            "toggled manual in-game loading roster overlay"
         );
         self.reset_window_sync_cache();
         cx.notify();
@@ -910,7 +929,10 @@ impl HexrsApp {
                 || (effective_mode == AppMode::InGameOverlay
                     && self.overlay_visible
                     && self.game_focused
-                    && self.loading_screen.is_some()));
+                    && self.offered_augments.is_empty()
+                    && (self.loading_screen.is_some()
+                        || (self.manual_loading_overlay_open
+                            && self.last_match_loading_screen.is_some()))));
 
         let target_rect = if should_show {
             self.last_detected_game_rect
@@ -935,9 +957,14 @@ impl HexrsApp {
             return (LoadingOverlayState::default(), cmd);
         };
 
-        let preview_snap = (self.preview_loading_screen && self.loading_screen.is_none())
+        let active_snap = self.loading_screen.as_ref().or_else(|| {
+            self.manual_loading_overlay_open
+                .then_some(self.last_match_loading_screen.as_ref())
+                .flatten()
+        });
+        let preview_snap = (self.preview_loading_screen && active_snap.is_none())
             .then(|| self.preview_loading_screen_snapshot());
-        let Some(snap) = self.loading_screen.as_ref().or(preview_snap.as_ref()) else {
+        let Some(snap) = active_snap.or(preview_snap.as_ref()) else {
             let cmd = if loading_hwnd_raw != 0 && self.last_loading_sync != Some((None, false)) {
                 self.last_loading_sync = Some((None, false));
                 Some(Win32WindowCommand {
@@ -1101,7 +1128,13 @@ impl HexrsApp {
                     slot.title = title;
                 }
             }
-            if let Some(loading) = self.loading_screen.as_mut() {
+            for loading in [
+                self.loading_screen.as_mut(),
+                self.last_match_loading_screen.as_mut(),
+            ]
+            .into_iter()
+            .flatten()
+            {
                 for slot in &mut loading.team_one_ratings.slots {
                     let (tier_index, title) = self.rating_titles.resolve(slot.status, slot.score);
                     slot.tier_index = tier_index;
@@ -1126,6 +1159,8 @@ impl HexrsApp {
         self.owned_augment_ids.clear();
         self.clear_offered_augment_state();
         self.loading_screen = None;
+        self.last_match_loading_screen = None;
+        self.manual_loading_overlay_open = false;
         self.dynamic_build = None;
         self.active_hero_id = None;
         self.active_hero_alias = None;
@@ -1217,6 +1252,7 @@ impl HexrsApp {
                     slot.tier_index = tier_index;
                     slot.title = title;
                 }
+                self.last_match_loading_screen = Some(snap.clone());
                 self.loading_screen = Some(snap);
                 self.reset_window_sync_cache();
             }
@@ -1226,9 +1262,6 @@ impl HexrsApp {
                 }
             }
             AppEvent::LiveGameUpdated(live) => {
-                if live.game_time_secs > 0.0 && self.loading_screen.take().is_some() {
-                    self.reset_window_sync_cache();
-                }
                 self.refresh_live_game_data(&live);
                 self.live_game = Some(live);
             }
@@ -1368,6 +1401,7 @@ impl HexrsApp {
         self.offered_augments = slots;
         self.offered_augment_layout = layout;
         self.last_offer_capture_ms = Some(capture_ms);
+        self.manual_loading_overlay_open = false;
         self.reset_window_sync_cache();
     }
 

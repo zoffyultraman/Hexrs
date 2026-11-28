@@ -136,6 +136,7 @@ fn render_loading_card_strip(
     top_dip: f32,
     width_dip: f32,
     height_dip: f32,
+    ui_scale: f32,
 ) -> Div {
     let accent_color = slot
         .hero
@@ -153,14 +154,14 @@ fn render_loading_card_strip(
             .child(components::tier_badge(hero.tier, TierBadgeSize::Md))
             .child(
                 div()
-                    .text_size(px(12.5))
+                    .text_size(px(12.5 * ui_scale))
                     .font_weight(FontWeight::BOLD)
                     .font_family(theme::MONO_FONT)
                     .text_color(theme::win_rate_color(hero.win_rate))
                     .child(format!("{:.1}%", hero.win_rate)),
             ),
         None => div()
-            .text_size(px(11.0))
+            .text_size(px(11.0 * ui_scale))
             .text_color(theme::text_muted())
             .child("未识别"),
     };
@@ -239,7 +240,7 @@ fn render_loading_card_strip(
                     .overflow_hidden()
                     .child(
                         div()
-                            .text_size(px(10.0))
+                            .text_size(px(10.5 * ui_scale))
                             .text_color(theme::text_muted())
                             .child(short_name),
                     )
@@ -252,13 +253,14 @@ fn render_team_summary_side(
     summary: &TeamLoadingSummary,
     side_label: &str,
     is_enemy: bool,
+    ui_scale: f32,
 ) -> Div {
     let mut row = div()
         .flex()
         .flex_row()
         .items_center()
         .gap(px(5.0))
-        .text_size(px(11.0))
+        .text_size(px(11.5 * ui_scale))
         .overflow_hidden()
         .child(
             div()
@@ -328,27 +330,33 @@ impl Render for LoadingScreenOverlay {
 
         let layout =
             compute_loading_layout_dip(self.state.window_width_dip, self.state.window_height_dip);
+        let ui_scale = (self.state.window_height_dip / 1080.0).clamp(0.85, 1.35);
+        let card_w = (layout.card_w_dip - 4.0).max(60.0);
         let mut canvas = div().size_full().relative().bg(theme::transparent());
 
         for (idx, slot) in self.state.team_one.iter().take(5).enumerate() {
-            let left = layout.row_left_dip + idx as f32 * (layout.card_w_dip + layout.card_gap_dip);
+            let left =
+                layout.row_left_dip + idx as f32 * (layout.card_w_dip + layout.card_gap_dip) + 2.0;
             canvas = canvas.child(render_loading_card_strip(
                 slot,
                 left,
                 layout.top_row_y_dip,
-                layout.card_w_dip,
+                card_w,
                 layout.card_strip_h_dip,
+                ui_scale,
             ));
         }
 
         for (idx, slot) in self.state.team_two.iter().take(5).enumerate() {
-            let left = layout.row_left_dip + idx as f32 * (layout.card_w_dip + layout.card_gap_dip);
+            let left =
+                layout.row_left_dip + idx as f32 * (layout.card_w_dip + layout.card_gap_dip) + 2.0;
             canvas = canvas.child(render_loading_card_strip(
                 slot,
                 left,
                 layout.bottom_row_y_dip,
-                layout.card_w_dip,
+                card_w,
                 layout.card_strip_h_dip,
+                ui_scale,
             ));
         }
 
@@ -388,15 +396,25 @@ impl Render for LoadingScreenOverlay {
                 .items_center()
                 .justify_between()
                 .gap(px(8.0))
-                .child(render_team_summary_side(ally_summary, ally_label, false))
+                .child(render_team_summary_side(
+                    ally_summary,
+                    ally_label,
+                    false,
+                    ui_scale,
+                ))
                 .child(
                     div()
-                        .text_size(px(11.0))
+                        .text_size(px(11.5 * ui_scale))
                         .font_weight(FontWeight::EXTRA_BOLD)
                         .text_color(theme::gold())
                         .child("VS"),
                 )
-                .child(render_team_summary_side(enemy_summary, enemy_label, true)),
+                .child(render_team_summary_side(
+                    enemy_summary,
+                    enemy_label,
+                    true,
+                    ui_scale,
+                )),
         );
 
         canvas.child(center_bar)
