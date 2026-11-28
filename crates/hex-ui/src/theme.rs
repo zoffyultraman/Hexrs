@@ -201,7 +201,7 @@ pub fn bench_frame_border(tier: HeroTier) -> Rgba {
 }
 
 /// Color trio for rendering strength tier badges (`S+` .. `D`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TierPalette {
     pub bg: Rgba,
     pub border: Rgba,
@@ -288,7 +288,7 @@ pub fn player_score_colors(tier_index: u8) -> (Rgba, Rgba) {
 }
 
 /// Color trio for translucent Ghost Pill tags (Section 2.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PillPalette {
     pub bg: Rgba,
     pub border: Rgba,

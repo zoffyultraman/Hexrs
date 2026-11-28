@@ -4,7 +4,7 @@
 use gpui::{
     div, linear_color_stop, linear_gradient, prelude::*, px, Context, Div, FontWeight, Render,
 };
-use hex_core::HeroTier;
+use hex_core::{HeroTier, SummonerRatingStatus};
 
 use crate::components::{self, AccentBar, TierBadgeSize};
 use crate::theme;
