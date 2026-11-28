@@ -24,14 +24,16 @@ use tracing_subscriber::fmt::writer::MakeWriterExt;
 use tracing_subscriber::EnvFilter;
 
 use crate::app::HexrsApp;
-use crate::loading_overlay_view::{LoadingOverlayState, LoadingScreenOverlay};
+use crate::loading_overlay_view::{
+    LoadingOverlayState, LoadingScreenOverlay, TabScoreboardSideOverlay, TabScoreboardSideState,
+};
 use crate::lobby_badge_view::{
     BenchBadgeOverlay, BenchBadgeState, CardBadgeOverlay, CardBadgeState, TeamBadgeOverlay,
     TeamBadgeState,
 };
 use crate::tray::TrayController;
 
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(60);
+const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(30);
 
 /// Returns `%LOCALAPPDATA%/Hexrs/hexrs.log` (or platform equivalent).
 pub fn log_file_path() -> PathBuf {
@@ -200,6 +202,52 @@ fn main() {
             }
         };
 
+        let mut tab_left_hwnd_raw: isize = 0;
+        let tab_left_options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: None,
+            kind: WindowKind::PopUp,
+            window_background: WindowBackgroundAppearance::Transparent,
+            focus: false,
+            show: true,
+            ..Default::default()
+        };
+        let tab_left_window_handle = match cx.open_window(tab_left_options, |window, cx| {
+            if let Ok(raw) = win32::window_hwnd_raw(window) {
+                tab_left_hwnd_raw = raw;
+            }
+            cx.new(|_| TabScoreboardSideOverlay::new())
+        }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                warn!(error = %err, "failed to open Hexrs left Tab scoreboard overlay window");
+                None
+            }
+        };
+
+        let mut tab_right_hwnd_raw: isize = 0;
+        let tab_right_options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: None,
+            kind: WindowKind::PopUp,
+            window_background: WindowBackgroundAppearance::Transparent,
+            focus: false,
+            show: true,
+            ..Default::default()
+        };
+        let tab_right_window_handle = match cx.open_window(tab_right_options, |window, cx| {
+            if let Ok(raw) = win32::window_hwnd_raw(window) {
+                tab_right_hwnd_raw = raw;
+            }
+            cx.new(|_| TabScoreboardSideOverlay::new())
+        }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                warn!(error = %err, "failed to open Hexrs right Tab scoreboard overlay window");
+                None
+            }
+        };
+
         cx.spawn(async move |cx: &mut AsyncApp| loop {
             cx.background_executor().timer(EVENT_POLL_INTERVAL).await;
             let (
@@ -212,6 +260,10 @@ fn main() {
                 card_cmd,
                 loading_state,
                 loading_cmd,
+                tab_left_state,
+                tab_left_cmd,
+                tab_right_state,
+                tab_right_cmd,
             ) = match window_handle.update(cx, |app, window, cx| {
                 let main_cmd = app.tick(window, cx);
                 let active_bench_hwnd = if bench_window_handle.is_some() {
@@ -231,6 +283,16 @@ fn main() {
                 };
                 let active_loading_hwnd = if loading_window_handle.is_some() {
                     loading_hwnd_raw
+                } else {
+                    0
+                };
+                let active_tab_left_hwnd = if tab_left_window_handle.is_some() {
+                    tab_left_hwnd_raw
+                } else {
+                    0
+                };
+                let active_tab_right_hwnd = if tab_right_window_handle.is_some() {
+                    tab_right_hwnd_raw
                 } else {
                     0
                 };
@@ -259,6 +321,18 @@ fn main() {
                     app.build_loading_overlay_sync(active_loading_hwnd)
                 };
 
+                let (tab_left_state, tab_left_cmd, tab_right_state, tab_right_cmd) =
+                    if active_tab_left_hwnd == 0 && active_tab_right_hwnd == 0 {
+                        (
+                            TabScoreboardSideState::default(),
+                            None,
+                            TabScoreboardSideState::default(),
+                            None,
+                        )
+                    } else {
+                        app.build_tab_scoreboard_sync(active_tab_left_hwnd, active_tab_right_hwnd)
+                    };
+
                 (
                     main_cmd,
                     bench_state,
@@ -269,6 +343,10 @@ fn main() {
                     card_cmd,
                     loading_state,
                     loading_cmd,
+                    tab_left_state,
+                    tab_left_cmd,
+                    tab_right_state,
+                    tab_right_cmd,
                 )
             }) {
                 Ok(tuple) => tuple,
@@ -296,6 +374,18 @@ fn main() {
             if let Some(ref loading_handle) = loading_window_handle {
                 let _ = loading_handle.update(cx, |overlay, _window, cx| {
                     overlay.update_state(loading_state, cx);
+                });
+            }
+
+            if let Some(ref tab_left_handle) = tab_left_window_handle {
+                let _ = tab_left_handle.update(cx, |overlay, _window, cx| {
+                    overlay.update_state(tab_left_state, cx);
+                });
+            }
+
+            if let Some(ref tab_right_handle) = tab_right_window_handle {
+                let _ = tab_right_handle.update(cx, |overlay, _window, cx| {
+                    overlay.update_state(tab_right_state, cx);
                 });
             }
 
@@ -356,6 +446,30 @@ fn main() {
                 }
                 if let Some(ref loading_handle) = loading_window_handle {
                     let _ = loading_handle.update(cx, |_overlay, window, cx| {
+                        window.refresh();
+                        cx.notify();
+                    });
+                }
+            }
+
+            if let Some(cmd) = tab_left_cmd {
+                if let Err(err) = win32::apply_window_command(&cmd) {
+                    warn!(error = %err, ?cmd.action, "failed to apply deferred left Tab scoreboard command");
+                }
+                if let Some(ref tab_left_handle) = tab_left_window_handle {
+                    let _ = tab_left_handle.update(cx, |_overlay, window, cx| {
+                        window.refresh();
+                        cx.notify();
+                    });
+                }
+            }
+
+            if let Some(cmd) = tab_right_cmd {
+                if let Err(err) = win32::apply_window_command(&cmd) {
+                    warn!(error = %err, ?cmd.action, "failed to apply deferred right Tab scoreboard command");
+                }
+                if let Some(ref tab_right_handle) = tab_right_window_handle {
+                    let _ = tab_right_handle.update(cx, |_overlay, window, cx| {
                         window.refresh();
                         cx.notify();
                     });

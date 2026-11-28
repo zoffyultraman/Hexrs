@@ -54,6 +54,13 @@ pub enum OverlayCorner {
     TopRight,
 }
 
+/// Side wing of the hold-Tab in-game scoreboard overlay (`Left` = team_one, `Right` = team_two).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabScoreboardSide {
+    Left,
+    Right,
+}
+
 /// Deferred Win32 window repositioning or visibility command executed after GPUI releases `Window`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Win32WindowAction {
@@ -85,6 +92,12 @@ pub enum Win32WindowAction {
     },
     LoadingScreenOverlay {
         target_rect: Option<WindowRectInfo>,
+        visible: bool,
+    },
+    TabScoreboardSideOverlay {
+        target_rect: Option<WindowRectInfo>,
+        side: TabScoreboardSide,
+        has_augment_wings: bool,
         visible: bool,
     },
 }
@@ -288,6 +301,75 @@ pub fn compute_loading_layout_dip(window_w_dip: f32, window_h_dip: f32) -> Loadi
     }
 }
 
+/// Logical DIP geometry for the left and right hold-Tab in-game scoreboard side panels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TabScoreboardLayoutGeometry {
+    pub left_x_dip: f32,
+    pub right_x_dip: f32,
+    pub window_top_dip: f32,
+    pub panel_w_dip: f32,
+    pub window_h_dip: f32,
+    pub header_h_dip: f32,
+    pub header_gap_dip: f32,
+    pub row_h_dip: f32,
+    pub row_pitch_dip: f32,
+    pub ui_scale: f32,
+}
+
+/// Computes left/right side-panel DIP coordinates aligned to the native League Tab scoreboard rows.
+pub fn compute_tab_scoreboard_layout_dip(
+    window_w_dip: f32,
+    window_h_dip: f32,
+    has_augment_wings: bool,
+) -> TabScoreboardLayoutGeometry {
+    let w = window_w_dip.max(320.0);
+    let h = window_h_dip.max(200.0);
+    let ui_scale = (h / 1080.0).clamp(0.85, 1.35);
+
+    let half_board_w = h * if has_augment_wings { 0.632 } else { 0.535 };
+    let board_left = (w * 0.5 - half_board_w).max(0.0);
+    let board_right = (w * 0.5 + half_board_w).min(w);
+
+    let gap = (6.0 * ui_scale).clamp(4.0, 10.0);
+    let outer_margin = (6.0 * ui_scale).clamp(4.0, 10.0);
+    let avail_side = (board_left - gap - outer_margin)
+        .min(w - board_right - gap - outer_margin)
+        .max(0.0);
+    let desired_w = (232.0 * ui_scale).clamp(176.0, 310.0);
+    let panel_w_dip = if avail_side >= 132.0 {
+        desired_w.min(avail_side)
+    } else {
+        desired_w
+            .min(avail_side.max(120.0))
+            .min((w * 0.25).max(120.0))
+    };
+
+    let left_x_dip = (board_left - gap - panel_w_dip).max(outer_margin);
+    let right_x_dip = (board_right + gap).min((w - outer_margin - panel_w_dip).max(0.0));
+
+    let row0_top = h * 0.2871;
+    let row_h_dip = h * 0.0645;
+    let row_pitch_dip = h * 0.0710;
+    let header_h_dip = (26.0 * ui_scale).clamp(22.0, 32.0);
+    let header_gap_dip = (5.0 * ui_scale).clamp(4.0, 8.0);
+    let window_top_dip = (row0_top - header_h_dip - header_gap_dip).max(4.0);
+    let rows_total_h = 4.0 * row_pitch_dip + row_h_dip;
+    let window_h_dip = header_h_dip + header_gap_dip + rows_total_h + 2.0;
+
+    TabScoreboardLayoutGeometry {
+        left_x_dip,
+        right_x_dip,
+        window_top_dip,
+        panel_w_dip,
+        window_h_dip,
+        header_h_dip,
+        header_gap_dip,
+        row_h_dip,
+        row_pitch_dip,
+        ui_scale,
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
     use std::os::windows::ffi::OsStrExt;
@@ -305,6 +387,9 @@ mod imp {
     };
     use windows::Win32::Graphics::Gdi::InvalidateRect;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_TAB,
+    };
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, FindWindowW, GetClassNameW, GetForegroundWindow, GetSystemMetrics,
@@ -319,12 +404,13 @@ mod imp {
     };
 
     use super::{
-        compute_augment_bar_geometry, AugmentOfferLayout, OverlayCorner, Win32WindowAction,
-        Win32WindowCommand, WindowRectInfo, BENCH_SLOT_HEIGHT_FRAC, BENCH_SLOT_PITCH_FRAC,
-        BENCH_SLOT_WIDTH_FRAC, BENCH_STRIP_LEFT_FRAC, BENCH_STRIP_Y_FRAC, DIAGNOSTICS_HEIGHT_DIP,
-        DIAGNOSTICS_WIDTH_DIP, IN_GAME_HUD_COLLAPSED_HEIGHT_DIP, IN_GAME_HUD_HEIGHT_DIP,
-        IN_GAME_HUD_WIDTH_DIP, PICK_CARD_BADGE_HEIGHT_FRAC, PICK_CARD_GAP_FRAC,
-        PICK_CARD_STRIP_Y_FRAC, PICK_CARD_WIDTH_FRAC, SIDEBAR_WIDTH_DIP, TEAM_STRIP_RIGHT_FRAC,
+        compute_augment_bar_geometry, compute_tab_scoreboard_layout_dip, AugmentOfferLayout,
+        OverlayCorner, TabScoreboardSide, Win32WindowAction, Win32WindowCommand, WindowRectInfo,
+        BENCH_SLOT_HEIGHT_FRAC, BENCH_SLOT_PITCH_FRAC, BENCH_SLOT_WIDTH_FRAC,
+        BENCH_STRIP_LEFT_FRAC, BENCH_STRIP_Y_FRAC, DIAGNOSTICS_HEIGHT_DIP, DIAGNOSTICS_WIDTH_DIP,
+        IN_GAME_HUD_COLLAPSED_HEIGHT_DIP, IN_GAME_HUD_HEIGHT_DIP, IN_GAME_HUD_WIDTH_DIP,
+        PICK_CARD_BADGE_HEIGHT_FRAC, PICK_CARD_GAP_FRAC, PICK_CARD_STRIP_Y_FRAC,
+        PICK_CARD_WIDTH_FRAC, SIDEBAR_WIDTH_DIP, TEAM_STRIP_RIGHT_FRAC,
     };
 
     const MIN_TARGET_WINDOW_DIM: i32 = 200;
@@ -828,7 +914,90 @@ mod imp {
                 target_rect,
                 visible,
             } => set_loading_screen_overlay_hwnd(hwnd, *target_rect, *visible),
+            Win32WindowAction::TabScoreboardSideOverlay {
+                target_rect,
+                side,
+                has_augment_wings,
+                visible,
+            } => set_tab_scoreboard_side_overlay_hwnd(
+                hwnd,
+                *target_rect,
+                *side,
+                *has_augment_wings,
+                *visible,
+            ),
         }
+    }
+
+    /// Returns `true` when bare `Tab` is currently held down (without Alt/Ctrl/Win modifiers).
+    pub fn is_tab_scoreboard_hotkey_pressed() -> bool {
+        // SAFETY: `GetAsyncKeyState` is a stateless, hook-free read-only keyboard state query.
+        unsafe {
+            GetAsyncKeyState(VK_TAB.0 as i32) < 0
+                && GetAsyncKeyState(VK_MENU.0 as i32) >= 0
+                && GetAsyncKeyState(VK_CONTROL.0 as i32) >= 0
+                && GetAsyncKeyState(VK_LWIN.0 as i32) >= 0
+                && GetAsyncKeyState(VK_RWIN.0 as i32) >= 0
+        }
+    }
+
+    /// Anchors one click-through hold-Tab scoreboard side panel adjacent to the native Tab board.
+    fn set_tab_scoreboard_side_overlay_hwnd(
+        hwnd: HWND,
+        target_rect: Option<WindowRectInfo>,
+        side: TabScoreboardSide,
+        has_augment_wings: bool,
+        visible: bool,
+    ) -> Result<()> {
+        // SAFETY: `hwnd` belongs to the active GPUI Tab scoreboard side window on the UI thread.
+        unsafe {
+            apply_transparent_ex_style(hwnd, false);
+
+            let Some(target) = target_rect.filter(|_| visible) else {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return Ok(());
+            };
+
+            let own_dpi = GetDpiForWindow(hwnd);
+            let dpi = if own_dpi > 0 { own_dpi } else { target.dpi.max(96) };
+            let scale = dpi as f32 / 96.0;
+
+            let target_w = target.width().max(320);
+            let target_h = target.height().max(200);
+            let layout = compute_tab_scoreboard_layout_dip(
+                target_w as f32 / scale,
+                target_h as f32 / scale,
+                has_augment_wings,
+            );
+            let x_dip = match side {
+                TabScoreboardSide::Left => layout.left_x_dip,
+                TabScoreboardSide::Right => layout.right_x_dip,
+            };
+
+            let width_px = ((layout.panel_w_dip * scale).round() as i32).clamp(1, target_w);
+            let height_px = ((layout.window_h_dip * scale).round() as i32).clamp(1, target_h);
+            let max_x = target.left + (target_w - width_px).max(0);
+            let max_y = target.top + (target_h - height_px).max(0);
+            let x = (target.left + (x_dip * scale).round() as i32).clamp(target.left, max_x);
+            let y = (target.top + (layout.window_top_dip * scale).round() as i32)
+                .clamp(target.top, max_y);
+
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                x,
+                y,
+                width_px,
+                height_px,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            .context("SetWindowPos(tab scoreboard side overlay) failed")?;
+
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+
+        Ok(())
     }
 
     /// Anchors the full-window click-through 10-player loading screen overlay over `League of Legends.exe`.
@@ -1396,6 +1565,11 @@ mod imp {
         false
     }
 
+    /// Non-Windows stub for `is_tab_scoreboard_hotkey_pressed`.
+    pub fn is_tab_scoreboard_hotkey_pressed() -> bool {
+        false
+    }
+
     /// Non-Windows stub for `apply_overlay_styles`.
     #[allow(dead_code)]
     pub fn apply_overlay_styles(_window: &Window) -> Result<()> {
@@ -1446,13 +1620,13 @@ mod imp {
 pub use imp::{
     apply_window_command, default_preview_game_rect, default_preview_lobby_rect,
     find_league_game_window, find_league_lobby_window, is_game_window_foreground,
-    is_lobby_window_foreground, open_data_directory, open_log_file, relaunch_as_administrator,
-    window_hwnd_raw, window_scale_for_hwnd,
+    is_lobby_window_foreground, is_tab_scoreboard_hotkey_pressed, open_data_directory,
+    open_log_file, relaunch_as_administrator, window_hwnd_raw, window_scale_for_hwnd,
 };
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_loading_layout_dip, OverlayCorner};
+    use super::{compute_loading_layout_dip, compute_tab_scoreboard_layout_dip, OverlayCorner};
 
     #[test]
     fn overlay_corner_defaults_to_top_right() {
@@ -1501,6 +1675,60 @@ mod tests {
                 g.center_bar_left_dip + g.center_bar_w_dip <= w + 0.1,
                 "center bar overflows right edge at {w}x{h}"
             );
+        }
+    }
+
+    #[test]
+    fn tab_scoreboard_layout_fits_and_avoids_board_hud_and_minimap() {
+        for (w, h) in [
+            (1920.0_f32, 1080.0_f32),
+            (2560.0_f32, 1440.0_f32),
+            (2560.0_f32, 1080.0_f32),
+            (1920.0_f32, 1200.0_f32),
+            (1280.0_f32, 720.0_f32),
+        ] {
+            for has_augment_wings in [true, false] {
+                let g = compute_tab_scoreboard_layout_dip(w, h, has_augment_wings);
+                let half_board_w = h * if has_augment_wings { 0.632 } else { 0.535 };
+                let board_left = (w * 0.5 - half_board_w).max(0.0);
+                let board_right = (w * 0.5 + half_board_w).min(w);
+
+                assert!(g.left_x_dip >= 0.0, "left_x < 0 at {w}x{h} wings={has_augment_wings}");
+                assert!(
+                    g.left_x_dip + g.panel_w_dip <= board_left + 0.1,
+                    "left panel overlaps native Tab board at {w}x{h} wings={has_augment_wings}"
+                );
+                assert!(
+                    g.right_x_dip >= board_right - 0.1,
+                    "right panel overlaps native Tab board at {w}x{h} wings={has_augment_wings}"
+                );
+                assert!(
+                    g.right_x_dip + g.panel_w_dip <= w + 0.1,
+                    "right panel overflows screen at {w}x{h} wings={has_augment_wings}"
+                );
+
+                let row0_top = g.window_top_dip + g.header_h_dip + g.header_gap_dip;
+                let row4_bottom = row0_top + 4.0 * g.row_pitch_dip + g.row_h_dip;
+                assert!(
+                    row0_top >= h * 0.287 && row4_bottom <= h * 0.636,
+                    "rows [{row0_top}, {row4_bottom}] out of [{}, {}] at {w}x{h}",
+                    h * 0.287,
+                    h * 0.636
+                );
+
+                if (w - 1920.0).abs() < 0.1 && (h - 1080.0).abs() < 0.1 {
+                    assert!(
+                        g.window_top_dip > 265.0,
+                        "1080p top {} overlaps expanded corner HUD (> 265)",
+                        g.window_top_dip
+                    );
+                    assert!(
+                        g.window_top_dip + g.window_h_dip < 720.0,
+                        "1080p bottom {} overlaps minimap (< 720)",
+                        g.window_top_dip + g.window_h_dip
+                    );
+                }
+            }
         }
     }
 }

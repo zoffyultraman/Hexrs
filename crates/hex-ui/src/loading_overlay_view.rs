@@ -8,7 +8,9 @@ use hex_core::{
 use crate::components::{self, AccentBar, TierBadgeSize};
 use crate::lobby_badge_view::SummonerBadgeData;
 use crate::theme;
-use crate::win32::compute_loading_layout_dip;
+use crate::win32::{
+    compute_loading_layout_dip, compute_tab_scoreboard_layout_dip, TabScoreboardSide,
+};
 
 /// Champion strength and short display name rendered on a loading screen card strip.
 #[derive(Debug, Clone, PartialEq)]
@@ -130,20 +132,7 @@ impl LoadingScreenOverlay {
     }
 }
 
-fn render_loading_card_strip(
-    slot: &LoadingCardSlotData,
-    left_dip: f32,
-    top_dip: f32,
-    width_dip: f32,
-    height_dip: f32,
-    ui_scale: f32,
-) -> Div {
-    let accent_color = slot
-        .hero
-        .as_ref()
-        .map(|h| theme::tier_palette(h.tier).text)
-        .unwrap_or_else(theme::border_subtle);
-
+fn render_player_card_inner(slot: &LoadingCardSlotData, ui_scale: f32) -> Div {
     let line1_left = match slot.hero.as_ref() {
         Some(hero) => div()
             .flex()
@@ -196,6 +185,59 @@ fn render_loading_card_strip(
         tags = tags.child(components::loss_streak_pill(sum.streak));
     }
 
+    div()
+        .size_full()
+        .px(px(7.0))
+        .pt(px(4.0))
+        .pb(px(3.0))
+        .flex()
+        .flex_col()
+        .justify_between()
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(4.0))
+                .overflow_hidden()
+                .child(line1_left)
+                .child(components::player_score_line(sum)),
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(4.0))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .text_size(px(10.5 * ui_scale))
+                        .text_color(theme::text_muted())
+                        .child(short_name),
+                )
+                .child(tags),
+        )
+}
+
+fn render_loading_card_strip(
+    slot: &LoadingCardSlotData,
+    left_dip: f32,
+    top_dip: f32,
+    width_dip: f32,
+    height_dip: f32,
+    ui_scale: f32,
+) -> Div {
+    let accent_color = slot
+        .hero
+        .as_ref()
+        .map(|h| theme::tier_palette(h.tier).text)
+        .unwrap_or_else(theme::border_subtle);
+
     components::hud_container(
         theme::bg_surface(),
         Some(theme::border_subtle()),
@@ -208,45 +250,7 @@ fn render_loading_card_strip(
     .h(px(height_dip))
     .rounded(px(3.0))
     .overflow_hidden()
-    .child(
-        div()
-            .size_full()
-            .px(px(7.0))
-            .pt(px(4.0))
-            .pb(px(3.0))
-            .flex()
-            .flex_col()
-            .justify_between()
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(4.0))
-                    .overflow_hidden()
-                    .child(line1_left)
-                    .child(components::player_score_line(sum)),
-            )
-            .child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(4.0))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .text_size(px(10.5 * ui_scale))
-                            .text_color(theme::text_muted())
-                            .child(short_name),
-                    )
-                    .child(tags),
-            ),
-    )
+    .child(render_player_card_inner(slot, ui_scale))
 }
 
 fn render_team_summary_side(
@@ -418,6 +422,209 @@ impl Render for LoadingScreenOverlay {
         );
 
         canvas.child(center_bar)
+    }
+}
+
+/// Immutable frame snapshot synced from `HexrsApp` to one side wing of the hold-Tab scoreboard overlay.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TabScoreboardSideState {
+    pub visible: bool,
+    pub side: TabScoreboardSide,
+    pub side_label: String,
+    pub is_enemy: bool,
+    pub has_augment_wings: bool,
+    pub slots: Vec<LoadingCardSlotData>,
+    pub summary: TeamLoadingSummary,
+    pub window_width_dip: f32,
+    pub window_height_dip: f32,
+}
+
+impl Default for TabScoreboardSideState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            side: TabScoreboardSide::Left,
+            side_label: String::new(),
+            is_enemy: false,
+            has_augment_wings: false,
+            slots: Vec::new(),
+            summary: TeamLoadingSummary::default(),
+            window_width_dip: 0.0,
+            window_height_dip: 0.0,
+        }
+    }
+}
+
+/// Click-through GPUI overlay anchoring 5 row-aligned player cards beside one wing of the Tab board.
+pub struct TabScoreboardSideOverlay {
+    state: TabScoreboardSideState,
+}
+
+impl TabScoreboardSideOverlay {
+    /// Creates an initially hidden hold-Tab scoreboard side panel.
+    pub fn new() -> Self {
+        Self {
+            state: TabScoreboardSideState::default(),
+        }
+    }
+
+    /// Replaces `state` and notifies GPUI only when geometry, visibility, or slot values changed.
+    pub fn update_state(&mut self, next: TabScoreboardSideState, cx: &mut Context<Self>) {
+        if self.state != next {
+            self.state = next;
+            cx.notify();
+        }
+    }
+}
+
+fn inner_edge_accent(side: TabScoreboardSide, color: gpui::Rgba) -> AccentBar {
+    match side {
+        TabScoreboardSide::Left => AccentBar::Right(2.0, color),
+        TabScoreboardSide::Right => AccentBar::Left(2.0, color),
+    }
+}
+
+fn render_tab_scoreboard_header(
+    state: &TabScoreboardSideState,
+    header_h_dip: f32,
+    ui_scale: f32,
+) -> Div {
+    let accent_color = if state.is_enemy {
+        theme::gold()
+    } else {
+        theme::cyan()
+    };
+    let font_px = (10.5 * ui_scale).clamp(9.5, 13.0);
+    let summary = &state.summary;
+
+    let mut right_meta = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+        .overflow_hidden();
+
+    if state.is_enemy && summary.avg_score.is_none() && summary.loading_count > 0 {
+        right_meta = right_meta.child(
+            div()
+                .font_family(theme::MONO_FONT)
+                .text_color(theme::text_muted())
+                .child(format!("拉取中({})…", summary.loading_count)),
+        );
+    } else {
+        match summary.avg_score {
+            Some(avg) => {
+                let (score_color, _) = theme::player_score_colors(summary.avg_tier_index);
+                right_meta = right_meta.child(
+                    div()
+                        .font_weight(FontWeight::BOLD)
+                        .font_family(theme::MONO_FONT)
+                        .text_color(score_color)
+                        .child(format!("均分 {avg}")),
+                );
+            }
+            None => {
+                right_meta =
+                    right_meta.child(div().text_color(theme::text_muted()).child("统计中"));
+            }
+        }
+
+        if !summary.premade_label.is_empty() {
+            right_meta = right_meta
+                .child(div().text_color(theme::text_muted()).child("·"))
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::text_secondary())
+                        .child(summary.premade_label.clone()),
+                );
+        }
+    }
+
+    components::hud_container(
+        theme::bg_surface_dense(),
+        Some(theme::border_subtle()),
+        inner_edge_accent(state.side, accent_color),
+    )
+    .absolute()
+    .left(px(0.0))
+    .top(px(0.0))
+    .w_full()
+    .h(px(header_h_dip))
+    .rounded(px(3.0))
+    .overflow_hidden()
+    .child(
+        div()
+            .size_full()
+            .px(px(7.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .gap(px(4.0))
+            .text_size(px(font_px))
+            .overflow_hidden()
+            .child(
+                div()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(theme::text_secondary())
+                    .child(state.side_label.clone()),
+            )
+            .child(right_meta),
+    )
+}
+
+impl Render for TabScoreboardSideOverlay {
+    fn render(&mut self, _window: &mut gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.state.visible
+            || self.state.window_width_dip <= 100.0
+            || self.state.window_height_dip <= 100.0
+            || self.state.slots.is_empty()
+        {
+            return div().size_full().bg(theme::transparent());
+        }
+
+        let layout = compute_tab_scoreboard_layout_dip(
+            self.state.window_width_dip,
+            self.state.window_height_dip,
+            self.state.has_augment_wings,
+        );
+        let mut canvas = div()
+            .size_full()
+            .relative()
+            .bg(theme::transparent())
+            .child(render_tab_scoreboard_header(
+                &self.state,
+                layout.header_h_dip,
+                layout.ui_scale,
+            ));
+
+        for (idx, slot) in self.state.slots.iter().take(5).enumerate() {
+            let accent_color = slot
+                .hero
+                .as_ref()
+                .map(|h| theme::tier_palette(h.tier).text)
+                .unwrap_or_else(theme::border_subtle);
+            let top =
+                layout.header_h_dip + layout.header_gap_dip + idx as f32 * layout.row_pitch_dip;
+            canvas = canvas.child(
+                components::hud_container(
+                    theme::bg_surface(),
+                    Some(theme::border_subtle()),
+                    inner_edge_accent(self.state.side, accent_color),
+                )
+                .absolute()
+                .left(px(0.0))
+                .top(px(top))
+                .w_full()
+                .h(px(layout.row_h_dip))
+                .rounded(px(3.0))
+                .overflow_hidden()
+                .child(render_player_card_inner(slot, layout.ui_scale)),
+            );
+        }
+
+        canvas
     }
 }
 

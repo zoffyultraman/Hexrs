@@ -25,6 +25,7 @@ use tracing::{debug, info, warn};
 
 use crate::loading_overlay_view::{
     compute_team_loading_summary, LoadingCardHeroData, LoadingCardSlotData, LoadingOverlayState,
+    TabScoreboardSideState,
 };
 use crate::lobby_badge_view::{
     BenchBadgeState, CardBadgeState, CardSlotBadgeData, SlotBadgeData, SummonerBadgeData,
@@ -35,7 +36,9 @@ use crate::log_file_path;
 use crate::overlay_view;
 use crate::theme;
 use crate::tray::{TrayAction, TrayController};
-use crate::win32::{self, OverlayCorner, Win32WindowAction, Win32WindowCommand, WindowRectInfo};
+use crate::win32::{
+    self, OverlayCorner, TabScoreboardSide, Win32WindowAction, Win32WindowCommand, WindowRectInfo,
+};
 
 const BENCH_HIGHLIGHT_LIMIT: usize = 12;
 const TEAM_RECOMMENDATION_LIMIT: usize = 5;
@@ -80,8 +83,9 @@ pub struct HexrsApp {
     pub game_focused: bool,
     pub loading_screen: Option<LoadingScreenSnapshot>,
     pub last_match_loading_screen: Option<LoadingScreenSnapshot>,
-    pub manual_loading_overlay_open: bool,
+    pub tab_scoreboard_held: bool,
     pub preview_loading_screen: bool,
+    pub preview_tab_scoreboard: bool,
     loading_card_order: Option<(u64, Vec<usize>, Vec<usize>)>,
     meta: Option<MetaEngine>,
     icon_cache: IconCache,
@@ -101,6 +105,8 @@ pub struct HexrsApp {
     last_team_badge_sync: Option<Option<WindowRectInfo>>,
     last_card_badge_sync: Option<(Option<WindowRectInfo>, usize)>,
     last_loading_sync: Option<(Option<WindowRectInfo>, bool)>,
+    last_tab_left_sync: Option<(Option<WindowRectInfo>, bool, bool)>,
+    last_tab_right_sync: Option<(Option<WindowRectInfo>, bool, bool)>,
     last_overlay_sync: Option<(
         Option<WindowRectInfo>,
         OverlayCorner,
@@ -216,8 +222,9 @@ impl HexrsApp {
             game_focused: false,
             loading_screen: None,
             last_match_loading_screen: None,
-            manual_loading_overlay_open: false,
+            tab_scoreboard_held: false,
             preview_loading_screen: false,
+            preview_tab_scoreboard: false,
             loading_card_order: None,
             meta,
             icon_cache,
@@ -237,6 +244,8 @@ impl HexrsApp {
             last_team_badge_sync: None,
             last_card_badge_sync: None,
             last_loading_sync: None,
+            last_tab_left_sync: None,
+            last_tab_right_sync: None,
             last_overlay_sync: None,
             last_diagnostics_sync: false,
             last_dormant_hidden: false,
@@ -349,9 +358,13 @@ impl HexrsApp {
                         dirty = true;
                     }
                     TrayAction::ToggleDiagnostics => {
-                        if self.preview_mode.is_some() || self.preview_loading_screen {
+                        if self.preview_mode.is_some()
+                            || self.preview_loading_screen
+                            || self.preview_tab_scoreboard
+                        {
                             self.preview_mode = None;
                             self.preview_loading_screen = false;
+                            self.preview_tab_scoreboard = false;
                             self.clear_offered_augment_state();
                             self.diagnostics_open = true;
                             if let Some(ref tray_ctrl) = self.tray {
@@ -359,6 +372,7 @@ impl HexrsApp {
                             }
                         } else {
                             self.preview_loading_screen = false;
+                            self.preview_tab_scoreboard = false;
                             self.diagnostics_open = self
                                 .tray
                                 .as_ref()
@@ -440,6 +454,18 @@ impl HexrsApp {
 
         let pending_cmd = self.sync_window_mode(window);
 
+        let next_tab_held = self.mode == AppMode::InGameOverlay
+            && self.game_focused
+            && self.overlay_visible
+            && self.loading_screen.is_none()
+            && self.offered_augments.is_empty()
+            && self.last_match_loading_screen.is_some()
+            && win32::is_tab_scoreboard_hotkey_pressed();
+        if next_tab_held != self.tab_scoreboard_held {
+            self.tab_scoreboard_held = next_tab_held;
+            dirty = true;
+        }
+
         if dirty {
             cx.notify();
         }
@@ -473,25 +499,11 @@ impl HexrsApp {
         cx.notify();
     }
 
-    /// Toggles the manual in-game 10-player roster/ratings overlay backed by the current match snapshot.
-    pub fn toggle_manual_loading_overlay(&mut self, cx: &mut Context<Self>) {
-        if self.last_match_loading_screen.is_none() {
-            self.manual_loading_overlay_open = false;
-            return;
-        }
-        self.manual_loading_overlay_open = !self.manual_loading_overlay_open;
-        info!(
-            open = self.manual_loading_overlay_open,
-            "toggled manual in-game loading roster overlay"
-        );
-        self.reset_window_sync_cache();
-        cx.notify();
-    }
-
     /// Sets or exits UI preview mode from the diagnostics panel.
     pub fn set_preview_mode(&mut self, mode: Option<AppMode>, cx: &mut Context<Self>) {
         self.preview_mode = mode;
         self.preview_loading_screen = false;
+        self.preview_tab_scoreboard = false;
         self.clear_offered_augment_state();
         if mode == Some(AppMode::InGameOverlay) && self.live_game.is_none() {
             self.populate_hero_hud_state(Some(PREVIEW_YASUO_HERO_ID), None, &[]);
@@ -506,6 +518,7 @@ impl HexrsApp {
     pub fn preview_augment_bar(&mut self, cx: &mut Context<Self>) {
         self.preview_mode = Some(AppMode::InGameOverlay);
         self.preview_loading_screen = false;
+        self.preview_tab_scoreboard = false;
         if self.live_game.is_none() {
             self.populate_hero_hud_state(Some(PREVIEW_YASUO_HERO_ID), None, &[]);
         }
@@ -532,7 +545,21 @@ impl HexrsApp {
     pub fn preview_loading_screen_mode(&mut self, cx: &mut Context<Self>) {
         self.preview_mode = Some(AppMode::InGameOverlay);
         self.preview_loading_screen = true;
+        self.preview_tab_scoreboard = false;
         self.clear_offered_augment_state();
+        self.reset_window_sync_cache();
+        cx.notify();
+    }
+
+    /// Previews the dual hold-Tab side scoreboard panels without requiring an active match.
+    pub fn preview_tab_scoreboard_mode(&mut self, cx: &mut Context<Self>) {
+        self.preview_mode = Some(AppMode::InGameOverlay);
+        self.preview_loading_screen = false;
+        self.preview_tab_scoreboard = true;
+        self.clear_offered_augment_state();
+        if self.live_game.is_none() {
+            self.populate_hero_hud_state(Some(PREVIEW_YASUO_HERO_ID), None, &[]);
+        }
         self.reset_window_sync_cache();
         cx.notify();
     }
@@ -542,6 +569,7 @@ impl HexrsApp {
         self.diagnostics_open = false;
         self.preview_mode = None;
         self.preview_loading_screen = false;
+        self.preview_tab_scoreboard = false;
         self.clear_offered_augment_state();
         if let Some(ref tray_ctrl) = self.tray {
             tray_ctrl.set_diagnostics_checked(false);
@@ -574,6 +602,8 @@ impl HexrsApp {
         self.last_team_badge_sync = None;
         self.last_card_badge_sync = None;
         self.last_loading_sync = None;
+        self.last_tab_left_sync = None;
+        self.last_tab_right_sync = None;
         self.last_overlay_sync = None;
         self.last_diagnostics_sync = false;
         self.last_dormant_hidden = false;
@@ -950,9 +980,7 @@ impl HexrsApp {
                     && self.overlay_visible
                     && self.game_focused
                     && self.offered_augments.is_empty()
-                    && (self.loading_screen.is_some()
-                        || (self.manual_loading_overlay_open
-                            && self.last_match_loading_screen.is_some()))));
+                    && self.loading_screen.is_some()));
 
         let target_rect = if should_show {
             self.last_detected_game_rect
@@ -977,14 +1005,9 @@ impl HexrsApp {
             return (LoadingOverlayState::default(), cmd);
         };
 
-        let active_snap = self.loading_screen.as_ref().or_else(|| {
-            self.manual_loading_overlay_open
-                .then_some(self.last_match_loading_screen.as_ref())
-                .flatten()
-        });
-        let preview_snap = (self.preview_loading_screen && active_snap.is_none())
+        let preview_snap = (self.preview_loading_screen && self.loading_screen.is_none())
             .then(|| self.preview_loading_screen_snapshot());
-        let Some(snap) = active_snap.or(preview_snap.as_ref()) else {
+        let Some(snap) = self.loading_screen.as_ref().or(preview_snap.as_ref()) else {
             let cmd = if loading_hwnd_raw != 0 && self.last_loading_sync != Some((None, false)) {
                 self.last_loading_sync = Some((None, false));
                 Some(Win32WindowCommand {
@@ -1041,6 +1064,180 @@ impl HexrsApp {
         };
 
         (state, cmd)
+    }
+
+    /// Computes left/right hold-Tab scoreboard side states and their deferred Win32 window commands.
+    pub fn build_tab_scoreboard_sync(
+        &mut self,
+        left_hwnd_raw: isize,
+        right_hwnd_raw: isize,
+    ) -> (
+        TabScoreboardSideState,
+        Option<Win32WindowCommand>,
+        TabScoreboardSideState,
+        Option<Win32WindowCommand>,
+    ) {
+        let in_diagnostics = self.diagnostics_open && self.preview_mode.is_none();
+        let effective_mode = self.preview_mode.unwrap_or(self.mode);
+        let should_show = !in_diagnostics
+            && (self.preview_tab_scoreboard
+                || (effective_mode == AppMode::InGameOverlay
+                    && self.overlay_visible
+                    && self.game_focused
+                    && self.tab_scoreboard_held
+                    && self.loading_screen.is_none()
+                    && self.offered_augments.is_empty()
+                    && self.last_match_loading_screen.is_some()));
+
+        let target_rect = if should_show {
+            self.last_detected_game_rect.or_else(|| {
+                self.preview_tab_scoreboard
+                    .then(win32::default_preview_game_rect)
+            })
+        } else {
+            None
+        };
+
+        let hide_sync = |this: &mut Self| {
+            let left_cmd = if left_hwnd_raw != 0
+                && this.last_tab_left_sync != Some((None, false, false))
+            {
+                this.last_tab_left_sync = Some((None, false, false));
+                Some(Win32WindowCommand {
+                    hwnd_raw: left_hwnd_raw,
+                    action: Win32WindowAction::TabScoreboardSideOverlay {
+                        target_rect: None,
+                        side: TabScoreboardSide::Left,
+                        has_augment_wings: false,
+                        visible: false,
+                    },
+                })
+            } else {
+                None
+            };
+            let right_cmd = if right_hwnd_raw != 0
+                && this.last_tab_right_sync != Some((None, false, false))
+            {
+                this.last_tab_right_sync = Some((None, false, false));
+                Some(Win32WindowCommand {
+                    hwnd_raw: right_hwnd_raw,
+                    action: Win32WindowAction::TabScoreboardSideOverlay {
+                        target_rect: None,
+                        side: TabScoreboardSide::Right,
+                        has_augment_wings: false,
+                        visible: false,
+                    },
+                })
+            } else {
+                None
+            };
+            (
+                TabScoreboardSideState::default(),
+                left_cmd,
+                TabScoreboardSideState::default(),
+                right_cmd,
+            )
+        };
+
+        let Some(rect) = target_rect else {
+            return hide_sync(self);
+        };
+
+        let preview_snap = (self.preview_tab_scoreboard && self.last_match_loading_screen.is_none())
+            .then(|| self.preview_loading_screen_snapshot());
+        let Some(snap) = self
+            .last_match_loading_screen
+            .as_ref()
+            .or(preview_snap.as_ref())
+        else {
+            return hide_sync(self);
+        };
+
+        let has_augment_wings = snapshot_has_augment_wings(snap);
+        let (left_label, left_is_enemy, right_label, right_is_enemy) =
+            tab_scoreboard_side_meta(snap.local_side);
+        let (team_one_order, team_two_order) = match self.loading_card_order.as_ref() {
+            Some((gid, t1, t2)) if *gid == snap.game_id => {
+                (Some(t1.as_slice()), Some(t2.as_slice()))
+            }
+            _ => (None, None),
+        };
+        let left_slots =
+            self.map_loading_team_slots(&snap.team_one, &snap.team_one_ratings, team_one_order);
+        let right_slots =
+            self.map_loading_team_slots(&snap.team_two, &snap.team_two_ratings, team_two_order);
+        let left_summary =
+            compute_team_loading_summary(&snap.team_one_ratings, &self.rating_titles);
+        let right_summary =
+            compute_team_loading_summary(&snap.team_two_ratings, &self.rating_titles);
+
+        let left_scale = win32::window_scale_for_hwnd(left_hwnd_raw, rect.scale()).max(0.5);
+        let right_scale = win32::window_scale_for_hwnd(right_hwnd_raw, rect.scale()).max(0.5);
+
+        let left_state = TabScoreboardSideState {
+            visible: !left_slots.is_empty(),
+            side: TabScoreboardSide::Left,
+            side_label: left_label.to_owned(),
+            is_enemy: left_is_enemy,
+            has_augment_wings,
+            slots: left_slots,
+            summary: left_summary,
+            window_width_dip: rect.width() as f32 / left_scale,
+            window_height_dip: rect.height() as f32 / left_scale,
+        };
+        let right_state = TabScoreboardSideState {
+            visible: !right_slots.is_empty(),
+            side: TabScoreboardSide::Right,
+            side_label: right_label.to_owned(),
+            is_enemy: right_is_enemy,
+            has_augment_wings,
+            slots: right_slots,
+            summary: right_summary,
+            window_width_dip: rect.width() as f32 / right_scale,
+            window_height_dip: rect.height() as f32 / right_scale,
+        };
+
+        let left_sync_key = (
+            left_state.visible.then_some(rect),
+            has_augment_wings,
+            left_state.visible,
+        );
+        let left_cmd = if left_hwnd_raw != 0 && self.last_tab_left_sync != Some(left_sync_key) {
+            self.last_tab_left_sync = Some(left_sync_key);
+            Some(Win32WindowCommand {
+                hwnd_raw: left_hwnd_raw,
+                action: Win32WindowAction::TabScoreboardSideOverlay {
+                    target_rect: left_sync_key.0,
+                    side: TabScoreboardSide::Left,
+                    has_augment_wings,
+                    visible: left_state.visible,
+                },
+            })
+        } else {
+            None
+        };
+
+        let right_sync_key = (
+            right_state.visible.then_some(rect),
+            has_augment_wings,
+            right_state.visible,
+        );
+        let right_cmd = if right_hwnd_raw != 0 && self.last_tab_right_sync != Some(right_sync_key) {
+            self.last_tab_right_sync = Some(right_sync_key);
+            Some(Win32WindowCommand {
+                hwnd_raw: right_hwnd_raw,
+                action: Win32WindowAction::TabScoreboardSideOverlay {
+                    target_rect: right_sync_key.0,
+                    side: TabScoreboardSide::Right,
+                    has_augment_wings,
+                    visible: right_state.visible,
+                },
+            })
+        } else {
+            None
+        };
+
+        (left_state, left_cmd, right_state, right_cmd)
     }
 
     fn lookup_card_slot_badge(&self, hero_id: i32) -> Option<CardSlotBadgeData> {
@@ -1190,7 +1387,7 @@ impl HexrsApp {
         self.loading_card_order = None;
         self.loading_screen = None;
         self.last_match_loading_screen = None;
-        self.manual_loading_overlay_open = false;
+        self.tab_scoreboard_held = false;
         self.dynamic_build = None;
         self.active_hero_id = None;
         self.active_hero_alias = None;
@@ -1329,6 +1526,28 @@ impl HexrsApp {
                 if self.loading_screen.take().is_some() {
                     self.reset_window_sync_cache();
                 }
+            }
+            AppEvent::MatchRosterUpdated(mut snap) => {
+                self.refresh_rating_titles_if_changed();
+                if self
+                    .loading_card_order
+                    .as_ref()
+                    .is_some_and(|(gid, _, _)| *gid != snap.game_id)
+                {
+                    self.loading_card_order = None;
+                }
+                for slot in &mut snap.team_one_ratings.slots {
+                    let (tier_index, title) = self.rating_titles.resolve(slot.status, slot.score);
+                    slot.tier_index = tier_index;
+                    slot.title = title;
+                }
+                for slot in &mut snap.team_two_ratings.slots {
+                    let (tier_index, title) = self.rating_titles.resolve(slot.status, slot.score);
+                    slot.tier_index = tier_index;
+                    slot.title = title;
+                }
+                self.last_match_loading_screen = Some(snap);
+                self.reset_window_sync_cache();
             }
             AppEvent::LiveGameUpdated(live) => {
                 self.refresh_live_game_data(&live);
@@ -1470,7 +1689,7 @@ impl HexrsApp {
         self.offered_augments = slots;
         self.offered_augment_layout = layout;
         self.last_offer_capture_ms = Some(capture_ms);
-        self.manual_loading_overlay_open = false;
+        self.tab_scoreboard_held = false;
         self.reset_window_sync_cache();
     }
 
@@ -2208,30 +2427,58 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                         )
                         .child(
                             div()
-                                .id("preview-loading-screen-btn")
-                                .cursor_pointer()
-                                .px_2()
-                                .py_1()
-                                .rounded(px(3.0))
-                                .bg(theme::cyan_dim())
-                                .border_1()
-                                .border_color(theme::border_cyan())
-                                .hover(|s| s.bg(theme::card_elevated_bg()))
                                 .flex()
-                                .justify_center()
-                                .text_xs()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::cyan())
-                                .child("预览加载页10人")
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.preview_loading_screen_mode(cx);
-                                })),
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("preview-loading-screen-btn")
+                                        .flex_1()
+                                        .cursor_pointer()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded(px(3.0))
+                                        .bg(theme::cyan_dim())
+                                        .border_1()
+                                        .border_color(theme::border_cyan())
+                                        .hover(|s| s.bg(theme::card_elevated_bg()))
+                                        .flex()
+                                        .justify_center()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::cyan())
+                                        .child("预览加载页10人")
+                                        .on_click(cx.listener(|this, _event, _window, cx| {
+                                            this.preview_loading_screen_mode(cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id("preview-tab-scoreboard-btn")
+                                        .flex_1()
+                                        .cursor_pointer()
+                                        .px_2()
+                                        .py_1()
+                                        .rounded(px(3.0))
+                                        .bg(theme::gold_dim())
+                                        .border_1()
+                                        .border_color(theme::border_gold())
+                                        .hover(|s| s.bg(theme::card_elevated_bg()))
+                                        .flex()
+                                        .justify_center()
+                                        .text_xs()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::gold())
+                                        .child("预览Tab战绩面板")
+                                        .on_click(cx.listener(|this, _event, _window, cx| {
+                                            this.preview_tab_scoreboard_mode(cx);
+                                        })),
+                                ),
                         )
                         .child(
                             div()
                                 .text_xs()
                                 .text_color(theme::text_muted())
-                                .child("提示：右上角出装窗可点击标题栏「收起/展开」，三选一与加载页保持穿透；预览时右键托盘“显示诊断面板”即可切回。"),
+                                .child("提示：局内按住 Tab 可在战绩面板两侧查看双方 10 人数据（松手隐藏）；右上角出装窗可点标题栏「收起/展开」，预览时右键托盘“显示诊断面板”即可切回。"),
                         ),
                 )
                 .child(
@@ -2296,6 +2543,22 @@ fn diag_row_colored(label: &str, value: String, value_color: Rgba) -> Div {
                 .text_color(value_color)
                 .child(value),
         )
+}
+
+fn snapshot_has_augment_wings(snap: &LoadingScreenSnapshot) -> bool {
+    snap.queue_id == Some(2400)
+        || snap.queue_id == Some(1700)
+        || snap.game_mode.eq_ignore_ascii_case("KIWI")
+        || snap.game_mode.eq_ignore_ascii_case("CHERRY")
+}
+
+fn tab_scoreboard_side_meta(
+    local_side: LoadingTeamSide,
+) -> (&'static str, bool, &'static str, bool) {
+    match local_side {
+        LoadingTeamSide::Blue => ("我方(蓝)", false, "敌方(红)", true),
+        LoadingTeamSide::Red => ("敌方(蓝)", true, "我方(红)", false),
+    }
 }
 
 fn resolve_slot_order(order: Option<&[usize]>, len: usize) -> Vec<usize> {
@@ -2383,9 +2646,44 @@ fn format_rect_info(rect: Option<WindowRectInfo>) -> String {
 mod tests {
     use super::{
         map_loading_team_slots_with, order_subset_cards_for_display, resolve_slot_order,
-        HeroTier, LoadingCardHeroData, LoadingPlayerSlot, RatingTitlesConfig,
+        snapshot_has_augment_wings, tab_scoreboard_side_meta, HeroTier, LoadingCardHeroData,
+        LoadingPlayerSlot, LoadingScreenSnapshot, LoadingTeamSide, RatingTitlesConfig,
         SummonerRatingStatus, SummonerRatingSummary, TeamRatingsSnapshot,
     };
+
+    #[test]
+    fn detects_augment_wings_modes_and_queues() {
+        let mut snap = LoadingScreenSnapshot::default();
+        assert!(!snapshot_has_augment_wings(&snap));
+
+        snap.queue_id = Some(2400);
+        assert!(snapshot_has_augment_wings(&snap));
+
+        snap.queue_id = Some(1700);
+        assert!(snapshot_has_augment_wings(&snap));
+
+        snap.queue_id = Some(450);
+        snap.game_mode = "ARAM".to_owned();
+        assert!(!snapshot_has_augment_wings(&snap));
+
+        snap.game_mode = "kiwi".to_owned();
+        assert!(snapshot_has_augment_wings(&snap));
+
+        snap.game_mode = "CHERRY".to_owned();
+        assert!(snapshot_has_augment_wings(&snap));
+    }
+
+    #[test]
+    fn maps_tab_scoreboard_sides_by_local_side() {
+        assert_eq!(
+            tab_scoreboard_side_meta(LoadingTeamSide::Blue),
+            ("我方(蓝)", false, "敌方(红)", true)
+        );
+        assert_eq!(
+            tab_scoreboard_side_meta(LoadingTeamSide::Red),
+            ("敌方(蓝)", true, "我方(红)", false)
+        );
+    }
 
     #[test]
     fn subset_cards_visual_order_places_third_blessed_card_in_center() {

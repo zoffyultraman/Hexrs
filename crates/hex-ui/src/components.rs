@@ -189,6 +189,7 @@ pub enum AccentBar {
     None,
     Top(f32, Rgba),
     Bottom(f32, Rgba),
+    Left(f32, Rgba),
     Right(f32, Rgba),
 }
 
@@ -227,6 +228,15 @@ pub fn hud_container(bg: impl Into<Background>, border: Option<Rgba>, accent: Ac
                 .left(px(0.0))
                 .right(px(0.0))
                 .h(px(thickness))
+                .bg(color),
+        ),
+        AccentBar::Left(thickness, color) => container.child(
+            div()
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .bottom(px(0.0))
+                .w(px(thickness))
                 .bg(color),
         ),
         AccentBar::Right(thickness, color) => container.child(
