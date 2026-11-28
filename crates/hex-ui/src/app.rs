@@ -8,8 +8,8 @@ use crossbeam_channel::{unbounded, Receiver};
 use gpui::{div, prelude::*, px, Context, Div, FontWeight, Render, Rgba, Window};
 use hex_core::{
     AppEvent, AppMode, AugmentOfferLayout, ChampSelectState, CoreDiagnostics, CoreHandle,
-    HeroTier, LiveGameState, LoadingPlayerSlot, LoadingScreenSnapshot, LoadingTeamSide,
-    PremadeGroupSummary, RatingTitlesConfig, RoiManifest, SummonerRatingStatus,
+    HeroTier, LiveGameState, LivePlayerEntry, LoadingPlayerSlot, LoadingScreenSnapshot,
+    LoadingTeamSide, PremadeGroupSummary, RatingTitlesConfig, RoiManifest, SummonerRatingStatus,
     SummonerRatingSummary, TeamRatingsSnapshot,
 };
 use hex_data::{
@@ -18,8 +18,8 @@ use hex_data::{
     UpdaterConfig,
 };
 use hex_vision::{
-    LoadingAlignmentTargets, LoadingSlotTarget, SharedRoiManifest, VisionController,
-    VisionGameContext,
+    LoadingAlignmentTargets, LoadingSlotTarget, SharedRoiManifest, TabAlignmentTargets,
+    VisionController, VisionGameContext,
 };
 use tracing::{debug, info, warn};
 
@@ -43,6 +43,10 @@ use crate::win32::{
 const BENCH_HIGHLIGHT_LIMIT: usize = 12;
 const TEAM_RECOMMENDATION_LIMIT: usize = 5;
 const PREVIEW_YASUO_HERO_ID: i32 = 157;
+
+/// Transient in-memory player key `(champion_id, normalized_display_name)` for stable Tab row locking.
+/// Never log, persist to disk, or emit to telemetry.
+type TabRosterKey = (i32, String);
 
 /// Root GPUI state and controller bridging `hex-core`, `hex-vision`, `hex-data`, `tray-icon`, and Win32.
 pub struct HexrsApp {
@@ -87,6 +91,8 @@ pub struct HexrsApp {
     pub preview_loading_screen: bool,
     pub preview_tab_scoreboard: bool,
     loading_card_order: Option<(u64, Vec<usize>, Vec<usize>)>,
+    tab_visual_keys: Option<(u64, Vec<TabRosterKey>, Vec<TabRosterKey>)>,
+    last_tab_target_keys: Option<(u64, Vec<TabRosterKey>, Vec<TabRosterKey>)>,
     meta: Option<MetaEngine>,
     icon_cache: IconCache,
     icon_ready_rx: Receiver<()>,
@@ -226,6 +232,8 @@ impl HexrsApp {
             preview_loading_screen: false,
             preview_tab_scoreboard: false,
             loading_card_order: None,
+            tab_visual_keys: None,
+            last_tab_target_keys: None,
             meta,
             icon_cache,
             icon_ready_rx,
@@ -459,11 +467,28 @@ impl HexrsApp {
             && self.overlay_visible
             && self.loading_screen.is_none()
             && self.offered_augments.is_empty()
-            && self.last_match_loading_screen.is_some()
+            && self.has_tab_roster_data()
             && win32::is_tab_scoreboard_hotkey_pressed();
         if next_tab_held != self.tab_scoreboard_held {
             self.tab_scoreboard_held = next_tab_held;
             dirty = true;
+        }
+        if self.tab_scoreboard_held {
+            let (game_id, left_entries, right_entries) =
+                self.build_baseline_tab_entries(self.last_match_loading_screen.as_ref());
+            let left_keys: Vec<TabRosterKey> =
+                left_entries.iter().map(|(k, _, _)| k.clone()).collect();
+            let right_keys: Vec<TabRosterKey> =
+                right_entries.iter().map(|(k, _, _)| k.clone()).collect();
+            let targets = TabAlignmentTargets {
+                game_id,
+                left_names: left_entries.into_iter().map(|(_, name, _)| name).collect(),
+                right_names: right_entries.into_iter().map(|(_, name, _)| name).collect(),
+            };
+            self.last_tab_target_keys = Some((game_id, left_keys, right_keys));
+            self.vision.set_tab_targets(Some(targets));
+        } else {
+            self.vision.set_tab_targets(None);
         }
 
         if dirty {
@@ -1067,6 +1092,85 @@ impl HexrsApp {
         (state, cmd)
     }
 
+    fn has_tab_roster_data(&self) -> bool {
+        self.last_match_loading_screen.is_some()
+            || self
+                .live_game
+                .as_ref()
+                .is_some_and(|g| !g.players.is_empty())
+    }
+
+    fn build_baseline_tab_entries(
+        &self,
+        snap: Option<&LoadingScreenSnapshot>,
+    ) -> (
+        u64,
+        Vec<(TabRosterKey, String, LoadingCardSlotData)>,
+        Vec<(TabRosterKey, String, LoadingCardSlotData)>,
+    ) {
+        let game_id = snap.map(|s| s.game_id).unwrap_or(0);
+        let empty_ratings = TeamRatingsSnapshot::default();
+        let (snap_t1, snap_r1, snap_t2, snap_r2) = match snap {
+            Some(s) => (
+                s.team_one.as_slice(),
+                &s.team_one_ratings,
+                s.team_two.as_slice(),
+                &s.team_two_ratings,
+            ),
+            None => (&[][..], &empty_ratings, &[][..], &empty_ratings),
+        };
+
+        let (live_t1, live_t2): (Vec<LivePlayerEntry>, Vec<LivePlayerEntry>) =
+            if self.preview_tab_scoreboard && self.last_match_loading_screen.is_none() {
+                (Vec::new(), Vec::new())
+            } else if let Some(live) = self.live_game.as_ref() {
+                let mut blue = Vec::with_capacity(5);
+                let mut red = Vec::with_capacity(5);
+                for p in &live.players {
+                    match p.team {
+                        LoadingTeamSide::Blue => blue.push(p.clone()),
+                        LoadingTeamSide::Red => red.push(p.clone()),
+                    }
+                }
+                (blue, red)
+            } else {
+                (Vec::new(), Vec::new())
+            };
+
+        let (team_one_order, team_two_order) = match self.loading_card_order.as_ref() {
+            Some((gid, t1, t2)) if *gid == game_id => (Some(t1.as_slice()), Some(t2.as_slice())),
+            _ => (None, None),
+        };
+
+        let resolve_hero = |name: &str| {
+            self.meta
+                .as_ref()
+                .and_then(|m| m.resolve_champion_id_by_alias(name))
+        };
+        let lookup_hero = |hero_id: i32| self.lookup_loading_hero(hero_id);
+
+        let left_entries = build_tab_team_entries(
+            &live_t1,
+            snap_t1,
+            snap_r1,
+            team_one_order,
+            &self.rating_titles,
+            resolve_hero,
+            lookup_hero,
+        );
+        let right_entries = build_tab_team_entries(
+            &live_t2,
+            snap_t2,
+            snap_r2,
+            team_two_order,
+            &self.rating_titles,
+            resolve_hero,
+            lookup_hero,
+        );
+
+        (game_id, left_entries, right_entries)
+    }
+
     /// Computes left/right hold-Tab scoreboard side states and their deferred Win32 window commands.
     pub fn build_tab_scoreboard_sync(
         &mut self,
@@ -1088,7 +1192,7 @@ impl HexrsApp {
                     && self.tab_scoreboard_held
                     && self.loading_screen.is_none()
                     && self.offered_augments.is_empty()
-                    && self.last_match_loading_screen.is_some()));
+                    && self.has_tab_roster_data()));
 
         let target_rect = if should_show {
             self.last_detected_game_rect.or_else(|| {
@@ -1144,33 +1248,50 @@ impl HexrsApp {
             return hide_sync(self);
         };
 
-        let preview_snap = (self.preview_tab_scoreboard && self.last_match_loading_screen.is_none())
-            .then(|| self.preview_loading_screen_snapshot());
-        let Some(snap) = self
+        let preview_snap = (self.preview_tab_scoreboard
+            && self.last_match_loading_screen.is_none()
+            && !self
+                .live_game
+                .as_ref()
+                .is_some_and(|g| !g.players.is_empty()))
+        .then(|| self.preview_loading_screen_snapshot());
+        let snap = self
             .last_match_loading_screen
             .as_ref()
-            .or(preview_snap.as_ref())
-        else {
+            .or(preview_snap.as_ref());
+        if snap.is_none() && !self.has_tab_roster_data() {
             return hide_sync(self);
-        };
+        }
 
-        let has_augment_wings = snapshot_has_augment_wings(snap);
+        let has_augment_wings = snap
+            .map(snapshot_has_augment_wings)
+            .unwrap_or_else(|| {
+                self.live_game.as_ref().is_some_and(|g| {
+                    g.game_mode.eq_ignore_ascii_case("KIWI")
+                        || g.game_mode.eq_ignore_ascii_case("CHERRY")
+                })
+            });
+        let local_side = snap
+            .map(|s| s.local_side)
+            .unwrap_or(LoadingTeamSide::Blue);
         let (left_label, left_is_enemy, right_label, right_is_enemy) =
-            tab_scoreboard_side_meta(snap.local_side);
-        let (team_one_order, team_two_order) = match self.loading_card_order.as_ref() {
-            Some((gid, t1, t2)) if *gid == snap.game_id => {
-                (Some(t1.as_slice()), Some(t2.as_slice()))
-            }
+            tab_scoreboard_side_meta(local_side);
+
+        let (game_id, left_entries, right_entries) = self.build_baseline_tab_entries(snap);
+        let (left_visual, right_visual) = match self.tab_visual_keys.as_ref() {
+            Some((gid, lk, rk)) if *gid == game_id => (Some(lk.as_slice()), Some(rk.as_slice())),
             _ => (None, None),
         };
-        let left_slots =
-            self.map_loading_team_slots(&snap.team_one, &snap.team_one_ratings, team_one_order);
-        let right_slots =
-            self.map_loading_team_slots(&snap.team_two, &snap.team_two_ratings, team_two_order);
-        let left_summary =
-            compute_team_loading_summary(&snap.team_one_ratings, &self.rating_titles);
-        let right_summary =
-            compute_team_loading_summary(&snap.team_two_ratings, &self.rating_titles);
+        let left_slots = apply_tab_visual_order(left_entries, left_visual);
+        let right_slots = apply_tab_visual_order(right_entries, right_visual);
+
+        let empty_ratings = TeamRatingsSnapshot::default();
+        let (r1, r2) = match snap {
+            Some(s) => (&s.team_one_ratings, &s.team_two_ratings),
+            None => (&empty_ratings, &empty_ratings),
+        };
+        let left_summary = compute_team_loading_summary(r1, &self.rating_titles);
+        let right_summary = compute_team_loading_summary(r2, &self.rating_titles);
 
         let left_scale = win32::window_scale_for_hwnd(left_hwnd_raw, rect.scale()).max(0.5);
         let right_scale = win32::window_scale_for_hwnd(right_hwnd_raw, rect.scale()).max(0.5);
@@ -1385,7 +1506,10 @@ impl HexrsApp {
         self.owned_augment_ids.clear();
         self.clear_offered_augment_state();
         self.vision.set_loading_targets(None);
+        self.vision.set_tab_targets(None);
         self.loading_card_order = None;
+        self.tab_visual_keys = None;
+        self.last_tab_target_keys = None;
         self.loading_screen = None;
         self.last_match_loading_screen = None;
         self.tab_scoreboard_held = false;
@@ -1477,6 +1601,20 @@ impl HexrsApp {
                 {
                     self.loading_card_order = None;
                 }
+                if self
+                    .tab_visual_keys
+                    .as_ref()
+                    .is_some_and(|(gid, _, _)| *gid != snap.game_id)
+                {
+                    self.tab_visual_keys = None;
+                }
+                if self
+                    .last_tab_target_keys
+                    .as_ref()
+                    .is_some_and(|(gid, _, _)| *gid != snap.game_id)
+                {
+                    self.last_tab_target_keys = None;
+                }
                 for slot in &mut snap.team_one_ratings.slots {
                     let (tier_index, title) = self.rating_titles.resolve(slot.status, slot.score);
                     slot.tier_index = tier_index;
@@ -1524,6 +1662,44 @@ impl HexrsApp {
                     );
                 }
             }
+            AppEvent::TabRowOrderDetected {
+                game_id,
+                left_order,
+                right_order,
+            } => {
+                let matched_keys = self
+                    .last_tab_target_keys
+                    .as_ref()
+                    .filter(|(target_gid, _, _)| *target_gid == game_id)
+                    .map(|(_, left_keys, right_keys)| {
+                        let ordered_left: Vec<TabRosterKey> =
+                            resolve_slot_order(Some(&left_order), left_keys.len())
+                                .into_iter()
+                                .map(|idx| left_keys[idx].clone())
+                                .collect();
+                        let ordered_right: Vec<TabRosterKey> =
+                            resolve_slot_order(Some(&right_order), right_keys.len())
+                                .into_iter()
+                                .map(|idx| right_keys[idx].clone())
+                                .collect();
+                        (ordered_left, ordered_right)
+                    });
+                if let Some((ordered_left, ordered_right)) = matched_keys {
+                    info!(
+                        game_id,
+                        left_order = ?left_order,
+                        right_order = ?right_order,
+                        "applied OCR Tab scoreboard row order"
+                    );
+                    self.tab_visual_keys = Some((game_id, ordered_left, ordered_right));
+                    self.reset_window_sync_cache();
+                } else {
+                    debug!(
+                        game_id,
+                        "ignoring stale or unmatched Tab scoreboard row order"
+                    );
+                }
+            }
             AppEvent::LoadingScreenCleared => {
                 self.vision.set_loading_targets(None);
                 if self.loading_screen.take().is_some() {
@@ -1538,6 +1714,20 @@ impl HexrsApp {
                     .is_some_and(|(gid, _, _)| *gid != snap.game_id)
                 {
                     self.loading_card_order = None;
+                }
+                if self
+                    .tab_visual_keys
+                    .as_ref()
+                    .is_some_and(|(gid, _, _)| *gid != snap.game_id)
+                {
+                    self.tab_visual_keys = None;
+                }
+                if self
+                    .last_tab_target_keys
+                    .as_ref()
+                    .is_some_and(|(gid, _, _)| *gid != snap.game_id)
+                {
+                    self.last_tab_target_keys = None;
                 }
                 for slot in &mut snap.team_one_ratings.slots {
                     let (tier_index, title) = self.rating_titles.resolve(slot.status, slot.score);
@@ -2570,6 +2760,210 @@ fn diag_row_colored(label: &str, value: String, value_color: Rgba) -> Div {
         )
 }
 
+fn normalize_tab_display_name(raw: &str) -> String {
+    raw.split('#')
+        .next()
+        .unwrap_or(raw)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn loading_placeholder_badge(rating_titles: &RatingTitlesConfig) -> SummonerBadgeData {
+    let (tier_index, title) = rating_titles.resolve(SummonerRatingStatus::Loading, 0);
+    SummonerBadgeData {
+        status: SummonerRatingStatus::Loading,
+        score: 0,
+        tier_index,
+        title,
+        streak: 0,
+        premade_group_id: None,
+        is_premade_last_mvp: false,
+    }
+}
+
+fn build_tab_team_entries<R, L>(
+    live_players: &[LivePlayerEntry],
+    snap_players: &[LoadingPlayerSlot],
+    snap_ratings: &TeamRatingsSnapshot,
+    fallback_loading_order: Option<&[usize]>,
+    rating_titles: &RatingTitlesConfig,
+    mut resolve_hero_id: R,
+    mut lookup_hero: L,
+) -> Vec<(TabRosterKey, String, LoadingCardSlotData)>
+where
+    R: FnMut(&str) -> Option<i32>,
+    L: FnMut(i32) -> Option<LoadingCardHeroData>,
+{
+    if !live_players.is_empty() {
+        let mut used = vec![false; snap_players.len()];
+        let mut entries = Vec::with_capacity(live_players.len().min(5));
+
+        for lp in live_players.iter().take(5) {
+            let live_champ_id = resolve_hero_id(&lp.raw_champion_name)
+                .filter(|&id| id > 0)
+                .or_else(|| resolve_hero_id(&lp.champion_name).filter(|&id| id > 0))
+                .unwrap_or(0);
+            let live_norm_name = normalize_tab_display_name(&lp.display_name);
+
+            let matched_lcu_idx = if live_champ_id > 0 {
+                snap_players
+                    .iter()
+                    .enumerate()
+                    .find(|(idx, slot)| !used[*idx] && slot.champion_id == live_champ_id)
+                    .map(|(idx, _)| idx)
+            } else {
+                None
+            }
+            .or_else(|| {
+                if live_norm_name.is_empty() {
+                    None
+                } else {
+                    snap_players
+                        .iter()
+                        .enumerate()
+                        .find(|(idx, slot)| {
+                            !used[*idx]
+                                && normalize_tab_display_name(&slot.display_name) == live_norm_name
+                        })
+                        .map(|(idx, _)| idx)
+                }
+            });
+
+            if let Some(lcu_idx) = matched_lcu_idx {
+                used[lcu_idx] = true;
+                let slot = &snap_players[lcu_idx];
+                let champ_id = if live_champ_id > 0 {
+                    live_champ_id
+                } else {
+                    slot.champion_id.max(0)
+                };
+                let hero = (champ_id > 0).then(|| lookup_hero(champ_id)).flatten();
+                let display_name = if !lp.display_name.is_empty() {
+                    lp.display_name.clone()
+                } else {
+                    slot.display_name.clone()
+                };
+                let key = (champ_id, normalize_tab_display_name(&display_name));
+                let summoner = snap_ratings
+                    .slots
+                    .get(lcu_idx)
+                    .map(summoner_summary_to_badge)
+                    .unwrap_or_else(|| loading_placeholder_badge(rating_titles));
+                entries.push((key, display_name, LoadingCardSlotData { hero, summoner }));
+            } else {
+                let hero = (live_champ_id > 0)
+                    .then(|| lookup_hero(live_champ_id))
+                    .flatten();
+                let display_name = lp.display_name.clone();
+                let key = (live_champ_id, live_norm_name);
+                let (tier_index, title) =
+                    rating_titles.resolve(SummonerRatingStatus::Private, 0);
+                let summoner = SummonerBadgeData {
+                    status: SummonerRatingStatus::Private,
+                    score: 0,
+                    tier_index,
+                    title,
+                    streak: 0,
+                    premade_group_id: None,
+                    is_premade_last_mvp: false,
+                };
+                entries.push((key, display_name, LoadingCardSlotData { hero, summoner }));
+            }
+        }
+
+        return entries;
+    }
+
+    let capped_len = snap_players.len().min(5);
+    let indices = resolve_slot_order(fallback_loading_order, capped_len);
+    indices
+        .into_iter()
+        .map(|idx| {
+            let slot = &snap_players[idx];
+            let champ_id = slot.champion_id.max(0);
+            let hero = (champ_id > 0).then(|| lookup_hero(champ_id)).flatten();
+            let display_name = slot.display_name.clone();
+            let key = (champ_id, normalize_tab_display_name(&display_name));
+            let summoner = snap_ratings
+                .slots
+                .get(idx)
+                .map(summoner_summary_to_badge)
+                .unwrap_or_else(|| loading_placeholder_badge(rating_titles));
+            (key, display_name, LoadingCardSlotData { hero, summoner })
+        })
+        .collect()
+}
+
+fn apply_tab_visual_order(
+    entries: Vec<(TabRosterKey, String, LoadingCardSlotData)>,
+    visual_keys: Option<&[TabRosterKey]>,
+) -> Vec<LoadingCardSlotData> {
+    let Some(target_keys) = visual_keys.filter(|keys| !keys.is_empty()) else {
+        return entries.into_iter().map(|(_, _, card)| card).collect();
+    };
+
+    let mut used = vec![false; entries.len()];
+    let mut ordered_indices = Vec::with_capacity(entries.len());
+
+    for (target_champ, target_name) in target_keys {
+        let matched = entries
+            .iter()
+            .enumerate()
+            .find(|(idx, ((cid, cname), _, _))| {
+                !used[*idx] && cid == target_champ && cname == target_name
+            })
+            .map(|(idx, _)| idx)
+            .or_else(|| {
+                if *target_champ <= 0 {
+                    return None;
+                }
+                let mut matches = entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, ((cid, _), _, _))| !used[*idx] && cid == target_champ)
+                    .map(|(idx, _)| idx);
+                let first = matches.next()?;
+                if matches.next().is_none() {
+                    Some(first)
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                if target_name.is_empty() {
+                    return None;
+                }
+                entries
+                    .iter()
+                    .enumerate()
+                    .find(|(idx, ((_, cname), _, _))| !used[*idx] && cname == target_name)
+                    .map(|(idx, _)| idx)
+            });
+
+        if let Some(idx) = matched {
+            used[idx] = true;
+            ordered_indices.push(idx);
+        }
+    }
+
+    for (idx, is_used) in used.iter().enumerate() {
+        if !*is_used {
+            ordered_indices.push(idx);
+        }
+    }
+
+    let mut cards: Vec<Option<LoadingCardSlotData>> = entries
+        .into_iter()
+        .map(|(_, _, card)| Some(card))
+        .collect();
+    ordered_indices
+        .into_iter()
+        .filter_map(|idx| cards[idx].take())
+        .collect()
+}
+
 fn resolve_live_hero_id_with<F>(
     live: &LiveGameState,
     roster_local_champion_id: Option<i32>,
@@ -2687,12 +3081,322 @@ fn format_rect_info(rect: Option<WindowRectInfo>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        map_loading_team_slots_with, order_subset_cards_for_display, resolve_live_hero_id_with,
-        resolve_slot_order, snapshot_has_augment_wings, tab_scoreboard_side_meta, HeroTier,
-        LiveGameState, LoadingCardHeroData, LoadingPlayerSlot, LoadingScreenSnapshot,
+        apply_tab_visual_order, build_tab_team_entries, map_loading_team_slots_with,
+        order_subset_cards_for_display, resolve_live_hero_id_with, resolve_slot_order,
+        snapshot_has_augment_wings, tab_scoreboard_side_meta, HeroTier, LiveGameState,
+        LivePlayerEntry, LoadingCardHeroData, LoadingPlayerSlot, LoadingScreenSnapshot,
         LoadingTeamSide, RatingTitlesConfig, SummonerRatingStatus, SummonerRatingSummary,
-        TeamRatingsSnapshot,
+        TabRosterKey, TeamRatingsSnapshot,
     };
+
+    #[test]
+    fn merges_live_five_players_with_partial_lcu_roster_including_anonymous_players() {
+        let live_players = vec![
+            LivePlayerEntry {
+                team: LoadingTeamSide::Blue,
+                champion_name: "亚索".to_owned(),
+                raw_champion_name: "game_character_displayname_Yasuo".to_owned(),
+                display_name: "PlayerOne".to_owned(),
+                position: String::new(),
+            },
+            LivePlayerEntry {
+                team: LoadingTeamSide::Blue,
+                champion_name: "阿狸".to_owned(),
+                raw_champion_name: "game_character_displayname_Ahri".to_owned(),
+                display_name: "AnonStreamer1".to_owned(),
+                position: String::new(),
+            },
+            LivePlayerEntry {
+                team: LoadingTeamSide::Blue,
+                champion_name: "李青".to_owned(),
+                raw_champion_name: "game_character_displayname_LeeSin".to_owned(),
+                display_name: "PlayerThree".to_owned(),
+                position: String::new(),
+            },
+            LivePlayerEntry {
+                team: LoadingTeamSide::Blue,
+                champion_name: "泽拉斯".to_owned(),
+                raw_champion_name: "game_character_displayname_Xerath".to_owned(),
+                display_name: "AnonStreamer2".to_owned(),
+                position: String::new(),
+            },
+            LivePlayerEntry {
+                team: LoadingTeamSide::Blue,
+                champion_name: "金克丝".to_owned(),
+                raw_champion_name: "game_character_displayname_Jinx".to_owned(),
+                display_name: "PlayerFive".to_owned(),
+                position: String::new(),
+            },
+        ];
+
+        // LCU omitted the 2 anonymous players (Ahri 103 & Xerath 101).
+        let snap_players = vec![
+            LoadingPlayerSlot {
+                slot_index: 0,
+                champion_id: 157,
+                puuid: "p1".to_owned(),
+                display_name: "PlayerOne".to_owned(),
+            },
+            LoadingPlayerSlot {
+                slot_index: 1,
+                champion_id: 64,
+                puuid: "p3".to_owned(),
+                display_name: "PlayerThree".to_owned(),
+            },
+            LoadingPlayerSlot {
+                slot_index: 2,
+                champion_id: 222,
+                puuid: "p5".to_owned(),
+                display_name: "PlayerFive".to_owned(),
+            },
+        ];
+        let snap_ratings = TeamRatingsSnapshot {
+            slots: vec![
+                SummonerRatingSummary {
+                    cell_id: 0,
+                    status: SummonerRatingStatus::Ready,
+                    score: 86,
+                    tier_index: 0,
+                    title: "通天代".to_owned(),
+                    games_count: 14,
+                    win_rate: 58.0,
+                    avg_kda: 4.1,
+                    streak: 4,
+                    premade_group_id: Some(1),
+                    is_premade_last_mvp: true,
+                },
+                SummonerRatingSummary {
+                    cell_id: 1,
+                    status: SummonerRatingStatus::Ready,
+                    score: 71,
+                    tier_index: 1,
+                    title: "小代".to_owned(),
+                    games_count: 11,
+                    win_rate: 53.0,
+                    avg_kda: 3.2,
+                    streak: 0,
+                    premade_group_id: Some(1),
+                    is_premade_last_mvp: false,
+                },
+                SummonerRatingSummary {
+                    cell_id: 2,
+                    status: SummonerRatingStatus::Ready,
+                    score: 54,
+                    tier_index: 3,
+                    title: "普通".to_owned(),
+                    games_count: 9,
+                    win_rate: 49.0,
+                    avg_kda: 2.4,
+                    streak: -3,
+                    premade_group_id: None,
+                    is_premade_last_mvp: false,
+                },
+            ],
+            premade_groups: Vec::new(),
+        };
+        let titles = RatingTitlesConfig::default();
+        let resolve = |raw: &str| match raw {
+            "game_character_displayname_Yasuo" => Some(157),
+            "game_character_displayname_Ahri" => Some(103),
+            "game_character_displayname_LeeSin" => Some(64),
+            "game_character_displayname_Xerath" => Some(101),
+            "game_character_displayname_Jinx" => Some(222),
+            _ => None,
+        };
+        let lookup = |id: i32| {
+            Some(LoadingCardHeroData {
+                tier: HeroTier::S,
+                win_rate: 52.5,
+                name_zh: format!("Hero{id}"),
+            })
+        };
+
+        let entries = build_tab_team_entries(
+            &live_players,
+            &snap_players,
+            &snap_ratings,
+            None,
+            &titles,
+            resolve,
+            lookup,
+        );
+
+        assert_eq!(entries.len(), 5);
+        // Matched LCU players keep full score/premade/MVP/streak badges.
+        assert_eq!(entries[0].2.hero.as_ref().map(|h| h.name_zh.as_str()), Some("Hero157"));
+        assert_eq!(entries[0].2.summoner.score, 86);
+        assert_eq!(entries[0].2.summoner.premade_group_id, Some(1));
+        assert!(entries[0].2.summoner.is_premade_last_mvp);
+
+        assert_eq!(entries[2].2.hero.as_ref().map(|h| h.name_zh.as_str()), Some("Hero64"));
+        assert_eq!(entries[2].2.summoner.score, 71);
+        assert_eq!(entries[2].2.summoner.premade_group_id, Some(1));
+
+        assert_eq!(entries[4].2.hero.as_ref().map(|h| h.name_zh.as_str()), Some("Hero222"));
+        assert_eq!(entries[4].2.summoner.score, 54);
+        assert_eq!(entries[4].2.summoner.streak, -3);
+
+        // Anonymous players omitted by LCU still render full hero meta + Private rating status.
+        assert_eq!(entries[1].2.hero.as_ref().map(|h| h.name_zh.as_str()), Some("Hero103"));
+        assert_eq!(entries[1].2.summoner.status, SummonerRatingStatus::Private);
+
+        assert_eq!(entries[3].2.hero.as_ref().map(|h| h.name_zh.as_str()), Some("Hero101"));
+        assert_eq!(entries[3].2.summoner.status, SummonerRatingStatus::Private);
+    }
+
+    #[test]
+    fn tab_visual_keys_lock_row_order_across_late_rating_updates() {
+        let live_players = vec![
+            LivePlayerEntry {
+                team: LoadingTeamSide::Red,
+                champion_name: "亚索".to_owned(),
+                raw_champion_name: "Yasuo".to_owned(),
+                display_name: "Alpha".to_owned(),
+                position: String::new(),
+            },
+            LivePlayerEntry {
+                team: LoadingTeamSide::Red,
+                champion_name: "阿狸".to_owned(),
+                raw_champion_name: "Ahri".to_owned(),
+                display_name: "Beta".to_owned(),
+                position: String::new(),
+            },
+            LivePlayerEntry {
+                team: LoadingTeamSide::Red,
+                champion_name: "李青".to_owned(),
+                raw_champion_name: "LeeSin".to_owned(),
+                display_name: "Gamma".to_owned(),
+                position: String::new(),
+            },
+        ];
+        let snap_players = vec![
+            LoadingPlayerSlot {
+                slot_index: 0,
+                champion_id: 157,
+                puuid: "a".to_owned(),
+                display_name: "Alpha".to_owned(),
+            },
+            LoadingPlayerSlot {
+                slot_index: 1,
+                champion_id: 103,
+                puuid: "b".to_owned(),
+                display_name: "Beta".to_owned(),
+            },
+            LoadingPlayerSlot {
+                slot_index: 2,
+                champion_id: 64,
+                puuid: "c".to_owned(),
+                display_name: "Gamma".to_owned(),
+            },
+        ];
+        let titles = RatingTitlesConfig::default();
+        let resolve = |raw: &str| match raw {
+            "Yasuo" => Some(157),
+            "Ahri" => Some(103),
+            "LeeSin" => Some(64),
+            _ => None,
+        };
+        let lookup = |id: i32| {
+            Some(LoadingCardHeroData {
+                tier: HeroTier::A,
+                win_rate: 51.0,
+                name_zh: format!("H{id}"),
+            })
+        };
+
+        // Initial build before SGP ratings finish loading.
+        let initial_entries = build_tab_team_entries(
+            &live_players,
+            &snap_players,
+            &TeamRatingsSnapshot::default(),
+            None,
+            &titles,
+            resolve,
+            lookup,
+        );
+        let target_keys: Vec<TabRosterKey> =
+            initial_entries.iter().map(|(k, _, _)| k.clone()).collect();
+        // Simulated TabRowOrderDetected permutation `[2, 0, 1]`.
+        let visual_keys: Vec<TabRosterKey> = resolve_slot_order(Some(&[2, 0, 1]), target_keys.len())
+            .into_iter()
+            .map(|i| target_keys[i].clone())
+            .collect();
+
+        let cards_before = apply_tab_visual_order(initial_entries, Some(&visual_keys));
+        assert_eq!(
+            cards_before
+                .iter()
+                .map(|c| c.hero.as_ref().map(|h| h.name_zh.as_str()))
+                .collect::<Vec<_>>(),
+            vec![Some("H64"), Some("H157"), Some("H103")]
+        );
+
+        // Late MatchRosterUpdated arrives with populated SGP scores.
+        let late_ratings = TeamRatingsSnapshot {
+            slots: vec![
+                SummonerRatingSummary {
+                    cell_id: 0,
+                    status: SummonerRatingStatus::Ready,
+                    score: 80,
+                    tier_index: 1,
+                    title: "小代".to_owned(),
+                    games_count: 10,
+                    win_rate: 55.0,
+                    avg_kda: 3.5,
+                    streak: 3,
+                    premade_group_id: None,
+                    is_premade_last_mvp: false,
+                },
+                SummonerRatingSummary {
+                    cell_id: 1,
+                    status: SummonerRatingStatus::Ready,
+                    score: 65,
+                    tier_index: 2,
+                    title: "人上人".to_owned(),
+                    games_count: 10,
+                    win_rate: 50.0,
+                    avg_kda: 2.8,
+                    streak: 0,
+                    premade_group_id: None,
+                    is_premade_last_mvp: false,
+                },
+                SummonerRatingSummary {
+                    cell_id: 2,
+                    status: SummonerRatingStatus::Ready,
+                    score: 91,
+                    tier_index: 0,
+                    title: "通天代".to_owned(),
+                    games_count: 12,
+                    win_rate: 62.0,
+                    avg_kda: 4.8,
+                    streak: 5,
+                    premade_group_id: None,
+                    is_premade_last_mvp: false,
+                },
+            ],
+            premade_groups: Vec::new(),
+        };
+        let updated_entries = build_tab_team_entries(
+            &live_players,
+            &snap_players,
+            &late_ratings,
+            None,
+            &titles,
+            resolve,
+            lookup,
+        );
+        let cards_after = apply_tab_visual_order(updated_entries, Some(&visual_keys));
+        assert_eq!(
+            cards_after
+                .iter()
+                .map(|c| (
+                    c.hero.as_ref().map(|h| h.name_zh.as_str()),
+                    c.summoner.score
+                ))
+                .collect::<Vec<_>>(),
+            vec![(Some("H64"), 91), (Some("H157"), 80), (Some("H103"), 65)]
+        );
+    }
 
     #[test]
     fn resolves_live_hero_id_by_five_level_priority_and_skips_invalid_ids() {

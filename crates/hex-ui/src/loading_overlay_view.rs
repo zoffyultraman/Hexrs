@@ -224,6 +224,97 @@ fn render_player_card_inner(slot: &LoadingCardSlotData, ui_scale: f32) -> Div {
         )
 }
 
+fn render_tab_player_card_inner(slot: &LoadingCardSlotData, ui_scale: f32) -> Div {
+    let line1_left = match slot.hero.as_ref() {
+        Some(hero) => div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(5.0))
+            .overflow_hidden()
+            .child(components::tier_badge(hero.tier, TierBadgeSize::Md))
+            .child(
+                div()
+                    .text_size(px(13.5 * ui_scale))
+                    .font_weight(FontWeight::BOLD)
+                    .font_family(theme::MONO_FONT)
+                    .text_color(theme::win_rate_color(hero.win_rate))
+                    .child(format!("{:.1}%", hero.win_rate)),
+            ),
+        None => div()
+            .text_size(px(11.5 * ui_scale))
+            .text_color(theme::text_muted())
+            .child("未识别"),
+    };
+
+    let short_name: String = slot
+        .hero
+        .as_ref()
+        .map(|h| h.name_zh.chars().take(5).collect())
+        .unwrap_or_default();
+
+    let sum = &slot.summoner;
+    let has_streak = sum.streak >= 3 || sum.streak <= -3;
+    let has_all_three = sum.premade_group_id.is_some() && sum.is_premade_last_mvp && has_streak;
+
+    let mut tags = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_end()
+        .gap(px(4.0))
+        .overflow_hidden();
+
+    if let Some(gid) = sum.premade_group_id {
+        tags = tags.child(components::premade_pill(gid, has_all_three));
+    }
+    if sum.is_premade_last_mvp {
+        tags = tags.child(components::mvp_pill());
+    }
+    if sum.streak >= 3 {
+        tags = tags.child(components::win_streak_pill(sum.streak));
+    } else if sum.streak <= -3 {
+        tags = tags.child(components::loss_streak_pill(sum.streak));
+    }
+
+    div()
+        .size_full()
+        .px(px(8.0))
+        .flex()
+        .flex_col()
+        .justify_center()
+        .gap(px(7.0 * ui_scale))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(4.0))
+                .overflow_hidden()
+                .child(line1_left)
+                .child(components::player_score_line(sum)),
+        )
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(4.0))
+                .overflow_hidden()
+                .child(
+                    div()
+                        .text_size(px(11.5 * ui_scale))
+                        .text_color(theme::text_muted())
+                        .child(short_name),
+                )
+                .child(tags),
+        )
+}
+
 fn render_loading_card_strip(
     slot: &LoadingCardSlotData,
     left_dip: f32,
@@ -620,7 +711,7 @@ impl Render for TabScoreboardSideOverlay {
                 .h(px(layout.row_h_dip))
                 .rounded(px(3.0))
                 .overflow_hidden()
-                .child(render_player_card_inner(slot, layout.ui_scale)),
+                .child(render_tab_player_card_inner(slot, layout.ui_scale)),
             );
         }
 
