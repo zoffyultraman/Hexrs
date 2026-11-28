@@ -68,7 +68,7 @@ jobs:
           $ErrorActionPreference = "Continue"
           $appVersion = (git describe --tags --abbrev=7 --always 2>$null | Select-Object -First 1)
           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($appVersion)) {
-            $appVersion = "v0.1.0"
+            $appVersion = "v0.0.1"
           } else {
             $appVersion = $appVersion.Trim()
           }

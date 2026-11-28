@@ -87,6 +87,11 @@ pub struct ParsedAppVersion {
 }
 
 impl ParsedAppVersion {
+    /// Returns the numeric `(major, minor, patch)` tuple without channel or dev-commit metadata.
+    pub fn core_tuple(self) -> (u64, u64, u64) {
+        (self.major, self.minor, self.patch)
+    }
+
     /// Parses tags such as `alpha_0.0.4`, `alpha_0.0.4-12-g9fcc012`, `beta_0.1.0`, `rc_0.2.0`,
     /// `v0.1.0`, `0.1.0`, `v0.1.0-12-g9fcc012`, `v1.0.0-alpha.2`, `v1.0.0-beta.1`, `v1.0.0-rc.1`.
     pub fn parse(raw: &str) -> Option<Self> {
@@ -209,10 +214,15 @@ struct GithubReleaseAsset {
     browser_download_url: String,
 }
 
+fn is_stable_release(release: &GithubRelease, parsed: ParsedAppVersion) -> bool {
+    !release.prerelease && parsed.channel == VersionChannel::Stable
+}
+
 fn evaluate_releases(releases: &[GithubRelease], current_version: &str) -> AppUpdateOutcome {
     let current_trimmed = current_version.trim();
 
-    let mut best: Option<(ParsedAppVersion, &GithubRelease)> = None;
+    let mut best_stable: Option<(ParsedAppVersion, &GithubRelease)> = None;
+    let mut best_prerelease: Option<(ParsedAppVersion, &GithubRelease)> = None;
     for release in releases {
         if release.draft {
             continue;
@@ -220,16 +230,61 @@ fn evaluate_releases(releases: &[GithubRelease], current_version: &str) -> AppUp
         let Some(parsed) = ParsedAppVersion::parse(&release.tag_name) else {
             continue;
         };
-        if best
+        if is_stable_release(release, parsed) {
+            if best_stable
+                .as_ref()
+                .map(|(best_ver, _)| parsed > *best_ver)
+                .unwrap_or(true)
+            {
+                best_stable = Some((parsed, release));
+            }
+        } else if best_prerelease
             .as_ref()
             .map(|(best_ver, _)| parsed > *best_ver)
             .unwrap_or(true)
         {
-            best = Some((parsed, release));
+            best_prerelease = Some((parsed, release));
         }
     }
 
-    let Some((best_ver, best_release)) = best else {
+    let cur_parsed = ParsedAppVersion::parse(current_trimmed);
+    let current_is_stable = cur_parsed
+        .map(|v| v.channel == VersionChannel::Stable)
+        .unwrap_or(false);
+
+    let selected = if current_is_stable {
+        match best_stable {
+            Some((sv, sr)) => Some((sv, sr, true)),
+            None => {
+                return AppUpdateOutcome::UpToDate {
+                    current_version: current_trimmed.to_owned(),
+                    latest_version: current_trimmed.to_owned(),
+                    release_url: DEFAULT_RELEASES_PAGE_URL.to_owned(),
+                };
+            }
+        }
+    } else {
+        match (best_stable, best_prerelease) {
+            (Some((sv, sr)), Some((pv, pr))) => {
+                let p_pub = pr.published_at.trim();
+                let s_pub = sr.published_at.trim();
+                if pv.core_tuple() > sv.core_tuple()
+                    && !p_pub.is_empty()
+                    && !s_pub.is_empty()
+                    && p_pub > s_pub
+                {
+                    Some((pv, pr, false))
+                } else {
+                    Some((sv, sr, true))
+                }
+            }
+            (Some((sv, sr)), None) => Some((sv, sr, true)),
+            (None, Some((pv, pr))) => Some((pv, pr, false)),
+            (None, None) => None,
+        }
+    };
+
+    let Some((best_ver, best_release, target_is_stable)) = selected else {
         return AppUpdateOutcome::UpToDate {
             current_version: current_trimmed.to_owned(),
             latest_version: current_trimmed.to_owned(),
@@ -247,9 +302,19 @@ fn evaluate_releases(releases: &[GithubRelease], current_version: &str) -> AppUp
         }
     };
 
-    let is_newer = ParsedAppVersion::parse(current_trimmed)
-        .map(|cur_ver| best_ver > cur_ver)
-        .unwrap_or(false);
+    let is_newer = match cur_parsed {
+        Some(cur_ver) => {
+            if target_is_stable && cur_ver.channel != VersionChannel::Stable {
+                best_ver >= cur_ver
+                    || (cur_ver.channel == VersionChannel::Alpha
+                        && cur_ver.major == 0
+                        && cur_ver.minor == 0)
+            } else {
+                best_ver > cur_ver
+            }
+        }
+        None => false,
+    };
 
     if is_newer {
         let download_url = best_release
@@ -269,7 +334,7 @@ fn evaluate_releases(releases: &[GithubRelease], current_version: &str) -> AppUp
             latest_version,
             release_url,
             download_url,
-            is_prerelease: best_release.prerelease,
+            is_prerelease: !target_is_stable,
             published_at: best_release.published_at.trim().to_owned(),
         }
     } else {
@@ -480,6 +545,113 @@ mod tests {
                 current_version: "alpha_0.0.4".to_owned(),
                 latest_version: "alpha_0.0.4".to_owned(),
                 release_url: DEFAULT_RELEASES_PAGE_URL.to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn stable_v0_0_1_supersedes_legacy_alpha_0_0_4_and_never_downgrades_stable() {
+        let make_rel = |tag: &str, prerelease: bool, published_at: &str| GithubRelease {
+            tag_name: tag.to_owned(),
+            html_url: format!("https://github.com/zoffyultraman/Hexrs/releases/tag/{tag}"),
+            draft: false,
+            prerelease,
+            published_at: published_at.to_owned(),
+            assets: vec![GithubReleaseAsset {
+                name: format!("Hexrs-{tag}-windows-x86_64.zip"),
+                browser_download_url: format!("https://example.com/Hexrs-{tag}.zip"),
+            }],
+        };
+
+        // 1. [v0.0.1 (stable, 2026-11-29), alpha_0.0.4 (prerelease, 2026-11-26)]
+        let stable_and_legacy_alpha = vec![
+            make_rel("v0.0.1", false, "2026-11-29T10:00:00Z"),
+            make_rel("alpha_0.0.4", true, "2026-11-26T10:00:00Z"),
+        ];
+        assert_eq!(
+            evaluate_releases(&stable_and_legacy_alpha, "v0.0.1"),
+            AppUpdateOutcome::UpToDate {
+                current_version: "v0.0.1".to_owned(),
+                latest_version: "v0.0.1".to_owned(),
+                release_url: "https://github.com/zoffyultraman/Hexrs/releases/tag/v0.0.1"
+                    .to_owned(),
+            }
+        );
+        assert_eq!(
+            evaluate_releases(&stable_and_legacy_alpha, "v0.0.1-5-g1234567"),
+            AppUpdateOutcome::UpToDate {
+                current_version: "v0.0.1-5-g1234567".to_owned(),
+                latest_version: "v0.0.1".to_owned(),
+                release_url: "https://github.com/zoffyultraman/Hexrs/releases/tag/v0.0.1"
+                    .to_owned(),
+            }
+        );
+        for legacy_cur in ["alpha_0.0.4", "alpha_0.0.4-12-g9fcc012"] {
+            assert_eq!(
+                evaluate_releases(&stable_and_legacy_alpha, legacy_cur),
+                AppUpdateOutcome::UpdateAvailable {
+                    current_version: legacy_cur.to_owned(),
+                    latest_version: "v0.0.1".to_owned(),
+                    release_url: "https://github.com/zoffyultraman/Hexrs/releases/tag/v0.0.1"
+                        .to_owned(),
+                    download_url: Some("https://example.com/Hexrs-v0.0.1.zip".to_owned()),
+                    is_prerelease: false,
+                    published_at: "2026-11-29T10:00:00Z".to_owned(),
+                }
+            );
+        }
+
+        // 2. Only [alpha_0.0.4 (prerelease)] (no stable published yet) -> stable v0.0.1 stays UpToDate.
+        let alpha_only = vec![make_rel("alpha_0.0.4", true, "2026-11-26T10:00:00Z")];
+        assert_eq!(
+            evaluate_releases(&alpha_only, "v0.0.1"),
+            AppUpdateOutcome::UpToDate {
+                current_version: "v0.0.1".to_owned(),
+                latest_version: "v0.0.1".to_owned(),
+                release_url: DEFAULT_RELEASES_PAGE_URL.to_owned(),
+            }
+        );
+
+        // 3. [beta_0.0.2 (prerelease, 2026-12-01), v0.0.1 (stable, 2026-11-29)]
+        let newer_beta_and_stable = vec![
+            make_rel("beta_0.0.2", true, "2026-12-01T10:00:00Z"),
+            make_rel("v0.0.1", false, "2026-11-29T10:00:00Z"),
+        ];
+        assert_eq!(
+            evaluate_releases(&newer_beta_and_stable, "v0.0.1"),
+            AppUpdateOutcome::UpToDate {
+                current_version: "v0.0.1".to_owned(),
+                latest_version: "v0.0.1".to_owned(),
+                release_url: "https://github.com/zoffyultraman/Hexrs/releases/tag/v0.0.1"
+                    .to_owned(),
+            }
+        );
+        assert_eq!(
+            evaluate_releases(&newer_beta_and_stable, "beta_0.0.2"),
+            AppUpdateOutcome::UpToDate {
+                current_version: "beta_0.0.2".to_owned(),
+                latest_version: "beta_0.0.2".to_owned(),
+                release_url: "https://github.com/zoffyultraman/Hexrs/releases/tag/beta_0.0.2"
+                    .to_owned(),
+            }
+        );
+
+        // 4. [v0.0.2 (stable, 2026-12-02), v0.0.1 (stable, 2026-11-29), alpha_0.0.4]
+        let two_stables_and_alpha = vec![
+            make_rel("v0.0.2", false, "2026-12-02T10:00:00Z"),
+            make_rel("v0.0.1", false, "2026-11-29T10:00:00Z"),
+            make_rel("alpha_0.0.4", true, "2026-11-26T10:00:00Z"),
+        ];
+        assert_eq!(
+            evaluate_releases(&two_stables_and_alpha, "v0.0.1"),
+            AppUpdateOutcome::UpdateAvailable {
+                current_version: "v0.0.1".to_owned(),
+                latest_version: "v0.0.2".to_owned(),
+                release_url: "https://github.com/zoffyultraman/Hexrs/releases/tag/v0.0.2"
+                    .to_owned(),
+                download_url: Some("https://example.com/Hexrs-v0.0.2.zip".to_owned()),
+                is_prerelease: false,
+                published_at: "2026-12-02T10:00:00Z".to_owned(),
             }
         );
     }

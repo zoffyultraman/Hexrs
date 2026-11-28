@@ -116,7 +116,7 @@ Hexrs 围绕 **“不干扰操作、平时零开销、信息一眼即懂”** �
 
 > **架构提示**：目前仅支持 **Windows x86_64（64 位）** 架构，暂不支持 ARM64 或 32 位系统。
 
-1. 前往仓库 [Releases](https://github.com/zoffyultraman/Hexrs/releases) 页面下载最新压缩包（如 `Hexrs-alpha_0.0.3-windows-x86_64.zip`）。
+1. 前往仓库 [Releases](https://github.com/zoffyultraman/Hexrs/releases) 页面下载最新压缩包（如 `Hexrs-v0.0.1-windows-x86_64.zip`）。
 2. 解压后得到自带完整根目录的便携文件夹 `Hexrs/`：
    ```text
    Hexrs/

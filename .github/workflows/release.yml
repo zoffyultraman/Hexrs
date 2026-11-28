@@ -77,7 +77,7 @@ jobs:
           } else {
             $appVersion = (git describe --tags --abbrev=7 --always 2>$null | Select-Object -First 1)
             if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($appVersion)) {
-              $appVersion = "v0.1.0"
+              $appVersion = "v0.0.1"
             } else {
               $appVersion = $appVersion.Trim()
             }
@@ -149,7 +149,7 @@ jobs:
           files: ${{ env.RELEASE_ZIP_PATH }}
           generate_release_notes: true
           body: |
-            ## Hexrs `${{ github.ref_name }}`（测试版 / Windows x86_64）
+            ## Hexrs `${{ github.ref_name }}`（${{ (contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc')) && '测试版' || '正式版' }} / Windows x86_64）
 
             > ⚠️ **架构说明**：当前仅支持 **Windows x86_64 (64位)** 架构，暂不支持 ARM64 或 32 位系统。
 
@@ -166,7 +166,9 @@ jobs:
                    └── rating_titles.json  # 自定义召唤师称号梯度配置（支持热加载）
                ```
             2. 双击 `Hexrs/Hexrs.exe` 运行；若国服/WeGame 以管理员权限运行导致无法读取 LCU，请在托盘右键选择“以管理员身份运行”。
-            3. 局内游戏画面请设置为**无边框窗口化**，以确保海克斯选卡评分条正常置顶且不影响点击。
+            3. 选人界面自动展示英雄胜率、出装/海克斯推荐及队友综合评分；加载界面自动展示双方 10 人综合评分与开黑/连胜标签，局内长按 `Tab` 键查看 10 人实时战绩评分。
+            4. 局内游戏画面请设置为**无边框窗口化**，以确保海克斯选卡评分条与 `Tab` 战绩面板正常置顶且不遮挡操作。
+            5. 客户端内置版本号显示与 GitHub Releases 自动更新检测（托盘菜单 / 大厅面板均可手动检查并跳转下载）。
 
             ### 开源协议与数据归属
             - **程序源代码**：遵循根目录 `Hexrs/LICENSE`（[GNU GPL-3.0](https://www.gnu.org/licenses/gpl-3.0.html)）。
