@@ -2,11 +2,12 @@
 //! non-interactive regions of `LeagueClientUx.exe` (`RCLIENT`) during Champ Select.
 
 use gpui::{
-    div, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba, Context, Div, FontWeight,
-    Render, Rgba,
+    div, linear_color_stop, linear_gradient, prelude::*, px, Context, Div, FontWeight, Render,
 };
-use hex_core::{HeroTier, SummonerRatingStatus};
+use hex_core::HeroTier;
 
+use crate::components::{self, AccentBar, TierBadgeSize};
+use crate::theme;
 use crate::win32::{
     BENCH_SLOT_HEIGHT_FRAC, BENCH_SLOT_PITCH_FRAC, BENCH_SLOT_WIDTH_FRAC,
     PICK_CARD_BADGE_HEIGHT_FRAC, PICK_CARD_PITCH_FRAC, PICK_CARD_WIDTH_FRAC,
@@ -78,7 +79,7 @@ impl Render for BenchBadgeOverlay {
             || self.state.client_height_dip <= 100.0
             || self.state.slots.iter().all(Option::is_none)
         {
-            return div().size_full().bg(rgba(0x00000000));
+            return div().size_full().bg(theme::transparent());
         }
 
         let w = self.state.client_width_dip;
@@ -89,67 +90,53 @@ impl Render for BenchBadgeOverlay {
         let bench_font_px = (slot_w * 0.175).clamp(9.0, 11.0);
         let gap_px = if slot_w >= 48.0 { 4.0 } else { 2.5 };
 
-        let mut canvas: Div = div().size_full().relative().bg(rgba(0x00000000));
+        let mut canvas: Div = div().size_full().relative().bg(theme::transparent());
 
         for (idx, slot) in self.state.slots.iter().take(10).enumerate() {
             let Some(badge) = slot.as_ref() else {
                 continue;
             };
-            let (tier_main, _, _) = hextech_tier_colors(badge.tier);
-            let frame_border = match badge.tier {
-                HeroTier::SPlus => rgba(0xF0C46C66),
-                HeroTier::S => rgba(0x2DD4BF66),
-                _ => rgba(0x384E6A73),
-            };
+            let pal = theme::tier_palette(badge.tier);
             let winrate_color = if matches!(badge.tier, HeroTier::SPlus | HeroTier::S) {
-                rgb(0xF8FAFC)
+                theme::text_primary()
             } else {
-                rgb(0xE2E8F0)
+                theme::text_secondary()
             };
             let left = idx as f32 * (w * BENCH_SLOT_PITCH_FRAC) + (raw_slot_w - slot_w) * 0.5;
 
             canvas = canvas.child(
-                div()
-                    .absolute()
-                    .left(px(left))
-                    .top(px(0.0))
-                    .w(px(slot_w))
-                    .h(px(slot_h))
-                    .overflow_hidden()
-                    .rounded_bl(px(2.0))
-                    .rounded_br(px(2.0))
-                    .bg(rgba(0x0B1220EB))
-                    .border_l_1()
-                    .border_r_1()
-                    .border_t_1()
-                    .border_color(frame_border)
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .flex_1()
-                            .w_full()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .justify_center()
-                            .gap(px(gap_px))
-                            .text_size(px(bench_font_px))
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(tier_main)
-                                    .child(badge.tier.label()),
-                            )
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .font_family("Consolas")
-                                    .text_color(winrate_color)
-                                    .child(format!("{:.1}%", badge.win_rate)),
-                            ),
-                    )
-                    .child(div().w_full().h(px(2.0)).bg(tier_main)),
+                components::hud_container(
+                    theme::bg_surface_dense(),
+                    Some(theme::bench_frame_border(badge.tier)),
+                    AccentBar::Bottom(2.0, pal.text),
+                )
+                .absolute()
+                .left(px(left))
+                .top(px(0.0))
+                .w(px(slot_w))
+                .h(px(slot_h))
+                .overflow_hidden()
+                .rounded_bl(px(2.0))
+                .rounded_br(px(2.0))
+                .child(
+                    div()
+                        .size_full()
+                        .pb(px(2.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(gap_px))
+                        .text_size(px(bench_font_px))
+                        .child(components::tier_badge(badge.tier, TierBadgeSize::Sm))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_family(theme::MONO_FONT)
+                                .text_color(winrate_color)
+                                .child(format!("{:.1}%", badge.win_rate)),
+                        ),
+                ),
             );
         }
 
@@ -188,61 +175,6 @@ impl TeamBadgeOverlay {
     }
 }
 
-/// Returns `(main_text_and_bar, badge_bg, border)` for the unified V2 Hextech hero tier tokens.
-fn hextech_tier_colors(tier: HeroTier) -> (Rgba, Rgba, Rgba) {
-    match tier {
-        HeroTier::SPlus => (rgb(0xF0C46C), rgba(0xF0C46C29), rgba(0xF0C46C80)),
-        HeroTier::S => (rgb(0x2DD4BF), rgba(0x2DD4BF29), rgba(0x2DD4BF73)),
-        HeroTier::A | HeroTier::B => (rgb(0x4ADE80), rgba(0x4ADE8024), rgba(0x4ADE8066)),
-        HeroTier::C => (rgb(0x94A3B8), rgba(0x94A3B824), rgba(0x94A3B859)),
-        HeroTier::D => (rgb(0xF472B6), rgba(0xF472B61F), rgba(0xF472B659)),
-    }
-}
-
-fn premade_ghost_colors(group_id: u8) -> (Rgba, Rgba, Rgba) {
-    match group_id {
-        1 => (rgba(0x14B8A62E), rgba(0x2DD4BF73), rgb(0x5EEAD4)),
-        2 => (rgba(0xA855F72E), rgba(0xC084FC73), rgb(0xD8B4FE)),
-        _ => (rgba(0x0EA5E92E), rgba(0x38BDF873), rgb(0x7DD3FC)),
-    }
-}
-
-fn player_silhouette_icon() -> Div {
-    div()
-        .w(px(10.0))
-        .h(px(10.0))
-        .flex()
-        .flex_col()
-        .items_center()
-        .justify_center()
-        .gap(px(1.0))
-        .child(div().w(px(4.0)).h(px(4.0)).rounded_full().bg(rgb(0x94A3B8)))
-        .child(
-            div()
-                .w(px(8.0))
-                .h(px(4.0))
-                .rounded_tl(px(4.0))
-                .rounded_tr(px(4.0))
-                .bg(rgb(0x94A3B8)),
-        )
-}
-
-fn ghost_pill(bg: Rgba, border: Rgba, text_color: Rgba, label: String) -> Div {
-    div()
-        .h(px(16.0))
-        .px(px(5.0))
-        .rounded(px(2.0))
-        .bg(bg)
-        .border_1()
-        .border_color(border)
-        .flex()
-        .items_center()
-        .text_size(px(10.0))
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(text_color)
-        .child(label)
-}
-
 impl Render for TeamBadgeOverlay {
     fn render(&mut self, _window: &mut gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
         if !self.state.visible
@@ -253,24 +185,25 @@ impl Render for TeamBadgeOverlay {
                 .iter()
                 .all(|s| s.hero.is_none() && s.summoner.is_none())
         {
-            return div().size_full().bg(rgba(0x00000000));
+            return div().size_full().bg(theme::transparent());
         }
 
         let h = self.state.client_height_dip;
         let row_pitch_h = TEAM_ROW_PITCH_FRAC * h;
         let row_h = (row_pitch_h - 2.0).max(20.0);
 
-        let mut canvas: Div = div().size_full().relative().bg(rgba(0x00000000));
+        let mut canvas: Div = div().size_full().relative().bg(theme::transparent());
 
         for (idx, slot) in self.state.slots.iter().take(5).enumerate() {
             if slot.hero.is_none() && slot.summoner.is_none() {
                 continue;
             }
 
-            let tier_accent = slot.hero.as_ref().map(|b| hextech_tier_colors(b.tier));
-            let tier_bar_color = tier_accent
-                .map(|(main_color, _, _)| main_color)
-                .unwrap_or_else(|| rgba(0x94A3B866));
+            let tier_bar_color = slot
+                .hero
+                .as_ref()
+                .map(|b| theme::tier_palette(b.tier).text)
+                .unwrap_or_else(theme::border_cool);
 
             let mut content_col = div()
                 .relative()
@@ -286,7 +219,6 @@ impl Render for TeamBadgeOverlay {
                 .overflow_hidden();
 
             if let Some(badge) = slot.hero.as_ref() {
-                let (tier_main, tier_bg, tier_border) = hextech_tier_colors(badge.tier);
                 content_col = content_col.child(
                     div()
                         .flex()
@@ -294,75 +226,20 @@ impl Render for TeamBadgeOverlay {
                         .items_center()
                         .justify_end()
                         .gap(px(6.0))
-                        .child(
-                            div()
-                                .px(px(5.0))
-                                .py(px(1.0))
-                                .rounded(px(2.0))
-                                .bg(tier_bg)
-                                .border_1()
-                                .border_color(tier_border)
-                                .text_size(px(12.0))
-                                .font_weight(FontWeight::BOLD)
-                                .text_color(tier_main)
-                                .child(badge.tier.label()),
-                        )
+                        .child(components::tier_badge(badge.tier, TierBadgeSize::Md))
                         .child(
                             div()
                                 .text_size(px(13.5))
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(0xF8FAFC))
-                                .font_family("Consolas")
+                                .text_color(theme::text_primary())
+                                .font_family(theme::MONO_FONT)
                                 .child(format!("{:.1}%", badge.win_rate)),
                         ),
                 );
             }
 
             if let Some(sum) = slot.summoner.as_ref() {
-                let mut line2 = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_end()
-                    .gap(px(3.5))
-                    .text_size(px(11.0))
-                    .font_weight(FontWeight::MEDIUM)
-                    .overflow_hidden()
-                    .child(player_silhouette_icon());
-
-                line2 = match sum.status {
-                    SummonerRatingStatus::Ready => {
-                        let (score_color, title_color) = match sum.tier_index {
-                            0 => (rgb(0xFDE047), rgb(0xFEF08A)),
-                            1 => (rgb(0xF0C46C), rgb(0xE2E8F0)),
-                            2 => (rgb(0x4ADE80), rgb(0xCBD5E1)),
-                            3 => (rgb(0xCBD5E1), rgb(0x94A3B8)),
-                            _ => (rgb(0xFDA4AF), rgb(0xF87171)),
-                        };
-                        let compact_title: String = sum.title.chars().take(4).collect();
-                        line2
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .font_family("Consolas")
-                                    .text_color(score_color)
-                                    .child(sum.score.to_string()),
-                            )
-                            .child(div().text_color(rgb(0x94A3B8)).child("·"))
-                            .child(div().text_color(title_color).child(compact_title))
-                    }
-                    SummonerRatingStatus::Private => {
-                        line2.child(div().text_color(rgb(0x94A3B8)).child("隐藏"))
-                    }
-                    SummonerRatingStatus::InsufficientSamples => {
-                        line2.child(div().text_color(rgb(0x94A3B8)).child("样本少"))
-                    }
-                    SummonerRatingStatus::Loading => {
-                        line2.child(div().text_color(rgb(0x94A3B8)).child("战绩…"))
-                    }
-                };
-
-                content_col = content_col.child(line2);
+                content_col = content_col.child(components::player_score_line(sum));
 
                 let has_streak = sum.streak >= 3 || sum.streak <= -3;
                 if sum.premade_group_id.is_some() || has_streak {
@@ -377,62 +254,34 @@ impl Render for TeamBadgeOverlay {
                         .overflow_hidden();
 
                     if let Some(gid) = sum.premade_group_id {
-                        let (p_bg, p_border, p_text) = premade_ghost_colors(gid);
-                        let label = if has_all_three {
-                            format!("● {gid}")
-                        } else {
-                            format!("● 黑{gid}")
-                        };
-                        tags = tags.child(ghost_pill(p_bg, p_border, p_text, label));
+                        tags = tags.child(components::premade_pill(gid, has_all_three));
                     }
 
                     if sum.is_premade_last_mvp {
-                        tags = tags.child(ghost_pill(
-                            rgba(0xEAB3082E),
-                            rgba(0xFACC1580),
-                            rgb(0xFDE047),
-                            "★ MVP".to_owned(),
-                        ));
+                        tags = tags.child(components::mvp_pill());
                     }
 
                     if sum.streak >= 3 {
-                        tags = tags.child(ghost_pill(
-                            rgba(0x22C55E2E),
-                            rgba(0x4ADE8073),
-                            rgb(0x86EFAC),
-                            format!("{}连胜", sum.streak),
-                        ));
+                        tags = tags.child(components::win_streak_pill(sum.streak));
                     } else if sum.streak <= -3 {
-                        tags = tags.child(ghost_pill(
-                            rgba(0xEF44442E),
-                            rgba(0xF8717180),
-                            rgb(0xFCA5A5),
-                            format!("{}连败", sum.streak.unsigned_abs()),
-                        ));
+                        tags = tags.child(components::loss_streak_pill(sum.streak));
                     }
 
                     content_col = content_col.child(tags);
                 }
             }
 
-            let row_inner = div()
-                .relative()
-                .size_full()
-                .bg(linear_gradient(
+            let row_inner = components::hud_container(
+                linear_gradient(
                     90.0,
-                    linear_color_stop(rgba(0x09142800), 0.0),
-                    linear_color_stop(rgba(0x091428E6), 0.72),
-                ))
-                .child(
-                    div()
-                        .absolute()
-                        .top(px(0.0))
-                        .right(px(0.0))
-                        .w(px(3.0))
-                        .h_full()
-                        .bg(tier_bar_color),
-                )
-                .child(content_col);
+                    linear_color_stop(theme::team_strip_gradient_start(), 0.0),
+                    linear_color_stop(theme::team_strip_gradient_end(), 0.72),
+                ),
+                None,
+                AccentBar::Right(3.0, tier_bar_color),
+            )
+            .size_full()
+            .child(content_col);
 
             canvas = canvas.child(
                 div()
@@ -497,7 +346,7 @@ impl Render for CardBadgeOverlay {
             || !(2..=3).contains(&self.state.cards.len())
             || self.state.cards.iter().all(Option::is_none)
         {
-            return div().size_full().bg(rgba(0x00000000));
+            return div().size_full().bg(theme::transparent());
         }
 
         let w = self.state.client_width_dip;
@@ -507,47 +356,34 @@ impl Render for CardBadgeOverlay {
         let font_px = (badge_h * 0.42).clamp(10.0, 14.0);
         let show_name = col_w >= 140.0;
 
-        let mut canvas: Div = div().size_full().relative().bg(rgba(0x00000000));
+        let mut canvas: Div = div().size_full().relative().bg(theme::transparent());
 
         for (idx, slot) in self.state.cards.iter().take(3).enumerate() {
             let Some(card) = slot.as_ref() else {
                 continue;
             };
-            let (tier_main, tier_bg, tier_border) = hextech_tier_colors(card.tier);
+            let pal = theme::tier_palette(card.tier);
             let left = idx as f32 * (w * PICK_CARD_PITCH_FRAC);
             let compact_name: String = card.name_zh.chars().take(5).collect();
 
-            let mut pill = div()
-                .h(px(badge_h))
-                .px(px(8.0))
-                .rounded(px(3.0))
-                .bg(rgba(0x091428EB))
-                .border_1()
-                .border_color(tier_border)
-                .overflow_hidden()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(px(5.0))
-                .text_size(px(font_px))
-                .child(
-                    div()
-                        .px(px(4.0))
-                        .py(px(1.0))
-                        .rounded(px(2.0))
-                        .bg(tier_bg)
-                        .border_1()
-                        .border_color(tier_border)
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(tier_main)
-                        .child(card.tier.label()),
-                );
+            let mut pill =
+                components::hud_container(theme::bg_surface_dense(), Some(pal.border), AccentBar::None)
+                    .h(px(badge_h))
+                    .px(px(8.0))
+                    .rounded(px(3.0))
+                    .overflow_hidden()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
+                    .text_size(px(font_px))
+                    .child(components::tier_badge(card.tier, TierBadgeSize::Md));
 
             if show_name && !compact_name.is_empty() {
                 pill = pill.child(
                     div()
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(rgb(0xE2E8F0))
+                        .text_color(theme::text_secondary())
                         .child(compact_name),
                 );
             }
@@ -555,8 +391,8 @@ impl Render for CardBadgeOverlay {
             pill = pill.child(
                 div()
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(0xF1F5F9))
-                    .font_family("Consolas")
+                    .text_color(theme::text_primary())
+                    .font_family(theme::MONO_FONT)
                     .child(format!("{:.1}%", card.win_rate)),
             );
 

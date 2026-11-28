@@ -1,6 +1,6 @@
 //! Champ Select GPUI sidebar rendering (`code_artifact.md` Section 3.1).
 
-use gpui::{div, prelude::*, px, rgb, rgba, AnyElement, Context, Div, FontWeight, SharedString};
+use gpui::{div, prelude::*, px, AnyElement, Context, Div, FontWeight, SharedString};
 use hex_core::{AppMode, ChampSelectState, PremadeGroupSummary};
 use hex_data::{
     AugmentEvaluation, BenchHighlight, DynamicBuildPlan, HeroPreview, HeroStats,
@@ -8,7 +8,8 @@ use hex_data::{
 };
 
 use crate::app::HexrsApp;
-use crate::theme::{self, tier_badge};
+use crate::components::{self, TierBadgeSize};
+use crate::theme;
 
 const SPLIT_BAR_WIDTH_PX: f32 = 268.0;
 
@@ -113,7 +114,7 @@ fn render_preview_banner(cx: &mut Context<HexrsApp>) -> Div {
                 .cursor_pointer()
                 .px_2()
                 .py(px(1.0))
-                .rounded_md()
+                .rounded(px(3.0))
                 .bg(theme::card_bg())
                 .border_1()
                 .border_color(theme::border_cyan())
@@ -180,7 +181,7 @@ fn render_header(lcu_connected: bool, champ_select: Option<&ChampSelectState>) -
                     div()
                         .px(px(6.0))
                         .py(px(2.0))
-                        .rounded_md()
+                        .rounded(px(2.0))
                         .bg(theme::cyan_dim())
                         .border_1()
                         .border_color(theme::border_cyan())
@@ -209,7 +210,7 @@ fn render_active_hero_section(
         if let Some(hero_id) = active_hero_id.filter(|&id| id > 0) {
             return div()
                 .p_3()
-                .rounded_lg()
+                .rounded(px(4.0))
                 .bg(theme::card_bg())
                 .border_1()
                 .border_color(theme::border_gold())
@@ -232,7 +233,7 @@ fn render_active_hero_section(
                             div()
                                 .px(px(6.0))
                                 .py(px(2.0))
-                                .rounded_md()
+                                .rounded(px(2.0))
                                 .bg(theme::gold_dim())
                                 .border_1()
                                 .border_color(theme::border_subtle())
@@ -251,7 +252,7 @@ fn render_active_hero_section(
 
         return div()
             .p_3()
-            .rounded_lg()
+            .rounded(px(4.0))
             .bg(theme::card_bg())
             .border_1()
             .border_color(theme::border_subtle())
@@ -286,8 +287,12 @@ fn render_active_hero_section(
                 .id(SharedString::from(format!("active-hero-{hero_id}")))
                 .cursor_pointer()
                 .p_3()
-                .rounded_lg()
-                .bg(theme::card_bg())
+                .rounded(px(4.0))
+                .bg(if is_expanded {
+                    theme::bg_highlight()
+                } else {
+                    theme::card_bg()
+                })
                 .border_1()
                 .border_color(if is_expanded {
                     theme::border_cyan()
@@ -311,7 +316,7 @@ fn render_active_hero_section(
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(tier_badge(hero.tier))
+                                .child(components::tier_badge(hero.tier, TierBadgeSize::Md))
                                 .child(
                                     div()
                                         .text_sm()
@@ -335,12 +340,14 @@ fn render_active_hero_section(
                             div()
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::cyan())
+                                .font_family(theme::MONO_FONT)
+                                .text_color(theme::win_rate_color(hero.win_rate))
                                 .child(format!("胜率 {:.1}%", hero.win_rate)),
                         )
                         .child(
                             div()
                                 .text_xs()
+                                .font_family(theme::MONO_FONT)
                                 .text_color(theme::text_muted())
                                 .child(format!("登场 {:.1}%", hero.pick_rate)),
                         ),
@@ -357,11 +364,7 @@ fn render_active_hero_section(
 fn render_premade_summary_section(groups: &[PremadeGroupSummary]) -> Div {
     let mut rows = div().flex().flex_col().gap_1();
     for group in groups {
-        let (bg, border, text) = match group.group_id {
-            1 => (rgba(0x0AC8B924), rgba(0x0AC8B988), rgb(0x4BE8DB)),
-            2 => (rgba(0x8B5CF629), rgba(0xA78BFA88), rgb(0xDDD6FE)),
-            _ => (rgba(0x14B8A624), rgba(0x2DD4BF88), rgb(0x99F6E4)),
-        };
+        let pal = theme::premade_pill_palette(group.group_id);
 
         let members: Vec<String> = group
             .slot_indices
@@ -369,7 +372,7 @@ fn render_premade_summary_section(groups: &[PremadeGroupSummary]) -> Div {
             .map(|&slot_idx| {
                 let seat = slot_idx + 1;
                 if group.last_mvp_slot_index == Some(slot_idx) {
-                    format!("{seat}号位(上局MVP)")
+                    format!("{seat}号位(MVP)")
                 } else {
                     format!("{seat}号位")
                 }
@@ -380,25 +383,52 @@ fn render_premade_summary_section(groups: &[PremadeGroupSummary]) -> Div {
             div()
                 .px_2()
                 .py(px(4.0))
-                .rounded_md()
-                .bg(bg)
+                .rounded(px(3.0))
+                .bg(pal.bg)
                 .border_1()
-                .border_color(border)
-                .text_xs()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(text)
-                .child(format!(
-                    "黑{} · {} · 同队{}场",
-                    group.group_id,
-                    members.join(" + "),
-                    group.shared_games
-                )),
+                .border_color(pal.border)
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(components::premade_pill(group.group_id, false))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(pal.text)
+                                .child(members.join(" + ")),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .when(group.last_mvp_slot_index.is_some(), |right| {
+                            right.child(components::mvp_pill())
+                        })
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_family(theme::MONO_FONT)
+                                .text_color(theme::text_secondary())
+                                .child(format!("{}局", group.shared_games)),
+                        ),
+                ),
         );
     }
 
     div()
         .p_3()
-        .rounded_lg()
+        .rounded(px(4.0))
         .bg(theme::card_bg())
         .border_1()
         .border_color(theme::border_subtle())
@@ -445,9 +475,9 @@ fn render_team_heroes_section(
                 .cursor_pointer()
                 .px_2()
                 .py(px(4.0))
-                .rounded_md()
-                .bg(if is_local {
-                    theme::cyan_dim()
+                .rounded(px(3.0))
+                .bg(if is_local || is_expanded {
+                    theme::bg_highlight()
                 } else {
                     theme::card_elevated_bg()
                 })
@@ -457,14 +487,14 @@ fn render_team_heroes_section(
                 } else {
                     theme::border_subtle()
                 })
-                .hover(|s| s.bg(theme::gold_dim()))
+                .hover(|s| s.bg(theme::card_elevated_bg()))
                 .on_click(cx.listener(move |this, _event, _window, cx| {
                     this.toggle_hero_preview(hero_id, cx);
                 }))
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(tier_badge(hero.tier))
+                .child(components::tier_badge(hero.tier, TierBadgeSize::Md))
                 .child(
                     div()
                         .text_xs()
@@ -474,7 +504,8 @@ fn render_team_heroes_section(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(theme::cyan())
+                        .font_family(theme::MONO_FONT)
+                        .text_color(theme::win_rate_color(hero.win_rate))
                         .child(format!("{:.1}%", hero.win_rate)),
                 ),
         );
@@ -488,7 +519,7 @@ fn render_team_heroes_section(
 
     div()
         .p_3()
-        .rounded_lg()
+        .rounded(px(4.0))
         .bg(theme::card_bg())
         .border_1()
         .border_color(theme::border_subtle())
@@ -536,8 +567,12 @@ fn render_bench_section(
                 .cursor_pointer()
                 .px_2()
                 .py(px(4.0))
-                .rounded_md()
-                .bg(theme::gold_dim())
+                .rounded(px(3.0))
+                .bg(if is_expanded {
+                    theme::bg_highlight()
+                } else {
+                    theme::gold_dim()
+                })
                 .border_1()
                 .border_color(if is_expanded {
                     theme::border_cyan()
@@ -551,7 +586,7 @@ fn render_bench_section(
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(tier_badge(item.tier))
+                .child(components::tier_badge(item.tier, TierBadgeSize::Md))
                 .child(
                     div()
                         .text_xs()
@@ -561,7 +596,8 @@ fn render_bench_section(
                 .child(
                     div()
                         .text_xs()
-                        .text_color(theme::gold())
+                        .font_family(theme::MONO_FONT)
+                        .text_color(theme::win_rate_color(item.win_rate))
                         .child(format!("{:.1}%", item.win_rate)),
                 ),
         );
@@ -573,7 +609,7 @@ fn render_bench_section(
 
     div()
         .p_3()
-        .rounded_lg()
+        .rounded(px(4.0))
         .bg(theme::card_bg())
         .border_1()
         .border_color(theme::border_subtle())
@@ -617,7 +653,7 @@ fn render_diagnosis_section(diagnosis: &TeamDiagnosis) -> Div {
             div()
                 .px(px(6.0))
                 .py(px(2.0))
-                .rounded_md()
+                .rounded(px(2.0))
                 .bg(theme::cyan_dim())
                 .border_1()
                 .border_color(theme::border_cyan())
@@ -631,7 +667,7 @@ fn render_diagnosis_section(diagnosis: &TeamDiagnosis) -> Div {
                 div()
                     .px(px(6.0))
                     .py(px(2.0))
-                    .rounded_md()
+                    .rounded(px(2.0))
                     .bg(theme::warning_bg())
                     .border_1()
                     .border_color(theme::warning_border())
@@ -645,7 +681,7 @@ fn render_diagnosis_section(diagnosis: &TeamDiagnosis) -> Div {
 
     div()
         .p_3()
-        .rounded_lg()
+        .rounded(px(4.0))
         .bg(theme::card_bg())
         .border_1()
         .border_color(theme::border_subtle())
@@ -667,6 +703,7 @@ fn render_diagnosis_section(diagnosis: &TeamDiagnosis) -> Div {
                 .child(
                     div()
                         .text_xs()
+                        .font_family(theme::MONO_FONT)
                         .text_color(theme::text_muted())
                         .child(format!(
                             "前排 {:.1} · 硬控 {:.1}",
@@ -684,6 +721,7 @@ fn render_diagnosis_section(diagnosis: &TeamDiagnosis) -> Div {
                         .flex()
                         .justify_between()
                         .text_xs()
+                        .font_family(theme::MONO_FONT)
                         .child(
                             div()
                                 .text_color(theme::ad_bar())
@@ -699,7 +737,7 @@ fn render_diagnosis_section(diagnosis: &TeamDiagnosis) -> Div {
                     div()
                         .w(px(SPLIT_BAR_WIDTH_PX))
                         .h(px(6.0))
-                        .rounded_full()
+                        .rounded(px(2.0))
                         .overflow_hidden()
                         .flex()
                         .child(div().w(px(ad_px)).h_full().bg(theme::ad_bar()))
@@ -780,8 +818,12 @@ fn render_recommendation_row(
                 .id(SharedString::from(format!("rec-hero-{hero_id}")))
                 .cursor_pointer()
                 .p_2()
-                .rounded_lg()
-                .bg(theme::card_bg())
+                .rounded(px(4.0))
+                .bg(if is_expanded {
+                    theme::bg_highlight()
+                } else {
+                    theme::card_bg()
+                })
                 .border_1()
                 .border_color(if is_expanded {
                     theme::border_cyan()
@@ -805,7 +847,7 @@ fn render_recommendation_row(
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(tier_badge(rec.tier))
+                                .child(components::tier_badge(rec.tier, TierBadgeSize::Md))
                                 .child(
                                     div()
                                         .text_xs()
@@ -817,7 +859,8 @@ fn render_recommendation_row(
                             div()
                                 .text_xs()
                                 .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::cyan())
+                                .font_family(theme::MONO_FONT)
+                                .text_color(theme::win_rate_color(rec.win_rate))
                                 .child(format!("{:.1}% 胜率", rec.win_rate)),
                         ),
                 )
@@ -838,7 +881,7 @@ fn render_recommendation_row(
                                 div()
                                     .px(px(5.0))
                                     .py(px(1.0))
-                                    .rounded_md()
+                                    .rounded(px(2.0))
                                     .bg(theme::cyan_dim())
                                     .border_1()
                                     .border_color(theme::border_cyan())
@@ -889,8 +932,8 @@ fn render_hero_preview_drawer(preview: &HeroPreview) -> Div {
 
     div()
         .p_2()
-        .rounded_lg()
-        .bg(theme::card_elevated_bg())
+        .rounded(px(4.0))
+        .bg(theme::bg_highlight())
         .border_1()
         .border_color(theme::border_cyan())
         .flex()
@@ -924,7 +967,7 @@ fn render_preview_augment_row(aug: &AugmentEvaluation) -> Div {
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(tier_badge(aug.tier))
+                .child(components::tier_badge(aug.tier, TierBadgeSize::Md))
                 .child(div().text_xs().child(aug.name_zh.clone()))
                 .child(
                     div()
@@ -936,7 +979,8 @@ fn render_preview_augment_row(aug: &AugmentEvaluation) -> Div {
         .child(
             div()
                 .text_xs()
-                .text_color(theme::cyan())
+                .font_family(theme::MONO_FONT)
+                .text_color(theme::win_rate_color(aug.win_rate))
                 .child(format!("{:.1}%", aug.win_rate)),
         )
 }
@@ -948,7 +992,7 @@ fn render_preview_build_row(build: &DynamicBuildPlan) -> Div {
             div()
                 .px(px(5.0))
                 .py(px(1.0))
-                .rounded_md()
+                .rounded(px(2.0))
                 .bg(theme::card_bg())
                 .border_1()
                 .border_color(theme::border_subtle())
@@ -976,7 +1020,8 @@ fn render_preview_build_row(build: &DynamicBuildPlan) -> Div {
                 .child(
                     div()
                         .text_xs()
-                        .text_color(theme::cyan())
+                        .font_family(theme::MONO_FONT)
+                        .text_color(theme::win_rate_color(build.win_rate))
                         .child(format!("{:.1}%", build.win_rate)),
                 ),
         )
@@ -990,7 +1035,7 @@ fn render_tag_row(tags: &[String]) -> Div {
             div()
                 .px(px(5.0))
                 .py(px(1.0))
-                .rounded_md()
+                .rounded(px(2.0))
                 .bg(theme::canvas_bg())
                 .border_1()
                 .border_color(theme::border_subtle())

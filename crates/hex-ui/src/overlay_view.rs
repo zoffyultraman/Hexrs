@@ -2,21 +2,19 @@
 
 use std::path::PathBuf;
 
-use gpui::{
-    div, img, linear_color_stop, linear_gradient, prelude::*, px, rgb, rgba, Div, FontWeight,
-    ObjectFit, Rgba,
-};
+use gpui::{div, img, prelude::*, px, Div, FontWeight, ObjectFit};
 use hex_core::HeroTier;
 use hex_data::{AugmentEvaluation, BuildItemInfo, DynamicBuildPlan};
 
 use crate::app::HexrsApp;
+use crate::components::{self, AccentBar, TierBadgeSize};
 use crate::theme;
 use crate::win32::{AUGMENT_BAR_CARD_HEIGHT_DIP, AUGMENT_BAR_TOP_PAD_DIP};
 
 /// Renders either the 3-card augment strip (when an offer is active) or the compact corner equipment HUD.
 pub fn render_in_game_overlay(app: &HexrsApp) -> Div {
     if !app.overlay_visible {
-        return div().size_full().bg(rgba(0x00000000));
+        return div().size_full().bg(theme::transparent());
     }
 
     if !app.offered_augments.is_empty() {
@@ -42,24 +40,26 @@ pub fn render_in_game_overlay(app: &HexrsApp) -> Div {
         .map(|plan| plan.playstyle_tag.clone())
         .filter(|tag| !tag.is_empty());
 
-    div()
-        .size_full()
-        .p_2()
-        .rounded_xl()
-        .bg(theme::overlay_card_bg())
-        .border_1()
-        .border_color(theme::border_gold())
-        .flex()
-        .flex_col()
-        .justify_between()
-        .gap_1()
-        .text_color(theme::text_primary())
-        .child(render_hero_header(
-            app.active_hero_icon.clone(),
-            hero_name,
-            playstyle_tag,
-        ))
-        .child(render_item_grid(app, app.dynamic_build.as_ref()))
+    components::hud_container(
+        theme::overlay_card_bg(),
+        Some(theme::border_subtle()),
+        AccentBar::Top(2.0, theme::gold()),
+    )
+    .size_full()
+    .overflow_hidden()
+    .p_2()
+    .rounded(px(4.0))
+    .flex()
+    .flex_col()
+    .justify_between()
+    .gap_1()
+    .text_color(theme::text_primary())
+    .child(render_hero_header(
+        app.active_hero_icon.clone(),
+        hero_name,
+        playstyle_tag,
+    ))
+    .child(render_item_grid(app, app.dynamic_build.as_ref()))
 }
 
 fn pick_recommended_augment_index(evals: &[AugmentEvaluation]) -> Option<usize> {
@@ -84,34 +84,13 @@ fn pick_recommended_augment_index(evals: &[AugmentEvaluation]) -> Option<usize> 
     Some(best_idx)
 }
 
-fn augment_tier_text_color(tier: HeroTier) -> Rgba {
-    match tier {
-        HeroTier::SPlus => rgb(0xFDE047),
-        HeroTier::S => rgb(0xF3D078),
-        HeroTier::A | HeroTier::B => rgb(0x4ADE80),
-        HeroTier::C | HeroTier::D => rgb(0x94A3B8),
-    }
-}
-
-fn augment_win_rate_colors(win_rate: f64) -> (Rgba, Rgba) {
-    if win_rate >= 52.0 {
-        (rgb(0x52E5D8), rgba(0x52E5D8E0))
-    } else if win_rate >= 50.0 {
-        (rgb(0xF1F5F9), rgba(0xF1F5F9CC))
-    } else if win_rate >= 48.0 {
-        (rgb(0x94A3B8), rgba(0x94A3B8CC))
-    } else {
-        (rgb(0xC9767D), rgba(0xC9767DCC))
-    }
-}
-
 fn render_augment_offer_bar(app: &HexrsApp) -> Div {
     let recommended_idx = pick_recommended_augment_index(&app.offered_augments);
     let mut columns = div()
         .size_full()
         .pt(px(AUGMENT_BAR_TOP_PAD_DIP))
         .pb(px(2.0))
-        .bg(rgba(0x00000000))
+        .bg(theme::transparent())
         .flex()
         .flex_row()
         .gap(px(app.augment_bar_gap_dip))
@@ -130,25 +109,26 @@ fn render_augment_slot_card(eval: &AugmentEvaluation, is_recommended: bool) -> D
             .h(px(AUGMENT_BAR_CARD_HEIGHT_DIP))
             .relative()
             .child(
-                div()
-                    .size_full()
-                    .overflow_hidden()
-                    .px(px(10.0))
-                    .py(px(6.0))
-                    .rounded(px(6.0))
-                    .bg(rgba(0x101828EB))
-                    .border_1()
-                    .border_color(rgba(0x64748B73))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(rgb(0x94A3B8))
-                            .child("海克斯未识别 · 请按效果选择"),
-                    ),
+                components::hud_container(
+                    theme::bg_surface_dense(),
+                    Some(theme::border_cool()),
+                    AccentBar::None,
+                )
+                .size_full()
+                .overflow_hidden()
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded(px(4.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme::text_muted())
+                        .child("海克斯未识别 · 请按效果选择"),
+                ),
             );
     }
 
@@ -159,78 +139,52 @@ fn render_augment_slot_card(eval: &AugmentEvaluation, is_recommended: bool) -> D
             .h(px(AUGMENT_BAR_CARD_HEIGHT_DIP))
             .relative()
             .child(
-                div()
-                    .size_full()
-                    .overflow_hidden()
-                    .px(px(10.0))
-                    .py(px(6.0))
-                    .rounded(px(6.0))
-                    .bg(linear_gradient(
-                        180.0,
-                        linear_color_stop(rgba(0x2C131AE8), 0.0),
-                        linear_color_stop(rgba(0x1B0D12EE), 1.0),
-                    ))
-                    .border_1()
-                    .border_color(rgba(0xC25A6599))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .text_size(px(15.0))
-                            .font_weight(FontWeight::BOLD)
-                            .text_color(rgb(0xC95B63))
-                            .child("⚠"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(14.5))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(0xD4747A))
-                            .child("数据过少 · 建议刷新"),
-                    ),
+                components::hud_container(
+                    theme::bg_danger_subtle(),
+                    Some(theme::danger_border()),
+                    AccentBar::None,
+                )
+                .size_full()
+                .overflow_hidden()
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded(px(4.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(13.5))
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme::warning_text())
+                        .child("⚠ 数据过少 · 建议刷新"),
+                ),
             );
     }
 
-    let tier_text_color = augment_tier_text_color(eval.tier);
-    let (wr_color, wr_suffix_color) = augment_win_rate_colors(eval.win_rate);
+    let wr_color = theme::win_rate_color(eval.win_rate);
+    let wr_suffix_color = theme::win_rate_suffix_color(eval.win_rate);
 
-    let tier_block = div()
-        .w(px(46.0))
-        .h_full()
-        .bg(if is_recommended {
-            linear_gradient(
-                180.0,
-                linear_color_stop(rgba(0x2D2412F5), 0.0),
-                linear_color_stop(rgba(0x1B160CF7), 1.0),
-            )
-        } else {
-            linear_gradient(
-                180.0,
-                linear_color_stop(rgba(0x233044EC), 0.0),
-                linear_color_stop(rgba(0x192334F0), 1.0),
-            )
-        })
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_size(px(21.0))
-        .font_weight(FontWeight::EXTRA_BOLD)
-        .text_color(tier_text_color)
-        .child(eval.tier.label());
-
-    let divider = if is_recommended {
-        div().w(px(1.5)).h_full().bg(rgba(0xE8C66DE6))
+    let inner_base = if is_recommended {
+        components::hud_container(theme::bg_highlight(), None, AccentBar::None)
+            .border_2()
+            .border_color(theme::border_gold_strong())
     } else {
-        div().w(px(1.0)).h_full().bg(rgba(0x64748B66))
+        components::hud_container(
+            theme::bg_surface(),
+            Some(theme::border_cool()),
+            AccentBar::None,
+        )
     };
 
-    let content_row = div()
-        .relative()
+    let inner = inner_base
         .size_full()
-        .px(px(12.0))
+        .overflow_hidden()
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded(px(4.0))
         .flex()
         .flex_row()
         .items_center()
@@ -240,27 +194,32 @@ fn render_augment_slot_card(eval: &AugmentEvaluation, is_recommended: bool) -> D
             div()
                 .flex()
                 .flex_row()
-                .items_end()
-                .gap(px(4.0))
+                .items_center()
+                .gap(px(10.0))
+                .min_w_0()
+                .child(components::tier_badge(eval.tier, TierBadgeSize::Lg))
                 .child(
                     div()
-                        .text_size(px(if is_recommended { 18.5 } else { 18.0 }))
-                        .font_weight(FontWeight::BOLD)
-                        .font_family("Consolas")
-                        .text_color(wr_color)
-                        .child(format!("{:.1}%", eval.win_rate)),
-                )
-                .child(
-                    div()
-                        .pb(px(1.5))
-                        .text_size(px(if is_recommended { 13.0 } else { 12.5 }))
-                        .font_weight(if is_recommended {
-                            FontWeight::SEMIBOLD
-                        } else {
-                            FontWeight::MEDIUM
-                        })
-                        .text_color(wr_suffix_color)
-                        .child("胜率"),
+                        .flex()
+                        .flex_row()
+                        .items_end()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .text_size(px(17.5))
+                                .font_weight(FontWeight::BOLD)
+                                .font_family(theme::MONO_FONT)
+                                .text_color(wr_color)
+                                .child(format!("{:.1}%", eval.win_rate)),
+                        )
+                        .child(
+                            div()
+                                .pb(px(1.5))
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(wr_suffix_color)
+                                .child("胜率"),
+                        ),
                 ),
         )
         .child(
@@ -274,86 +233,18 @@ fn render_augment_slot_card(eval: &AugmentEvaluation, is_recommended: bool) -> D
                     div()
                         .text_size(px(11.5))
                         .font_weight(FontWeight::MEDIUM)
-                        .text_color(if is_recommended {
-                            rgb(0xB8C7D9)
-                        } else {
-                            rgb(0x8896AA)
-                        })
+                        .text_color(theme::text_muted())
                         .child("选取"),
                 )
                 .child(
                     div()
                         .text_size(px(11.5))
                         .font_weight(FontWeight::MEDIUM)
-                        .font_family("Consolas")
-                        .text_color(if is_recommended {
-                            rgb(0xCBD5E1)
-                        } else {
-                            rgb(0x94A3B8)
-                        })
+                        .font_family(theme::MONO_FONT)
+                        .text_color(theme::text_muted())
                         .child(format!("{:.1}%", eval.pick_rate)),
                 ),
         );
-
-    let data_body = if is_recommended {
-        div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .relative()
-            .bg(linear_gradient(
-                180.0,
-                linear_color_stop(rgba(0x0E1F33F2), 0.0),
-                linear_color_stop(rgba(0x103546F7), 1.0),
-            ))
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .top(px(0.0))
-                    .h(px(1.0))
-                    .bg(rgba(0x38E2D440)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .bottom(px(0.0))
-                    .h(px(2.5))
-                    .bg(rgba(0x38E2D499)),
-            )
-            .child(content_row)
-    } else {
-        div()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .relative()
-            .bg(linear_gradient(
-                180.0,
-                linear_color_stop(rgba(0x131D2EEB), 0.0),
-                linear_color_stop(rgba(0x0D1422F0), 1.0),
-            ))
-            .child(content_row)
-    };
-
-    let inner = div()
-        .size_full()
-        .overflow_hidden()
-        .rounded(px(6.0))
-        .flex()
-        .flex_row()
-        .when(is_recommended, |bar| {
-            bar.border_2().border_color(rgb(0xE8C66D))
-        })
-        .when(!is_recommended, |bar| {
-            bar.border_1().border_color(rgba(0x64748B80))
-        })
-        .child(tier_block)
-        .child(divider)
-        .child(data_body);
 
     div()
         .flex_1()
@@ -363,27 +254,10 @@ fn render_augment_slot_card(eval: &AugmentEvaluation, is_recommended: bool) -> D
         .child(inner)
         .when(is_recommended, |slot| {
             slot.child(
-                div()
+                components::recommended_badge()
                     .absolute()
                     .top(px(-9.0))
-                    .right(px(6.0))
-                    .h(px(18.0))
-                    .px(px(7.5))
-                    .rounded(px(4.0))
-                    .bg(linear_gradient(
-                        90.0,
-                        linear_color_stop(rgb(0xF8E3A3), 0.0),
-                        linear_color_stop(rgb(0xD9A74A), 1.0),
-                    ))
-                    .border_1()
-                    .border_color(rgba(0xFFF3C4CC))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(10.5))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(0x1C1406))
-                    .child("★ 推荐"),
+                    .right(px(8.0)),
             )
         })
 }
@@ -455,7 +329,7 @@ fn render_hero_header(
         Some(path) => div()
             .w(px(36.0))
             .h(px(36.0))
-            .rounded_lg()
+            .rounded(px(3.0))
             .overflow_hidden()
             .border_1()
             .border_color(theme::border_gold())
@@ -463,13 +337,13 @@ fn render_hero_header(
                 img(path)
                     .w(px(36.0))
                     .h(px(36.0))
-                    .rounded_lg()
+                    .rounded(px(3.0))
                     .object_fit(ObjectFit::Cover),
             ),
         None => div()
             .w(px(36.0))
             .h(px(36.0))
-            .rounded_lg()
+            .rounded(px(3.0))
             .bg(theme::gold_dim())
             .border_1()
             .border_color(theme::border_gold())
@@ -512,7 +386,7 @@ fn render_hero_header(
                 div()
                     .px(px(6.0))
                     .py(px(2.0))
-                    .rounded_md()
+                    .rounded(px(2.0))
                     .bg(theme::cyan_dim())
                     .border_1()
                     .border_color(theme::border_cyan())
@@ -599,7 +473,7 @@ fn render_item_slot(item: &BuildItemInfo, icon_path: Option<PathBuf>) -> Div {
         Some(path) => div()
             .w(px(30.0))
             .h(px(30.0))
-            .rounded_md()
+            .rounded(px(3.0))
             .overflow_hidden()
             .border_1()
             .border_color(border)
@@ -607,13 +481,13 @@ fn render_item_slot(item: &BuildItemInfo, icon_path: Option<PathBuf>) -> Div {
                 img(path)
                     .w(px(30.0))
                     .h(px(30.0))
-                    .rounded_md()
+                    .rounded(px(3.0))
                     .object_fit(ObjectFit::Cover),
             ),
         None => div()
             .w(px(30.0))
             .h(px(30.0))
-            .rounded_md()
+            .rounded(px(3.0))
             .bg(theme::card_elevated_bg())
             .border_1()
             .border_color(border)
@@ -630,7 +504,7 @@ fn render_item_slot(item: &BuildItemInfo, icon_path: Option<PathBuf>) -> Div {
         .w(px(96.0))
         .h(px(66.0))
         .p(px(4.0))
-        .rounded_lg()
+        .rounded(px(4.0))
         .bg(bg)
         .border_1()
         .border_color(border)

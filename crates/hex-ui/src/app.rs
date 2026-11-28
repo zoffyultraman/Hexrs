@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use crossbeam_channel::{unbounded, Receiver};
-use gpui::{div, prelude::*, px, rgba, Context, Div, FontWeight, Render, Rgba, Window};
+use gpui::{div, prelude::*, px, Context, Div, FontWeight, Render, Rgba, Window};
 use hex_core::{
     AppEvent, AppMode, AugmentOfferLayout, ChampSelectState, CoreDiagnostics, CoreHandle,
     HeroTier, LiveGameState, PremadeGroupSummary, RatingTitlesConfig, RoiManifest,
@@ -1342,7 +1342,7 @@ impl Render for HexrsApp {
             AppMode::InGameOverlay => overlay_view::render_in_game_overlay(self).into_any_element(),
             AppMode::Dormant => div()
                 .size_full()
-                .bg(rgba(0x00000000))
+                .bg(theme::transparent())
                 .into_any_element(),
         }
     }
@@ -1426,7 +1426,7 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                         .cursor_pointer()
                         .px_2()
                         .py(px(2.0))
-                        .rounded_md()
+                        .rounded(px(3.0))
                         .bg(theme::card_elevated_bg())
                         .border_1()
                         .border_color(theme::border_subtle())
@@ -1451,7 +1451,7 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                 .child(
                     div()
                         .p_2()
-                        .rounded_lg()
+                        .rounded(px(4.0))
                         .bg(theme::card_bg())
                         .border_1()
                         .border_color(theme::border_subtle())
@@ -1522,7 +1522,7 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                                     div()
                                         .mt_1()
                                         .p_2()
-                                        .rounded_md()
+                                        .rounded(px(3.0))
                                         .bg(theme::warning_bg())
                                         .border_1()
                                         .border_color(theme::warning_border())
@@ -1553,7 +1553,7 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                                     .cursor_pointer()
                                     .px_2()
                                     .py_1()
-                                    .rounded_md()
+                                    .rounded(px(3.0))
                                     .bg(theme::warning_bg())
                                     .border_1()
                                     .border_color(theme::warning_border())
@@ -1573,7 +1573,7 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                 .child(
                     div()
                         .p_2()
-                        .rounded_lg()
+                        .rounded(px(4.0))
                         .bg(theme::card_bg())
                         .border_1()
                         .border_color(theme::border_subtle())
@@ -1593,7 +1593,7 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                 .child(
                     div()
                         .p_2()
-                        .rounded_lg()
+                        .rounded(px(4.0))
                         .bg(theme::card_bg())
                         .border_1()
                         .border_color(theme::border_gold())
@@ -1618,7 +1618,7 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                                         .cursor_pointer()
                                         .px_2()
                                         .py_1()
-                                        .rounded_md()
+                                        .rounded(px(3.0))
                                         .bg(theme::gold_dim())
                                         .border_1()
                                         .border_color(theme::border_gold())
@@ -1638,7 +1638,7 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                                         .cursor_pointer()
                                         .px_2()
                                         .py_1()
-                                        .rounded_md()
+                                        .rounded(px(3.0))
                                         .bg(theme::cyan_dim())
                                         .border_1()
                                         .border_color(theme::border_cyan())
@@ -1658,7 +1658,7 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                                         .cursor_pointer()
                                         .px_2()
                                         .py_1()
-                                        .rounded_md()
+                                        .rounded(px(3.0))
                                         .bg(theme::synergy_gold_bg())
                                         .border_1()
                                         .border_color(theme::synergy_gold_border())
@@ -1682,7 +1682,7 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                 .child(
                     div()
                         .p_2()
-                        .rounded_lg()
+                        .rounded(px(4.0))
                         .bg(theme::card_bg())
                         .border_1()
                         .border_color(theme::border_subtle())
