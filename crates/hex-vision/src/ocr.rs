@@ -25,9 +25,19 @@ pub struct OcrOfferMatch {
     pub layout: AugmentOfferLayout,
 }
 
+/// Diagnostic breakdown explaining why an OCR frame did not match a full augment offer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OcrMatchDiagnostic {
+    pub total_lines: usize,
+    pub matched_hits: Vec<(i32, String, f32, f32)>,
+    pub row_unmatched_texts: Vec<(String, f32, f32)>,
+    pub reject_reason: &'static str,
+}
+
 #[derive(Debug, Clone)]
 struct NormalizedAugmentEntry {
     augment_id: i32,
+    name_zh: String,
     norm_name: String,
     char_count: usize,
 }
@@ -69,6 +79,7 @@ impl AugmentTextMatcher {
                 }
                 Some(NormalizedAugmentEntry {
                     augment_id: entry.augment_id,
+                    name_zh: entry.name_zh,
                     norm_name,
                     char_count,
                 })
@@ -273,6 +284,121 @@ impl AugmentTextMatcher {
         }
     }
 
+    /// Produces a privacy-safe diagnostic summary when `match_ocr_lines_to_offer_with_layout` returns `None`.
+    pub fn diagnose_ocr_lines(&self, lines: &[OcrLineHit]) -> OcrMatchDiagnostic {
+        let total_lines = lines.len();
+        if lines.is_empty() {
+            return OcrMatchDiagnostic {
+                total_lines,
+                matched_hits: Vec::new(),
+                row_unmatched_texts: Vec::new(),
+                reject_reason: "no_ocr_lines",
+            };
+        }
+
+        let in_band: Vec<&OcrLineHit> = lines
+            .iter()
+            .filter(|hit| {
+                (BAND_X_MIN..=BAND_X_MAX).contains(&hit.center_x_norm)
+                    && (BAND_Y_MIN..=BAND_Y_MAX).contains(&hit.center_y_norm)
+            })
+            .collect();
+
+        let mut matched_indices = vec![false; in_band.len()];
+        let mut matched_hits: Vec<(i32, String, f32, f32)> = Vec::new();
+
+        for (idx, &hit) in in_band.iter().enumerate() {
+            let hit_norm = normalize_ocr_text(&hit.text);
+            let hit_len = hit_norm.chars().count();
+            if hit_len == 0 || (hit_len == 1 && hit_norm.is_ascii()) {
+                continue;
+            }
+            if let Some((aug_id, _score)) = self.score_line(&hit_norm, hit_len) {
+                matched_indices[idx] = true;
+                let name = self.lookup_name(aug_id);
+                matched_hits.push((aug_id, name, hit.center_x_norm, hit.center_y_norm));
+            }
+        }
+
+        for (i, &a) in in_band.iter().enumerate() {
+            for (j, &b) in in_band.iter().enumerate() {
+                if matched_indices[i] && matched_indices[j] {
+                    continue;
+                }
+                let dy = b.center_y_norm - a.center_y_norm;
+                if !(0.005..=0.055).contains(&dy) {
+                    continue;
+                }
+                if (a.center_x_norm - b.center_x_norm).abs() > 0.06 {
+                    continue;
+                }
+                let merged_raw = format!("{}{}", a.text, b.text);
+                let merged_norm = normalize_ocr_text(&merged_raw);
+                let merged_len = merged_norm.chars().count();
+                if !(4..=16).contains(&merged_len) {
+                    continue;
+                }
+                if let Some((aug_id, _score)) = self.score_line(&merged_norm, merged_len) {
+                    matched_indices[i] = true;
+                    matched_indices[j] = true;
+                    let name = self.lookup_name(aug_id);
+                    matched_hits.push((
+                        aug_id,
+                        name,
+                        (a.center_x_norm + b.center_x_norm) * 0.5,
+                        (a.center_y_norm + b.center_y_norm) * 0.5,
+                    ));
+                }
+            }
+        }
+
+        let reject_reason = if matched_hits.is_empty() {
+            "no_dictionary_match"
+        } else if matched_hits.len() == 1 {
+            "single_hit_only"
+        } else {
+            "row_alignment_or_spacing_rejected"
+        };
+
+        let mut row_unmatched_texts = Vec::new();
+        if let Some(&(_, _, _, ref_y)) = matched_hits.first() {
+            for (idx, &hit) in in_band.iter().enumerate() {
+                if matched_indices[idx] {
+                    continue;
+                }
+                if (hit.center_y_norm - ref_y).abs() <= 0.06 {
+                    let trimmed = hit.text.trim();
+                    if !trimmed.is_empty() {
+                        let truncated: String = trimmed.chars().take(24).collect();
+                        row_unmatched_texts.push((
+                            truncated,
+                            hit.center_x_norm,
+                            hit.center_y_norm,
+                        ));
+                        if row_unmatched_texts.len() >= 6 {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        OcrMatchDiagnostic {
+            total_lines,
+            matched_hits,
+            row_unmatched_texts,
+            reject_reason,
+        }
+    }
+
+    fn lookup_name(&self, aug_id: i32) -> String {
+        self.entries
+            .iter()
+            .find(|e| e.augment_id == aug_id)
+            .map(|e| e.name_zh.clone())
+            .unwrap_or_default()
+    }
+
     fn score_line(&self, hit_norm: &str, hit_len: usize) -> Option<(i32, i32)> {
         let mut best: Option<(i32, i32)> = None;
 
@@ -387,6 +513,8 @@ mod win_ocr {
     /// current thread (must be initialized on the WGC capture callback thread).
     pub struct WinOcrRecognizer {
         engine: OcrEngine,
+        language_tag: String,
+        available_languages: Vec<String>,
     }
 
     impl WinOcrRecognizer {
@@ -404,7 +532,41 @@ mod win_ocr {
                 .or_else(|_| OcrEngine::TryCreateFromUserProfileLanguages())
                 .ok()?;
 
-            Some(Self { engine })
+            let language_tag = engine
+                .RecognizerLanguage()
+                .and_then(|l| l.LanguageTag())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "unknown".to_owned());
+
+            let available_languages = OcrEngine::AvailableRecognizerLanguages()
+                .map(|langs| {
+                    langs
+                        .into_iter()
+                        .filter_map(|l| l.LanguageTag().ok().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            Some(Self {
+                engine,
+                language_tag,
+                available_languages,
+            })
+        }
+
+        /// Returns the BCP-47 language tag actually active on the underlying `OcrEngine`.
+        pub fn language_tag(&self) -> &str {
+            &self.language_tag
+        }
+
+        /// Returns the BCP-47 language tags installed for Windows OCR on this machine.
+        pub fn available_languages(&self) -> &[String] {
+            &self.available_languages
+        }
+
+        /// Returns `true` when the active OCR engine language is Chinese (`zh-*`).
+        pub fn is_chinese(&self) -> bool {
+            self.language_tag.to_ascii_lowercase().starts_with("zh")
         }
 
         /// Crops the augment card band (`x: 0.0..1.0, y: 0.25..0.68`), runs WinRT OCR, and
@@ -905,5 +1067,62 @@ mod tests {
             matcher.match_ocr_lines_to_offer(&wrapped_hits),
             Some(vec![101, 2112, 103])
         );
+    }
+
+    #[test]
+    fn diagnoses_empty_unmatched_single_hit_and_row_filtering() {
+        let matcher = AugmentTextMatcher::new(sample_entries());
+
+        let empty_diag = matcher.diagnose_ocr_lines(&[]);
+        assert_eq!(empty_diag.reject_reason, "no_ocr_lines");
+        assert_eq!(empty_diag.total_lines, 0);
+
+        let no_dict = matcher.diagnose_ocr_lines(&[OcrLineHit {
+            text: "完全无关的屏幕文字".to_owned(),
+            center_x_norm: 0.50,
+            center_y_norm: 0.42,
+        }]);
+        assert_eq!(no_dict.reject_reason, "no_dictionary_match");
+        assert!(no_dict.matched_hits.is_empty());
+        assert!(no_dict.row_unmatched_texts.is_empty());
+
+        let single_hit = matcher.diagnose_ocr_lines(&[
+            OcrLineHit {
+                text: "急速之追求".to_owned(),
+                center_x_norm: 0.32,
+                center_y_norm: 0.42,
+            },
+            OcrLineHit {
+                text: "这是一段超过二十四个字符的同行未匹配卡片标题测试文本内容".to_owned(),
+                center_x_norm: 0.50,
+                center_y_norm: 0.44,
+            },
+            OcrLineHit {
+                text: "底部聊天无关消息".to_owned(),
+                center_x_norm: 0.20,
+                center_y_norm: 0.68,
+            },
+        ]);
+        assert_eq!(single_hit.reject_reason, "single_hit_only");
+        assert_eq!(single_hit.matched_hits.len(), 1);
+        assert_eq!(single_hit.matched_hits[0].0, 101);
+        assert_eq!(single_hit.matched_hits[0].1, "急速之追求");
+        assert_eq!(single_hit.row_unmatched_texts.len(), 1);
+        assert_eq!(single_hit.row_unmatched_texts[0].0.chars().count(), 24);
+
+        let misaligned = matcher.diagnose_ocr_lines(&[
+            OcrLineHit {
+                text: "急速之追求".to_owned(),
+                center_x_norm: 0.32,
+                center_y_norm: 0.30,
+            },
+            OcrLineHit {
+                text: "拯救".to_owned(),
+                center_x_norm: 0.35,
+                center_y_norm: 0.55,
+            },
+        ]);
+        assert_eq!(misaligned.reject_reason, "row_alignment_or_spacing_rejected");
+        assert_eq!(misaligned.matched_hits.len(), 2);
     }
 }

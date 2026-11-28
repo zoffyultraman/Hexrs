@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use crossbeam_channel::Sender;
 use hex_core::AppEvent;
 use hex_data::{AugmentHashEntry, AugmentNameEntry};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::ocr::AugmentTextMatcher;
 use crate::phash::AugmentMatcher;
@@ -143,9 +143,13 @@ pub fn mode_supports_augments(game_mode: &str) -> bool {
     ) {
         return false;
     }
-    matches!(upper.as_str(), "CHERRY" | "KIWI" | "ARAM" | "ULTBOOK")
+    upper.contains("ARAM")
+        || upper.contains("KIWI")
+        || upper.contains("CHERRY")
+        || upper.contains("MAYHEM")
         || upper.contains("HEX")
         || upper.contains("AUGMENT")
+        || upper == "ULTBOOK"
 }
 
 struct VisionShared {
@@ -160,6 +164,7 @@ struct VisionShared {
     max_distance: AtomicU32,
     game_ctx: RwLock<VisionGameContext>,
     gate: Mutex<AramAugmentGate>,
+    last_unsupported_mode_warned: Mutex<Option<String>>,
     wake_lock: Mutex<()>,
     wake_cv: Condvar,
 }
@@ -227,6 +232,7 @@ impl VisionController {
             max_distance: AtomicU32::new(DEFAULT_MAX_HAMMING_DISTANCE),
             game_ctx: RwLock::new(VisionGameContext::default()),
             gate: Mutex::new(AramAugmentGate::default()),
+            last_unsupported_mode_warned: Mutex::new(None),
             wake_lock: Mutex::new(()),
             wake_cv: Condvar::new(),
         });
@@ -240,7 +246,7 @@ impl VisionController {
             {
                 Ok(handle) => Some(handle),
                 Err(err) => {
-                    tracing::warn!(error = %err, "failed to spawn hex-vision supervisor thread");
+                    warn!(error = %err, "failed to spawn hex-vision supervisor thread");
                     None
                 }
             }
@@ -255,14 +261,34 @@ impl VisionController {
 
     /// Updates match context (`level`, `game_time_secs`, `is_dead`, `respawn_timer`) and toggles WGC + ARAM gate.
     pub fn update_game_context(&self, active: bool, ctx: VisionGameContext) {
-        let should_run = active && mode_supports_augments(&ctx.game_mode);
+        let supported = mode_supports_augments(&ctx.game_mode);
+        let should_run = active && supported;
         let game_mode_log = ctx.game_mode.clone();
+        let level = ctx.level;
+        let game_time_secs = ctx.game_time_secs;
+        let is_dead = ctx.is_dead;
+        let respawn_timer = ctx.respawn_timer;
+
+        if active && !supported {
+            if let Ok(mut warned) = self.shared.last_unsupported_mode_warned.lock() {
+                if warned.as_deref() != Some(game_mode_log.as_str()) {
+                    warn!(
+                        game_mode = %game_mode_log,
+                        "hex-vision capture disabled: game_mode does not match augment whitelist"
+                    );
+                    *warned = Some(game_mode_log.clone());
+                }
+            }
+        } else if let Ok(mut warned) = self.shared.last_unsupported_mode_warned.lock() {
+            *warned = None;
+        }
 
         if let Ok(mut guard) = self.shared.game_ctx.write() {
             *guard = ctx;
         }
 
         let prev = self.shared.active.swap(should_run, Ordering::AcqRel);
+        let prev_gate = self.shared.gate_open.load(Ordering::Acquire);
         if !should_run {
             self.shared.offer_active.store(false, Ordering::Release);
             if let Ok(mut gate) = self.shared.gate.lock() {
@@ -270,23 +296,30 @@ impl VisionController {
             }
         }
         self.shared.refresh_gate();
+        let new_gate = self.shared.gate_open.load(Ordering::Acquire);
 
-        if prev != should_run {
+        if prev != should_run || prev_gate != new_gate {
             info!(
                 active = should_run,
                 game_mode = %game_mode_log,
-                gate_open = self.shared.gate_open.load(Ordering::Acquire),
-                "hex-vision capture state changed"
+                level,
+                game_time_secs,
+                is_dead,
+                respawn_timer,
+                gate_open = new_gate,
+                "hex-vision capture/gate state changed"
             );
-            if !should_run {
-                let _ = self.shared.event_tx.send(AppEvent::AugmentOfferCleared);
+            if prev != should_run {
+                if !should_run {
+                    let _ = self.shared.event_tx.send(AppEvent::AugmentOfferCleared);
+                }
+                self.shared.notify_supervisor();
             }
-            self.shared.notify_supervisor();
         } else {
             debug!(
                 active = should_run,
                 game_mode = %game_mode_log,
-                gate_open = self.shared.gate_open.load(Ordering::Acquire),
+                gate_open = new_gate,
                 "hex-vision context updated"
             );
         }
@@ -360,7 +393,7 @@ mod win_capture {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use hex_core::AppEvent;
+    use hex_core::{AppEvent, AugmentOfferLayout};
     use tracing::{debug, info, warn};
     use windows_capture::capture::{CaptureControl, Context, GraphicsCaptureApiHandler};
     use windows_capture::frame::Frame;
@@ -381,6 +414,11 @@ mod win_capture {
     const WINDOW_RETRY_INTERVAL: Duration = Duration::from_millis(1000);
     const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(250);
     const FALLBACK_MAX_DISTANCE: u32 = 8;
+    const OCR_ERR_LOG_INTERVAL: Duration = Duration::from_secs(10);
+    const PARTIAL_DIAG_LOG_INTERVAL: Duration = Duration::from_secs(5);
+    const HEARTBEAT_LOG_INTERVAL: Duration = Duration::from_secs(15);
+    const WINDOW_MISSING_WARN_DELAY: Duration = Duration::from_secs(5);
+    const WINDOW_MISSING_WARN_INTERVAL: Duration = Duration::from_secs(30);
 
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -391,8 +429,34 @@ mod win_capture {
         bgra_scratch: Vec<u8>,
         last_processed: Instant,
         last_emitted: Option<(Vec<i32>, Instant)>,
+        last_frame_dims: Option<(u32, u32)>,
+        last_ocr_err_log: Option<Instant>,
+        last_partial_diag_log: Option<Instant>,
+        last_heartbeat_log: Option<Instant>,
         active_offer: bool,
         consecutive_misses: u8,
+    }
+
+    fn try_strict_phash_match(
+        shared: &VisionShared,
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Option<(Vec<i32>, u64, Option<AugmentOfferLayout>)> {
+        let manifest = shared.manifest.read().ok()?.clone();
+        let preset = select_preset(&manifest, width, height);
+        if !detect_augment_screen(rgba, width, height, preset) {
+            return None;
+        }
+        let mut matcher = shared.matcher.read().ok()?.clone();
+        let strict_dist = shared
+            .max_distance
+            .load(Ordering::Acquire)
+            .min(FALLBACK_MAX_DISTANCE);
+        matcher.set_max_distance(strict_dist);
+        matcher
+            .match_offer(rgba, width, height, &preset.card_icons)
+            .map(|(candidates, ms)| (candidates, ms, None))
     }
 
     impl GraphicsCaptureApiHandler for HexCaptureHandler {
@@ -401,8 +465,19 @@ mod win_capture {
 
         fn new(ctx: Context<Self::Flags>) -> Result<Self, Self::Error> {
             let ocr_recognizer = WinOcrRecognizer::new();
-            if ocr_recognizer.is_some() {
-                info!("WinRT OcrEngine initialized on WGC capture thread");
+            if let Some(ref ocr) = ocr_recognizer {
+                info!(
+                    ocr_lang = %ocr.language_tag(),
+                    available_langs = ?ocr.available_languages(),
+                    "WinRT OcrEngine initialized on WGC capture thread"
+                );
+                if !ocr.is_chinese() {
+                    warn!(
+                        ocr_lang = %ocr.language_tag(),
+                        available_langs = ?ocr.available_languages(),
+                        "WinRT OcrEngine is using a non-Chinese language; Chinese augment OCR cannot match, will fall back to strict ROI pHash"
+                    );
+                }
             } else {
                 warn!("WinRT OcrEngine unavailable; falling back to strict ROI pHash");
             }
@@ -414,6 +489,10 @@ mod win_capture {
                 bgra_scratch: Vec::new(),
                 last_processed: Instant::now() - FRAME_PROCESS_INTERVAL,
                 last_emitted: None,
+                last_frame_dims: None,
+                last_ocr_err_log: None,
+                last_partial_diag_log: None,
+                last_heartbeat_log: None,
                 active_offer: false,
                 consecutive_misses: 0,
             })
@@ -454,6 +533,16 @@ mod win_capture {
             let height = buffer.height();
             let rgba = buffer.as_nopadding_buffer(&mut self.scratch_buf);
 
+            if self.last_frame_dims != Some((width, height)) {
+                self.last_frame_dims = Some((width, height));
+                let ocr_lang = self
+                    .ocr_recognizer
+                    .as_ref()
+                    .map(|o| o.language_tag())
+                    .unwrap_or("none");
+                info!(width, height, ocr_lang, "WGC capture frame stream active");
+            }
+
             let match_result = if let Some(ocr) = self.ocr_recognizer.as_ref() {
                 let start = Instant::now();
                 let hits = ocr.recognize_augment_region(
@@ -463,37 +552,111 @@ mod win_capture {
                     &mut self.bgra_scratch,
                 );
                 let elapsed_ms = start.elapsed().as_millis() as u64;
-                hits.and_then(|lines| {
-                    let text_matcher = self.shared.text_matcher.read().ok()?;
-                    text_matcher
-                        .match_ocr_lines_to_offer_with_layout(&lines)
-                        .map(|matched| (matched.candidates, elapsed_ms, Some(matched.layout)))
-                })
-            } else {
-                let manifest = match self.shared.manifest.read() {
-                    Ok(guard) => guard.clone(),
-                    Err(_) => return Ok(()),
-                };
-                let preset = select_preset(&manifest, width, height);
-                if detect_augment_screen(rgba, width, height, preset) {
-                    let Ok(mut matcher) = self.shared.matcher.read().map(|g| g.clone()) else {
-                        return Ok(());
-                    };
-                    let strict_dist = self
-                        .shared
-                        .max_distance
-                        .load(Ordering::Acquire)
-                        .min(FALLBACK_MAX_DISTANCE);
-                    matcher.set_max_distance(strict_dist);
-                    matcher
-                        .match_offer(rgba, width, height, &preset.card_icons)
-                        .map(|(candidates, ms)| (candidates, ms, None))
-                } else {
-                    None
+                let ocr_lang = ocr.language_tag().to_owned();
+                let is_chinese = ocr.is_chinese();
+
+                match hits {
+                    None => {
+                        if self
+                            .last_ocr_err_log
+                            .map(|t| t.elapsed() >= OCR_ERR_LOG_INTERVAL)
+                            .unwrap_or(true)
+                        {
+                            warn!(
+                                width,
+                                height,
+                                %ocr_lang,
+                                "WinRT OCR recognize_augment_region returned None"
+                            );
+                            self.last_ocr_err_log = Some(Instant::now());
+                        }
+                        if !is_chinese {
+                            try_strict_phash_match(&self.shared, rgba, width, height)
+                                .map(|(c, ms, l)| (c, ms, l, "phash_fallback"))
+                        } else {
+                            None
+                        }
+                    }
+                    Some(lines) => {
+                        let ocr_matched = self.shared.text_matcher.read().ok().and_then(|tm| {
+                            tm.match_ocr_lines_to_offer_with_layout(&lines).map(|m| {
+                                (m.candidates, elapsed_ms, Some(m.layout), "winrt_ocr")
+                            })
+                        });
+
+                        if ocr_matched.is_some() {
+                            ocr_matched
+                        } else {
+                            let phash_matched = if !is_chinese {
+                                try_strict_phash_match(&self.shared, rgba, width, height)
+                                    .map(|(c, ms, l)| (c, ms, l, "phash_fallback"))
+                            } else {
+                                None
+                            };
+
+                            if phash_matched.is_none() {
+                                let can_log_partial = self
+                                    .last_partial_diag_log
+                                    .map(|t| t.elapsed() >= PARTIAL_DIAG_LOG_INTERVAL)
+                                    .unwrap_or(true);
+                                let can_log_heartbeat = self
+                                    .last_heartbeat_log
+                                    .map(|t| t.elapsed() >= HEARTBEAT_LOG_INTERVAL)
+                                    .unwrap_or(true);
+                                if can_log_partial || can_log_heartbeat {
+                                    if let Ok(tm) = self.shared.text_matcher.read() {
+                                        let diag = tm.diagnose_ocr_lines(&lines);
+                                        if !diag.matched_hits.is_empty() && can_log_partial {
+                                            warn!(
+                                                width,
+                                                height,
+                                                total_lines = diag.total_lines,
+                                                matched_hits = ?diag.matched_hits,
+                                                row_unmatched = ?diag.row_unmatched_texts,
+                                                reject_reason = diag.reject_reason,
+                                                "augment OCR partial match rejected"
+                                            );
+                                            self.last_partial_diag_log = Some(Instant::now());
+                                        } else if can_log_heartbeat {
+                                            info!(
+                                                width,
+                                                height,
+                                                total_lines = diag.total_lines,
+                                                reject_reason = diag.reject_reason,
+                                                %ocr_lang,
+                                                "WGC augment scan heartbeat (no offer matched)"
+                                            );
+                                            self.last_heartbeat_log = Some(Instant::now());
+                                        }
+                                    }
+                                }
+                            }
+
+                            phash_matched
+                        }
+                    }
                 }
+            } else {
+                let phash_matched = try_strict_phash_match(&self.shared, rgba, width, height)
+                    .map(|(c, ms, l)| (c, ms, l, "phash_fallback"));
+                if phash_matched.is_none()
+                    && self
+                        .last_heartbeat_log
+                        .map(|t| t.elapsed() >= HEARTBEAT_LOG_INTERVAL)
+                        .unwrap_or(true)
+                {
+                    info!(
+                        width,
+                        height,
+                        ocr_lang = "none",
+                        "WGC augment scan heartbeat (no offer matched via pHash fallback)"
+                    );
+                    self.last_heartbeat_log = Some(Instant::now());
+                }
+                phash_matched
             };
 
-            if let Some((candidates, capture_ms, layout)) = match_result {
+            if let Some((candidates, capture_ms, layout, source)) = match_result {
                 self.consecutive_misses = 0;
                 self.active_offer = true;
                 self.shared.set_offer_active(true);
@@ -505,7 +668,15 @@ mod win_capture {
                     .unwrap_or(false);
 
                 if !is_duplicate {
-                    debug!(?candidates, capture_ms, ?layout, "detected hextech augment offer");
+                    info!(
+                        ?candidates,
+                        capture_ms,
+                        ?layout,
+                        width,
+                        height,
+                        source,
+                        "detected hextech augment offer"
+                    );
                     let _ = self.shared.event_tx.send(AppEvent::AugmentOfferDetected {
                         candidates: candidates.clone(),
                         capture_ms,
@@ -520,7 +691,7 @@ mod win_capture {
                     self.consecutive_misses = 0;
                     self.last_emitted = None;
                     self.shared.set_offer_active(false);
-                    debug!("augment offer modal dismissed; clearing strip");
+                    info!("augment offer modal dismissed; clearing strip");
                     let _ = self.shared.event_tx.send(AppEvent::AugmentOfferCleared);
                 }
             }
@@ -529,7 +700,7 @@ mod win_capture {
         }
 
         fn on_closed(&mut self) -> Result<(), Self::Error> {
-            debug!("WGC capture session closed by game window");
+            info!("WGC capture session closed by game window");
             Ok(())
         }
     }
@@ -550,11 +721,15 @@ mod win_capture {
 
     pub fn run_supervisor(shared: Arc<VisionShared>) {
         let mut active_control: Option<CaptureControl<HexCaptureHandler, BoxError>> = None;
+        let mut window_missing_since: Option<Instant> = None;
+        let mut last_window_missing_warn: Option<Instant> = None;
 
         while !shared.shutdown.load(Ordering::Acquire) {
             let should_run = shared.active.load(Ordering::Acquire);
 
             if !should_run {
+                window_missing_since = None;
+                last_window_missing_warn = None;
                 if active_control.is_some() {
                     info!("hibernating WGC capture session");
                     stop_control(active_control.take());
@@ -581,6 +756,8 @@ mod win_capture {
 
             if active_control.is_none() {
                 if let Some(window) = find_league_game_window() {
+                    window_missing_since = None;
+                    last_window_missing_warn = None;
                     let settings = Settings::new(
                         window,
                         CursorCaptureSettings::Default,
@@ -599,6 +776,17 @@ mod win_capture {
                         Err(err) => {
                             warn!(error = %err, "failed to start WGC capture; retrying");
                         }
+                    }
+                } else {
+                    let now = Instant::now();
+                    let since = *window_missing_since.get_or_insert(now);
+                    if now.saturating_duration_since(since) >= WINDOW_MISSING_WARN_DELAY
+                        && last_window_missing_warn
+                            .map(|t| now.saturating_duration_since(t) >= WINDOW_MISSING_WARN_INTERVAL)
+                            .unwrap_or(true)
+                    {
+                        warn!("WGC active but game window 'League of Legends (TM)' not found for >=5s; retrying");
+                        last_window_missing_warn = Some(now);
                     }
                 }
             }
@@ -726,5 +914,20 @@ mod tests {
             },
             false,
         ));
+    }
+
+    #[test]
+    fn mode_whitelist_accepts_aram_mayhem_variants_and_rejects_classic() {
+        assert!(mode_supports_augments(""));
+        assert!(mode_supports_augments("KIWI"));
+        assert!(mode_supports_augments("ARAM"));
+        assert!(mode_supports_augments("ARAM_MAYHEM"));
+        assert!(mode_supports_augments("CHERRY"));
+        assert!(mode_supports_augments("ULTBOOK"));
+        assert!(mode_supports_augments("HEXTECH_TEST"));
+        assert!(!mode_supports_augments("CLASSIC"));
+        assert!(!mode_supports_augments("TFT"));
+        assert!(!mode_supports_augments("PRACTICETOOL"));
+        assert!(!mode_supports_augments("TUTORIAL"));
     }
 }
