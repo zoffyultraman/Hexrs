@@ -8,8 +8,9 @@ use crossbeam_channel::{unbounded, Receiver};
 use gpui::{div, prelude::*, px, Context, Div, FontWeight, Render, Rgba, Window};
 use hex_core::{
     AppEvent, AppMode, AugmentOfferLayout, ChampSelectState, CoreDiagnostics, CoreHandle,
-    HeroTier, LiveGameState, PremadeGroupSummary, RatingTitlesConfig, RoiManifest,
-    SummonerRatingStatus, SummonerRatingSummary, TeamRatingsSnapshot,
+    HeroTier, LiveGameState, LoadingPlayerSlot, LoadingScreenSnapshot, LoadingTeamSide,
+    PremadeGroupSummary, RatingTitlesConfig, RoiManifest, SummonerRatingStatus,
+    SummonerRatingSummary, TeamRatingsSnapshot,
 };
 use hex_data::{
     spawn_background_update, AugmentEvaluation, BenchHighlight, DynamicBuildPlan, EogReporter,
@@ -19,6 +20,9 @@ use hex_data::{
 use hex_vision::{SharedRoiManifest, VisionController, VisionGameContext};
 use tracing::{debug, info, warn};
 
+use crate::loading_overlay_view::{
+    compute_team_loading_summary, LoadingCardHeroData, LoadingCardSlotData, LoadingOverlayState,
+};
 use crate::lobby_badge_view::{
     BenchBadgeState, CardBadgeState, CardSlotBadgeData, SlotBadgeData, SummonerBadgeData,
     TeamBadgeState, TeamSlotBadgeEntry,
@@ -68,6 +72,10 @@ pub struct HexrsApp {
     pub roi_manifest: SharedRoiManifest,
     pub last_detected_lobby_rect: Option<WindowRectInfo>,
     pub last_detected_game_rect: Option<WindowRectInfo>,
+    pub lobby_focused: bool,
+    pub game_focused: bool,
+    pub loading_screen: Option<LoadingScreenSnapshot>,
+    pub preview_loading_screen: bool,
     meta: Option<MetaEngine>,
     icon_cache: IconCache,
     icon_ready_rx: Receiver<()>,
@@ -85,6 +93,7 @@ pub struct HexrsApp {
     last_bench_badge_sync: Option<(Option<WindowRectInfo>, usize)>,
     last_team_badge_sync: Option<Option<WindowRectInfo>>,
     last_card_badge_sync: Option<(Option<WindowRectInfo>, usize)>,
+    last_loading_sync: Option<(Option<WindowRectInfo>, bool)>,
     last_overlay_sync: Option<(
         Option<WindowRectInfo>,
         OverlayCorner,
@@ -188,6 +197,10 @@ impl HexrsApp {
             roi_manifest,
             last_detected_lobby_rect: None,
             last_detected_game_rect: None,
+            lobby_focused: false,
+            game_focused: false,
+            loading_screen: None,
+            preview_loading_screen: false,
             meta,
             icon_cache,
             icon_ready_rx,
@@ -205,6 +218,7 @@ impl HexrsApp {
             last_bench_badge_sync: None,
             last_team_badge_sync: None,
             last_card_badge_sync: None,
+            last_loading_sync: None,
             last_overlay_sync: None,
             last_diagnostics_sync: false,
             last_dormant_hidden: false,
@@ -317,14 +331,16 @@ impl HexrsApp {
                         dirty = true;
                     }
                     TrayAction::ToggleDiagnostics => {
-                        if self.preview_mode.is_some() {
+                        if self.preview_mode.is_some() || self.preview_loading_screen {
                             self.preview_mode = None;
+                            self.preview_loading_screen = false;
                             self.clear_offered_augment_state();
                             self.diagnostics_open = true;
                             if let Some(ref tray_ctrl) = self.tray {
                                 tray_ctrl.set_diagnostics_checked(true);
                             }
                         } else {
+                            self.preview_loading_screen = false;
                             self.diagnostics_open = self
                                 .tray
                                 .as_ref()
@@ -431,6 +447,7 @@ impl HexrsApp {
     /// Sets or exits UI preview mode from the diagnostics panel.
     pub fn set_preview_mode(&mut self, mode: Option<AppMode>, cx: &mut Context<Self>) {
         self.preview_mode = mode;
+        self.preview_loading_screen = false;
         self.clear_offered_augment_state();
         if mode == Some(AppMode::InGameOverlay) && self.live_game.is_none() {
             self.populate_hero_hud_state(Some(PREVIEW_YASUO_HERO_ID), None, &[]);
@@ -444,6 +461,7 @@ impl HexrsApp {
     /// Previews the horizontal 3-card augment strip using real augments from `MetaEngine`.
     pub fn preview_augment_bar(&mut self, cx: &mut Context<Self>) {
         self.preview_mode = Some(AppMode::InGameOverlay);
+        self.preview_loading_screen = false;
         if self.live_game.is_none() {
             self.populate_hero_hud_state(Some(PREVIEW_YASUO_HERO_ID), None, &[]);
         }
@@ -466,10 +484,20 @@ impl HexrsApp {
         cx.notify();
     }
 
+    /// Previews the 10-player loading screen HUD overlay without requiring an active match.
+    pub fn preview_loading_screen_mode(&mut self, cx: &mut Context<Self>) {
+        self.preview_mode = Some(AppMode::InGameOverlay);
+        self.preview_loading_screen = true;
+        self.clear_offered_augment_state();
+        self.reset_window_sync_cache();
+        cx.notify();
+    }
+
     /// Closes the diagnostics panel and syncs the tray check item.
     pub fn close_diagnostics(&mut self, cx: &mut Context<Self>) {
         self.diagnostics_open = false;
         self.preview_mode = None;
+        self.preview_loading_screen = false;
         self.clear_offered_augment_state();
         if let Some(ref tray_ctrl) = self.tray {
             tray_ctrl.set_diagnostics_checked(false);
@@ -501,6 +529,7 @@ impl HexrsApp {
         self.last_bench_badge_sync = None;
         self.last_team_badge_sync = None;
         self.last_card_badge_sync = None;
+        self.last_loading_sync = None;
         self.last_overlay_sync = None;
         self.last_diagnostics_sync = false;
         self.last_dormant_hidden = false;
@@ -526,7 +555,7 @@ impl HexrsApp {
 
         let target_rect = if !in_diagnostics
             && effective_mode == AppMode::LobbyDocked
-            && (self.overlay_visible || is_preview)
+            && (is_preview || (self.overlay_visible && self.lobby_focused))
         {
             self.last_detected_lobby_rect
                 .or_else(|| is_preview.then(win32::default_preview_lobby_rect))
@@ -728,6 +757,217 @@ impl HexrsApp {
         )
     }
 
+    fn lookup_loading_hero(&self, hero_id: i32) -> Option<LoadingCardHeroData> {
+        if hero_id <= 0 {
+            return None;
+        }
+        let stats = self.meta.as_ref()?.get_hero_stats(hero_id)?;
+        Some(LoadingCardHeroData {
+            tier: stats.tier,
+            win_rate: stats.win_rate,
+            name_zh: stats.name_zh,
+        })
+    }
+
+    fn preview_loading_screen_snapshot(&self) -> LoadingScreenSnapshot {
+        const BLUE_IDS: [i32; 5] = [157, 498, 23, 36, 526];
+        const RED_IDS: [i32; 5] = [145, 777, 875, 54, 42];
+
+        let team_one: Vec<LoadingPlayerSlot> = BLUE_IDS
+            .into_iter()
+            .enumerate()
+            .map(|(slot_index, champion_id)| LoadingPlayerSlot {
+                slot_index,
+                champion_id,
+                puuid: format!("preview-blue-{slot_index}"),
+            })
+            .collect();
+        let team_two: Vec<LoadingPlayerSlot> = RED_IDS
+            .into_iter()
+            .enumerate()
+            .map(|(slot_index, champion_id)| LoadingPlayerSlot {
+                slot_index,
+                champion_id,
+                puuid: format!("preview-red-{slot_index}"),
+            })
+            .collect();
+
+        let enemy_specs = [
+            (0, SummonerRatingStatus::Ready, 81, 4, Some(1), true),
+            (1, SummonerRatingStatus::Ready, 68, 0, Some(1), false),
+            (2, SummonerRatingStatus::Ready, 55, -3, None, false),
+            (3, SummonerRatingStatus::Ready, 43, -4, None, false),
+            (4, SummonerRatingStatus::InsufficientSamples, 0, 0, None, false),
+        ];
+        let enemy_slots = enemy_specs
+            .into_iter()
+            .map(
+                |(cell_id, status, score, streak, premade_group_id, is_premade_last_mvp)| {
+                    let (tier_index, title) = self.rating_titles.resolve(status, score);
+                    SummonerRatingSummary {
+                        cell_id,
+                        status,
+                        score,
+                        tier_index,
+                        title,
+                        games_count: if status == SummonerRatingStatus::Ready {
+                            10
+                        } else {
+                            2
+                        },
+                        win_rate: 51.0,
+                        avg_kda: 2.9,
+                        streak,
+                        premade_group_id,
+                        is_premade_last_mvp,
+                    }
+                },
+            )
+            .collect();
+
+        LoadingScreenSnapshot {
+            game_id: 0,
+            game_mode: "KIWI".to_owned(),
+            queue_id: Some(2400),
+            local_side: LoadingTeamSide::Blue,
+            team_one,
+            team_two,
+            team_one_ratings: self.preview_team_ratings(),
+            team_two_ratings: TeamRatingsSnapshot {
+                slots: enemy_slots,
+                premade_groups: vec![PremadeGroupSummary {
+                    group_id: 1,
+                    slot_indices: vec![0, 1],
+                    shared_games: 3,
+                    last_mvp_slot_index: Some(0),
+                }],
+            },
+        }
+    }
+
+    fn map_loading_team_slots(
+        &self,
+        players: &[LoadingPlayerSlot],
+        ratings: &TeamRatingsSnapshot,
+    ) -> Vec<LoadingCardSlotData> {
+        players
+            .iter()
+            .take(5)
+            .enumerate()
+            .map(|(idx, player)| {
+                let hero = self.lookup_loading_hero(player.champion_id);
+                let summoner = ratings
+                    .slots
+                    .get(idx)
+                    .map(summoner_summary_to_badge)
+                    .unwrap_or_else(|| {
+                        let (tier_index, title) =
+                            self.rating_titles.resolve(SummonerRatingStatus::Loading, 0);
+                        SummonerBadgeData {
+                            status: SummonerRatingStatus::Loading,
+                            score: 0,
+                            tier_index,
+                            title,
+                            streak: 0,
+                            premade_group_id: None,
+                            is_premade_last_mvp: false,
+                        }
+                    });
+                LoadingCardSlotData { hero, summoner }
+            })
+            .collect()
+    }
+
+    /// Computes the 10-player loading screen overlay state and its deferred Win32 window command.
+    pub fn build_loading_overlay_sync(
+        &mut self,
+        loading_hwnd_raw: isize,
+    ) -> (LoadingOverlayState, Option<Win32WindowCommand>) {
+        let in_diagnostics = self.diagnostics_open && self.preview_mode.is_none();
+        let effective_mode = self.preview_mode.unwrap_or(self.mode);
+        let should_show = !in_diagnostics
+            && (self.preview_loading_screen
+                || (effective_mode == AppMode::InGameOverlay
+                    && self.overlay_visible
+                    && self.game_focused
+                    && self.loading_screen.is_some()));
+
+        let target_rect = if should_show {
+            self.last_detected_game_rect
+                .or_else(|| self.preview_loading_screen.then(win32::default_preview_game_rect))
+        } else {
+            None
+        };
+
+        let Some(rect) = target_rect else {
+            let cmd = if loading_hwnd_raw != 0 && self.last_loading_sync != Some((None, false)) {
+                self.last_loading_sync = Some((None, false));
+                Some(Win32WindowCommand {
+                    hwnd_raw: loading_hwnd_raw,
+                    action: Win32WindowAction::LoadingScreenOverlay {
+                        target_rect: None,
+                        visible: false,
+                    },
+                })
+            } else {
+                None
+            };
+            return (LoadingOverlayState::default(), cmd);
+        };
+
+        let preview_snap = (self.preview_loading_screen && self.loading_screen.is_none())
+            .then(|| self.preview_loading_screen_snapshot());
+        let Some(snap) = self.loading_screen.as_ref().or(preview_snap.as_ref()) else {
+            let cmd = if loading_hwnd_raw != 0 && self.last_loading_sync != Some((None, false)) {
+                self.last_loading_sync = Some((None, false));
+                Some(Win32WindowCommand {
+                    hwnd_raw: loading_hwnd_raw,
+                    action: Win32WindowAction::LoadingScreenOverlay {
+                        target_rect: None,
+                        visible: false,
+                    },
+                })
+            } else {
+                None
+            };
+            return (LoadingOverlayState::default(), cmd);
+        };
+
+        let team_one = self.map_loading_team_slots(&snap.team_one, &snap.team_one_ratings);
+        let team_two = self.map_loading_team_slots(&snap.team_two, &snap.team_two_ratings);
+        let team_one_summary =
+            compute_team_loading_summary(&snap.team_one_ratings, &self.rating_titles);
+        let team_two_summary =
+            compute_team_loading_summary(&snap.team_two_ratings, &self.rating_titles);
+
+        let scale = win32::window_scale_for_hwnd(loading_hwnd_raw, rect.scale()).max(0.5);
+        let state = LoadingOverlayState {
+            visible: true,
+            local_side: snap.local_side,
+            team_one,
+            team_two,
+            team_one_summary,
+            team_two_summary,
+            window_width_dip: rect.width() as f32 / scale,
+            window_height_dip: rect.height() as f32 / scale,
+        };
+
+        let cmd = if loading_hwnd_raw != 0 && self.last_loading_sync != Some((Some(rect), true)) {
+            self.last_loading_sync = Some((Some(rect), true));
+            Some(Win32WindowCommand {
+                hwnd_raw: loading_hwnd_raw,
+                action: Win32WindowAction::LoadingScreenOverlay {
+                    target_rect: Some(rect),
+                    visible: true,
+                },
+            })
+        } else {
+            None
+        };
+
+        (state, cmd)
+    }
+
     fn lookup_card_slot_badge(&self, hero_id: i32) -> Option<CardSlotBadgeData> {
         if hero_id <= 0 {
             return None;
@@ -841,6 +1081,18 @@ impl HexrsApp {
                     slot.title = title;
                 }
             }
+            if let Some(loading) = self.loading_screen.as_mut() {
+                for slot in &mut loading.team_one_ratings.slots {
+                    let (tier_index, title) = self.rating_titles.resolve(slot.status, slot.score);
+                    slot.tier_index = tier_index;
+                    slot.title = title;
+                }
+                for slot in &mut loading.team_two_ratings.slots {
+                    let (tier_index, title) = self.rating_titles.resolve(slot.status, slot.score);
+                    slot.tier_index = tier_index;
+                    slot.title = title;
+                }
+            }
         }
     }
 
@@ -853,6 +1105,7 @@ impl HexrsApp {
     fn clear_in_game_hud_state(&mut self) {
         self.owned_augment_ids.clear();
         self.clear_offered_augment_state();
+        self.loading_screen = None;
         self.dynamic_build = None;
         self.active_hero_id = None;
         self.active_hero_alias = None;
@@ -932,7 +1185,30 @@ impl HexrsApp {
                 }
                 self.team_ratings = Some(snapshot);
             }
+            AppEvent::LoadingScreenUpdated(mut snap) => {
+                self.refresh_rating_titles_if_changed();
+                for slot in &mut snap.team_one_ratings.slots {
+                    let (tier_index, title) = self.rating_titles.resolve(slot.status, slot.score);
+                    slot.tier_index = tier_index;
+                    slot.title = title;
+                }
+                for slot in &mut snap.team_two_ratings.slots {
+                    let (tier_index, title) = self.rating_titles.resolve(slot.status, slot.score);
+                    slot.tier_index = tier_index;
+                    slot.title = title;
+                }
+                self.loading_screen = Some(snap);
+                self.reset_window_sync_cache();
+            }
+            AppEvent::LoadingScreenCleared => {
+                if self.loading_screen.take().is_some() {
+                    self.reset_window_sync_cache();
+                }
+            }
             AppEvent::LiveGameUpdated(live) => {
+                if live.game_time_secs > 0.0 && self.loading_screen.take().is_some() {
+                    self.reset_window_sync_cache();
+                }
                 self.refresh_live_game_data(&live);
                 self.live_game = Some(live);
             }
@@ -1166,6 +1442,19 @@ impl HexrsApp {
         };
 
         if self.diagnostics_open && self.preview_mode.is_none() {
+            let lobby_r = win32::find_league_lobby_window(self.core_handle.lcu_pid());
+            let game_r = win32::find_league_game_window(self.core_handle.game_pid());
+            self.last_detected_lobby_rect = lobby_r;
+            self.last_detected_game_rect = game_r;
+            self.lobby_focused = win32::is_lobby_window_foreground(
+                self.core_handle.lcu_pid(),
+                lobby_r.map(|r| r.hwnd_raw).unwrap_or(0),
+                hwnd_raw,
+            );
+            self.game_focused = win32::is_game_window_foreground(
+                self.core_handle.game_pid(),
+                game_r.map(|r| r.hwnd_raw).unwrap_or(0),
+            );
             if !self.last_diagnostics_sync {
                 self.last_diagnostics_sync = true;
                 self.last_dormant_hidden = false;
@@ -1194,15 +1483,21 @@ impl HexrsApp {
                     self.last_detected_lobby_rect = detected_rect;
                 }
 
+                self.lobby_focused = win32::is_lobby_window_foreground(
+                    self.core_handle.lcu_pid(),
+                    detected_rect.map(|r| r.hwnd_raw).unwrap_or(0),
+                    hwnd_raw,
+                );
+                let visible = is_preview || (self.overlay_visible && self.lobby_focused);
                 let target_rect = if is_preview {
                     detected_rect.or_else(|| Some(win32::default_preview_lobby_rect()))
-                } else if self.overlay_visible {
+                } else if visible {
                     detected_rect
                 } else {
                     None
                 };
 
-                let state = (target_rect, is_preview || self.overlay_visible);
+                let state = (target_rect, visible);
                 if self.last_lobby_sync != Some(state) {
                     self.last_lobby_sync = Some(state);
                     return Some(Win32WindowCommand {
@@ -1224,14 +1519,25 @@ impl HexrsApp {
                     self.last_detected_game_rect = detected_rect;
                 }
 
+                self.game_focused = win32::is_game_window_foreground(
+                    self.core_handle.game_pid(),
+                    detected_rect.map(|r| r.hwnd_raw).unwrap_or(0),
+                );
+                let base_visible = is_preview || (self.overlay_visible && self.game_focused);
+                let suppress_corner_for_loading = self.offered_augments.is_empty()
+                    && (self.loading_screen.is_some() || self.preview_loading_screen);
+                let visible = base_visible && !suppress_corner_for_loading;
                 let target_rect = if is_preview {
-                    detected_rect.or_else(|| Some(win32::default_preview_game_rect()))
-                } else if self.overlay_visible {
+                    if visible {
+                        detected_rect.or_else(|| Some(win32::default_preview_game_rect()))
+                    } else {
+                        None
+                    }
+                } else if visible {
                     detected_rect
                 } else {
                     None
                 };
-                let visible = is_preview || self.overlay_visible;
                 let augment_slot_count = self.offered_augments.len().min(4);
                 let offer_layout = if augment_slot_count > 0 {
                     self.offered_augment_layout.as_ref()
@@ -1588,7 +1894,15 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                                 .child("Win32 目标窗口定位"),
                         )
                         .child(diag_row("大厅窗口 (RCLIENT)", lobby_rect_str))
-                        .child(diag_row("局内窗口 (RiotWindowClass)", game_rect_str)),
+                        .child(diag_row("局内窗口 (RiotWindowClass)", game_rect_str))
+                        .child(diag_row(
+                            "客户端焦点",
+                            format!(
+                                "大厅: {} · 局内: {}",
+                                if app.lobby_focused { "聚焦" } else { "未聚焦" },
+                                if app.game_focused { "聚焦" } else { "未聚焦" }
+                            ),
+                        )),
                 )
                 .child(
                     div()
@@ -1671,6 +1985,27 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                                             this.preview_augment_bar(cx);
                                         })),
                                 ),
+                        )
+                        .child(
+                            div()
+                                .id("preview-loading-screen-btn")
+                                .cursor_pointer()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(3.0))
+                                .bg(theme::cyan_dim())
+                                .border_1()
+                                .border_color(theme::border_cyan())
+                                .hover(|s| s.bg(theme::card_elevated_bg()))
+                                .flex()
+                                .justify_center()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::cyan())
+                                .child("预览加载页10人")
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.preview_loading_screen_mode(cx);
+                                })),
                         )
                         .child(
                             div()

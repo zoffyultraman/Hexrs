@@ -81,6 +81,10 @@ pub enum Win32WindowAction {
         slot_count: usize,
         layout: Option<AugmentOfferLayout>,
     },
+    LoadingScreenOverlay {
+        target_rect: Option<WindowRectInfo>,
+        visible: bool,
+    },
 }
 
 /// Deferred Win32 command targeting a specific `HWND` outside GPUI's re-entrant `Window` lock.
@@ -98,6 +102,7 @@ pub struct WindowRectInfo {
     pub right: i32,
     pub bottom: i32,
     pub dpi: u32,
+    pub hwnd_raw: isize,
 }
 
 impl WindowRectInfo {
@@ -221,6 +226,75 @@ pub fn compute_augment_bar_gap_dip(
     compute_augment_bar_geometry(rect, rect.scale(), slot_count, layout).gap_dip
 }
 
+/// Logical DIP coordinates for the 10-player loading screen card strips and center VS summary bar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoadingLayoutGeometry {
+    pub row_left_dip: f32,
+    pub card_w_dip: f32,
+    pub card_gap_dip: f32,
+    pub card_strip_h_dip: f32,
+    pub top_row_y_dip: f32,
+    pub bottom_row_y_dip: f32,
+    pub center_bar_left_dip: f32,
+    pub center_bar_y_dip: f32,
+    pub center_bar_w_dip: f32,
+    pub center_bar_h_dip: f32,
+}
+
+/// Computes the 10-card top/bottom strip and center VS summary bar layout for a loading screen window.
+pub fn compute_loading_layout_dip(window_w_dip: f32, window_h_dip: f32) -> LoadingLayoutGeometry {
+    let w = window_w_dip.max(320.0);
+    let h = window_h_dip.max(200.0);
+
+    let raw_card_w = h * 0.285;
+    let raw_gap = h * 0.026;
+    let raw_total = 5.0 * raw_card_w + 4.0 * raw_gap;
+    let max_row_w = w * 0.92;
+    let (card_w_dip, card_gap_dip) = if raw_total > max_row_w && raw_total > 0.0 {
+        let scale = max_row_w / raw_total;
+        (raw_card_w * scale, raw_gap * scale)
+    } else {
+        (raw_card_w, raw_gap)
+    };
+
+    let row_w = 5.0 * card_w_dip + 4.0 * card_gap_dip;
+    let row_left_dip = ((w - row_w) * 0.5).max(0.0);
+    let card_strip_h_dip = (h * 0.044).clamp(44.0, 48.0);
+    let top_row_y_dip = h * 0.022;
+    let bottom_row_y_dip = h * 0.528;
+
+    let center_bar_h_dip = 28.0_f32;
+    let min_center_y = top_row_y_dip + card_strip_h_dip + 2.0;
+    let max_center_y = (bottom_row_y_dip - center_bar_h_dip - 2.0).max(min_center_y);
+    let raw_center_y = (h * 0.500 - center_bar_h_dip * 0.5).max(min_center_y);
+    let center_bar_y_dip = if raw_center_y > max_center_y {
+        let avail =
+            (bottom_row_y_dip - (top_row_y_dip + card_strip_h_dip) - center_bar_h_dip).max(0.0);
+        top_row_y_dip + card_strip_h_dip + avail * 0.5
+    } else {
+        raw_center_y
+    };
+
+    let center_bar_w_dip = row_w
+        .min(680.0)
+        .max(360.0)
+        .min((w - 24.0).max(200.0));
+    let center_bar_left_dip = ((w - center_bar_w_dip) * 0.5).max(0.0);
+
+    LoadingLayoutGeometry {
+        row_left_dip,
+        card_w_dip,
+        card_gap_dip,
+        card_strip_h_dip,
+        top_row_y_dip,
+        bottom_row_y_dip,
+        center_bar_left_dip,
+        center_bar_y_dip,
+        center_bar_w_dip,
+        center_bar_h_dip,
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
     use std::os::windows::ffi::OsStrExt;
@@ -240,9 +314,9 @@ mod imp {
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, FindWindowW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+        EnumWindows, FindWindowW, GetClassNameW, GetForegroundWindow, GetSystemMetrics,
+        GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+        IsWindowVisible, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
         SystemParametersInfoW, GWL_EXSTYLE, HWND_TOPMOST, LWA_ALPHA, SM_CXVIRTUALSCREEN,
         SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SPI_GETWORKAREA, SWP_FRAMECHANGED,
         SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, SW_SHOWNORMAL,
@@ -317,7 +391,66 @@ mod imp {
             right: rect.right,
             bottom: rect.bottom,
             dpi: if dpi == 0 { 96 } else { dpi },
+            hwnd_raw: hwnd.0 as isize,
         })
+    }
+
+    unsafe fn read_window_class(hwnd: HWND) -> String {
+        let mut buf = [0_u16; 128];
+        let len = GetClassNameW(hwnd, &mut buf);
+        if len <= 0 {
+            String::new()
+        } else {
+            String::from_utf16_lossy(&buf[..len as usize])
+        }
+    }
+
+    /// Returns `true` when the League lobby client (`RCLIENT`) or Hexrs itself owns foreground focus.
+    pub fn is_lobby_window_foreground(
+        lcu_pid: Option<u32>,
+        lobby_hwnd_raw: isize,
+        own_hwnd_raw: isize,
+    ) -> bool {
+        // SAFETY: Foreground window, PID, and class queries are read-only Win32 calls.
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg.0.is_null() {
+                return false;
+            }
+            let fg_raw = fg.0 as isize;
+            if (lobby_hwnd_raw != 0 && fg_raw == lobby_hwnd_raw)
+                || (own_hwnd_raw != 0 && fg_raw == own_hwnd_raw)
+            {
+                return true;
+            }
+            let mut fg_pid: u32 = 0;
+            let _ = GetWindowThreadProcessId(fg, Some(&mut fg_pid));
+            if fg_pid != 0 && (Some(fg_pid) == lcu_pid || fg_pid == std::process::id()) {
+                return true;
+            }
+            read_window_class(fg) == "RCLIENT"
+        }
+    }
+
+    /// Returns `true` when the active League in-game window (`RiotWindowClass`) owns foreground focus.
+    pub fn is_game_window_foreground(game_pid: Option<u32>, game_hwnd_raw: isize) -> bool {
+        // SAFETY: Foreground window, PID, and class queries are read-only Win32 calls.
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg.0.is_null() {
+                return false;
+            }
+            let fg_raw = fg.0 as isize;
+            if game_hwnd_raw != 0 && fg_raw == game_hwnd_raw {
+                return true;
+            }
+            let mut fg_pid: u32 = 0;
+            let _ = GetWindowThreadProcessId(fg, Some(&mut fg_pid));
+            if fg_pid != 0 && Some(fg_pid) == game_pid {
+                return true;
+            }
+            read_window_class(fg) == "RiotWindowClass"
+        }
     }
 
     unsafe fn read_window_title(hwnd: HWND) -> String {
@@ -559,6 +692,7 @@ mod imp {
             right: (left + w - 340).min(work.right),
             bottom: top + h,
             dpi: 96,
+            hwnd_raw: 0,
         }
     }
 
@@ -571,6 +705,7 @@ mod imp {
             right: work.right,
             bottom: work.bottom,
             dpi: 96,
+            hwnd_raw: 0,
         }
     }
 
@@ -689,7 +824,47 @@ mod imp {
                 *slot_count,
                 layout.as_ref(),
             ),
+            Win32WindowAction::LoadingScreenOverlay {
+                target_rect,
+                visible,
+            } => set_loading_screen_overlay_hwnd(hwnd, *target_rect, *visible),
         }
+    }
+
+    /// Anchors the full-window click-through 10-player loading screen overlay over `League of Legends.exe`.
+    fn set_loading_screen_overlay_hwnd(
+        hwnd: HWND,
+        target_rect: Option<WindowRectInfo>,
+        visible: bool,
+    ) -> Result<()> {
+        // SAFETY: `hwnd` belongs to the active GPUI loading overlay window on the UI thread.
+        unsafe {
+            apply_transparent_ex_style(hwnd, false);
+
+            let Some(target) = target_rect.filter(|_| visible) else {
+                let _ = ShowWindow(hwnd, SW_HIDE);
+                return Ok(());
+            };
+
+            let w = target.width().max(320);
+            let h = target.height().max(200);
+
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                target.left,
+                target.top,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            .context("SetWindowPos(loading screen overlay) failed")?;
+
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
+
+        Ok(())
     }
 
     /// Anchors the compact `324x204` click-through corner HUD onto `League of Legends.exe`.
@@ -1181,6 +1356,7 @@ mod imp {
             right: 1060,
             bottom: 820,
             dpi: 96,
+            hwnd_raw: 0,
         }
     }
 
@@ -1192,7 +1368,22 @@ mod imp {
             right: 1920,
             bottom: 1080,
             dpi: 96,
+            hwnd_raw: 0,
         }
+    }
+
+    /// Non-Windows stub for `is_lobby_window_foreground`.
+    pub fn is_lobby_window_foreground(
+        _lcu_pid: Option<u32>,
+        _lobby_hwnd_raw: isize,
+        _own_hwnd_raw: isize,
+    ) -> bool {
+        false
+    }
+
+    /// Non-Windows stub for `is_game_window_foreground`.
+    pub fn is_game_window_foreground(_game_pid: Option<u32>, _game_hwnd_raw: isize) -> bool {
+        false
     }
 
     /// Non-Windows stub for `apply_overlay_styles`.
@@ -1244,6 +1435,48 @@ mod imp {
 
 pub use imp::{
     apply_window_command, default_preview_game_rect, default_preview_lobby_rect,
-    find_league_game_window, find_league_lobby_window, open_data_directory, open_log_file,
-    relaunch_as_administrator, window_hwnd_raw, window_scale_for_hwnd,
+    find_league_game_window, find_league_lobby_window, is_game_window_foreground,
+    is_lobby_window_foreground, open_data_directory, open_log_file, relaunch_as_administrator,
+    window_hwnd_raw, window_scale_for_hwnd,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::compute_loading_layout_dip;
+
+    #[test]
+    fn loading_layout_fits_and_does_not_overlap_across_resolutions() {
+        for (w, h) in [
+            (1920.0_f32, 1080.0_f32),
+            (2560.0_f32, 1440.0_f32),
+            (2560.0_f32, 1080.0_f32),
+            (1280.0_f32, 800.0_f32),
+        ] {
+            let g = compute_loading_layout_dip(w, h);
+            assert!(
+                (44.0..=48.0).contains(&g.card_strip_h_dip),
+                "strip height {} out of 44..=48 at {w}x{h}",
+                g.card_strip_h_dip
+            );
+            let row_w = 5.0 * g.card_w_dip + 4.0 * g.card_gap_dip;
+            assert!(g.row_left_dip >= 0.0, "row_left < 0 at {w}x{h}");
+            assert!(
+                g.row_left_dip + row_w <= w + 0.1,
+                "row overflows right edge at {w}x{h}"
+            );
+            assert!(
+                g.top_row_y_dip + g.card_strip_h_dip < g.center_bar_y_dip,
+                "top row overlaps center bar at {w}x{h}"
+            );
+            assert!(
+                g.center_bar_y_dip + g.center_bar_h_dip <= g.bottom_row_y_dip,
+                "center bar overlaps bottom row at {w}x{h}"
+            );
+            assert!(g.center_bar_left_dip >= 0.0, "center bar left < 0 at {w}x{h}");
+            assert!(
+                g.center_bar_left_dip + g.center_bar_w_dip <= w + 0.1,
+                "center bar overflows right edge at {w}x{h}"
+            );
+        }
+    }
+}
