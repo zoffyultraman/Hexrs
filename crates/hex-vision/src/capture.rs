@@ -1,6 +1,6 @@
 //! On-demand Windows Graphics Capture (WGC) session controller (`windows-capture 2.0.1`).
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use crossbeam_channel::Sender;
@@ -8,7 +8,7 @@ use hex_core::AppEvent;
 use hex_data::{AugmentHashEntry, AugmentNameEntry};
 use tracing::{debug, info, warn};
 
-use crate::ocr::AugmentTextMatcher;
+use crate::ocr::{AugmentTextMatcher, LoadingAlignmentTargets};
 use crate::phash::AugmentMatcher;
 use crate::roi::SharedRoiManifest;
 
@@ -160,6 +160,9 @@ struct VisionShared {
     active: AtomicBool,
     offer_active: AtomicBool,
     gate_open: AtomicBool,
+    loading_targets: RwLock<Option<LoadingAlignmentTargets>>,
+    loading_targets_gen: AtomicU64,
+    loading_scan_pending: AtomicBool,
     shutdown: AtomicBool,
     max_distance: AtomicU32,
     game_ctx: RwLock<VisionGameContext>,
@@ -170,6 +173,11 @@ struct VisionShared {
 }
 
 impl VisionShared {
+    #[cfg(any(target_os = "windows", test))]
+    fn should_run_capture(&self) -> bool {
+        self.active.load(Ordering::Acquire) || self.loading_scan_pending.load(Ordering::Acquire)
+    }
+
     fn notify_supervisor(&self) {
         let _guard = self.wake_lock.lock();
         self.wake_cv.notify_all();
@@ -228,6 +236,9 @@ impl VisionController {
             active: AtomicBool::new(false),
             offer_active: AtomicBool::new(false),
             gate_open: AtomicBool::new(false),
+            loading_targets: RwLock::new(None),
+            loading_targets_gen: AtomicU64::new(0),
+            loading_scan_pending: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             max_distance: AtomicU32::new(DEFAULT_MAX_HAMMING_DISTANCE),
             game_ctx: RwLock::new(VisionGameContext::default()),
@@ -366,11 +377,63 @@ impl VisionController {
         }
     }
 
+    /// Sets or clears loading-screen card alignment targets.
+    ///
+    /// Deduplicates identical target rosters so repeated rating updates during loading do not
+    /// reset alignment attempts or unlock a locked alignment. Never logs player/target text.
+    pub fn set_loading_targets(&self, targets: Option<LoadingAlignmentTargets>) {
+        let normalized = targets.filter(|t| !t.team_one.is_empty() || !t.team_two.is_empty());
+        let changed = if let Ok(mut guard) = self.shared.loading_targets.write() {
+            if *guard == normalized {
+                false
+            } else {
+                *guard = normalized.clone();
+                true
+            }
+        } else {
+            false
+        };
+
+        if !changed {
+            return;
+        }
+
+        let pending = normalized.is_some();
+        self.shared
+            .loading_targets_gen
+            .fetch_add(1, Ordering::AcqRel);
+        self.shared
+            .loading_scan_pending
+            .store(pending, Ordering::Release);
+
+        if let Some(ref t) = normalized {
+            debug!(
+                game_id = t.game_id,
+                team_one_len = t.team_one.len(),
+                team_two_len = t.team_two.len(),
+                "updated loading screen OCR alignment targets"
+            );
+        } else {
+            debug!("cleared loading screen OCR alignment targets");
+        }
+
+        self.shared.notify_supervisor();
+    }
+
     /// Stops any active capture session and shuts down the supervisor thread.
     pub fn shutdown(&mut self) {
         self.shared.active.store(false, Ordering::Release);
         self.shared.offer_active.store(false, Ordering::Release);
         self.shared.gate_open.store(false, Ordering::Release);
+        self.shared
+            .loading_scan_pending
+            .store(false, Ordering::Release);
+        if let Ok(mut guard) = self.shared.loading_targets.write() {
+            *guard = None;
+        }
+        self.shared
+            .loading_targets_gen
+            .fetch_add(1, Ordering::AcqRel);
         self.shared.shutdown.store(true, Ordering::Release);
         self.shared.notify_supervisor();
 
@@ -405,10 +468,16 @@ mod win_capture {
     use windows_capture::window::Window as CaptureWindow;
 
     use super::VisionShared;
-    use crate::ocr::WinOcrRecognizer;
+    use crate::ocr::{align_loading_row_from_ocr, LoadingAlignmentTargets, WinOcrRecognizer};
     use crate::roi::{detect_augment_screen, select_preset};
 
     const FRAME_PROCESS_INTERVAL: Duration = Duration::from_millis(400);
+    const LOADING_FRAME_INTERVAL: Duration = Duration::from_millis(500);
+    const LOADING_TOP_BAND_Y_START: f32 = 0.368;
+    const LOADING_TOP_BAND_Y_END: f32 = 0.485;
+    const LOADING_BOTTOM_BAND_Y_START: f32 = 0.855;
+    const LOADING_BOTTOM_BAND_Y_END: f32 = 0.965;
+    const LOADING_MAX_ATTEMPTS: u8 = 12;
     const OFFER_DEDUP_COOLDOWN: Duration = Duration::from_secs(4);
     const CLEAR_AFTER_MISSES: u8 = 3;
     const WINDOW_RETRY_INTERVAL: Duration = Duration::from_millis(1000);
@@ -422,12 +491,35 @@ mod win_capture {
 
     type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+    #[derive(Default)]
+    struct LoadingAlignmentState {
+        generation: u64,
+        targets: Option<LoadingAlignmentTargets>,
+        best_team_one: Option<(Vec<usize>, usize, i32)>,
+        best_team_two: Option<(Vec<usize>, usize, i32)>,
+        attempts: u8,
+        locked: bool,
+    }
+
+    impl LoadingAlignmentState {
+        fn reset_for(&mut self, generation: u64, targets: Option<LoadingAlignmentTargets>) {
+            self.generation = generation;
+            self.targets = targets;
+            self.best_team_one = None;
+            self.best_team_two = None;
+            self.attempts = 0;
+            self.locked = false;
+        }
+    }
+
     struct HexCaptureHandler {
         shared: Arc<VisionShared>,
         ocr_recognizer: Option<WinOcrRecognizer>,
         scratch_buf: Vec<u8>,
         bgra_scratch: Vec<u8>,
         last_processed: Instant,
+        last_loading_processed: Instant,
+        loading_state: LoadingAlignmentState,
         last_emitted: Option<(Vec<i32>, Instant)>,
         last_frame_dims: Option<(u32, u32)>,
         last_ocr_err_log: Option<Instant>,
@@ -488,6 +580,8 @@ mod win_capture {
                 scratch_buf: Vec::new(),
                 bgra_scratch: Vec::new(),
                 last_processed: Instant::now() - FRAME_PROCESS_INTERVAL,
+                last_loading_processed: Instant::now() - LOADING_FRAME_INTERVAL,
+                loading_state: LoadingAlignmentState::default(),
                 last_emitted: None,
                 last_frame_dims: None,
                 last_ocr_err_log: None,
@@ -503,7 +597,7 @@ mod win_capture {
             frame: &mut Frame,
             capture_control: InternalCaptureControl,
         ) -> Result<(), Self::Error> {
-            if !self.shared.active.load(Ordering::Acquire)
+            if !self.shared.should_run_capture()
                 || self.shared.shutdown.load(Ordering::Acquire)
             {
                 if self.active_offer {
@@ -514,6 +608,208 @@ mod win_capture {
                     let _ = self.shared.event_tx.send(AppEvent::AugmentOfferCleared);
                 }
                 capture_control.stop();
+                return Ok(());
+            }
+
+            let targets_gen = self.shared.loading_targets_gen.load(Ordering::Acquire);
+            if targets_gen != self.loading_state.generation {
+                let next_targets = self
+                    .shared
+                    .loading_targets
+                    .read()
+                    .ok()
+                    .and_then(|g| g.clone());
+                self.loading_state.reset_for(targets_gen, next_targets);
+                self.last_loading_processed = Instant::now() - LOADING_FRAME_INTERVAL;
+            }
+
+            if self.loading_state.targets.is_some() {
+                if self.loading_state.locked {
+                    return Ok(());
+                }
+                if self.last_loading_processed.elapsed() < LOADING_FRAME_INTERVAL {
+                    return Ok(());
+                }
+                self.last_loading_processed = Instant::now();
+
+                if self.ocr_recognizer.is_none() {
+                    let game_id = self
+                        .loading_state
+                        .targets
+                        .as_ref()
+                        .map(|t| t.game_id)
+                        .unwrap_or(0);
+                    warn!(
+                        game_id,
+                        "WinRT OcrEngine unavailable; skipping loading screen card alignment"
+                    );
+                    self.loading_state.locked = true;
+                    self.shared
+                        .loading_scan_pending
+                        .store(false, Ordering::Release);
+                    return Ok(());
+                }
+
+                let (t1_res, t2_res) = {
+                    let (Some(targets), Some(ocr)) = (
+                        self.loading_state.targets.as_ref(),
+                        self.ocr_recognizer.as_ref(),
+                    ) else {
+                        return Ok(());
+                    };
+
+                    let buffer = frame.buffer()?;
+                    let width = buffer.width();
+                    let height = buffer.height();
+                    let rgba = buffer.as_nopadding_buffer(&mut self.scratch_buf);
+
+                    if self.last_frame_dims != Some((width, height)) {
+                        self.last_frame_dims = Some((width, height));
+                        info!(
+                            width,
+                            height,
+                            ocr_lang = %ocr.language_tag(),
+                            "WGC capture frame stream active"
+                        );
+                    }
+
+                    let t1 = if !targets.team_one.is_empty() {
+                        ocr.recognize_band(
+                            rgba,
+                            width,
+                            height,
+                            LOADING_TOP_BAND_Y_START,
+                            LOADING_TOP_BAND_Y_END,
+                            &mut self.bgra_scratch,
+                        )
+                        .and_then(|lines| {
+                            align_loading_row_from_ocr(&lines, &targets.team_one, width, height)
+                        })
+                    } else {
+                        None
+                    };
+
+                    let t2 = if !targets.team_two.is_empty() {
+                        ocr.recognize_band(
+                            rgba,
+                            width,
+                            height,
+                            LOADING_BOTTOM_BAND_Y_START,
+                            LOADING_BOTTOM_BAND_Y_END,
+                            &mut self.bgra_scratch,
+                        )
+                        .and_then(|lines| {
+                            align_loading_row_from_ocr(&lines, &targets.team_two, width, height)
+                        })
+                    } else {
+                        None
+                    };
+
+                    (t1, t2)
+                };
+
+                self.loading_state.attempts = self.loading_state.attempts.saturating_add(1);
+
+                let mut improved = false;
+                if let Some((order, matched_cols, score)) = t1_res {
+                    let is_better = self
+                        .loading_state
+                        .best_team_one
+                        .as_ref()
+                        .map(|(_, prev_cols, prev_score)| {
+                            matched_cols > *prev_cols
+                                || (matched_cols == *prev_cols && score > *prev_score)
+                        })
+                        .unwrap_or(true);
+                    if is_better {
+                        self.loading_state.best_team_one = Some((order, matched_cols, score));
+                        improved = true;
+                    }
+                }
+                if let Some((order, matched_cols, score)) = t2_res {
+                    let is_better = self
+                        .loading_state
+                        .best_team_two
+                        .as_ref()
+                        .map(|(_, prev_cols, prev_score)| {
+                            matched_cols > *prev_cols
+                                || (matched_cols == *prev_cols && score > *prev_score)
+                        })
+                        .unwrap_or(true);
+                    if is_better {
+                        self.loading_state.best_team_two = Some((order, matched_cols, score));
+                        improved = true;
+                    }
+                }
+
+                let (game_id, t1_len, t2_len) = self
+                    .loading_state
+                    .targets
+                    .as_ref()
+                    .map(|t| (t.game_id, t.team_one.len(), t.team_two.len()))
+                    .unwrap_or((0, 0, 0));
+                let t1_matched = self
+                    .loading_state
+                    .best_team_one
+                    .as_ref()
+                    .map(|(_, m, _)| *m)
+                    .unwrap_or(0);
+                let t2_matched = self
+                    .loading_state
+                    .best_team_two
+                    .as_ref()
+                    .map(|(_, m, _)| *m)
+                    .unwrap_or(0);
+
+                if improved {
+                    let team_one_order = self
+                        .loading_state
+                        .best_team_one
+                        .as_ref()
+                        .map(|(o, _, _)| o.clone())
+                        .unwrap_or_else(|| (0..t1_len).collect());
+                    let team_two_order = self
+                        .loading_state
+                        .best_team_two
+                        .as_ref()
+                        .map(|(o, _, _)| o.clone())
+                        .unwrap_or_else(|| (0..t2_len).collect());
+                    info!(
+                        game_id,
+                        ?team_one_order,
+                        ?team_two_order,
+                        team_one_matched = t1_matched,
+                        team_two_matched = t2_matched,
+                        attempts = self.loading_state.attempts,
+                        "detected loading screen card order"
+                    );
+                    let _ = self.shared.event_tx.send(AppEvent::LoadingCardOrderDetected {
+                        game_id,
+                        team_one_order,
+                        team_two_order,
+                    });
+                }
+
+                let t1_ready = t1_len == 0 || t1_matched >= t1_len.min(3);
+                let t2_ready = t2_len == 0 || t2_matched >= t2_len.min(3);
+                if (t1_ready && t2_ready) || self.loading_state.attempts >= LOADING_MAX_ATTEMPTS {
+                    self.loading_state.locked = true;
+                    self.shared
+                        .loading_scan_pending
+                        .store(false, Ordering::Release);
+                    info!(
+                        game_id,
+                        team_one_matched = t1_matched,
+                        team_two_matched = t2_matched,
+                        attempts = self.loading_state.attempts,
+                        "loading screen card alignment locked"
+                    );
+                }
+
+                return Ok(());
+            }
+
+            if !self.shared.active.load(Ordering::Acquire) {
                 return Ok(());
             }
 
@@ -725,7 +1021,7 @@ mod win_capture {
         let mut last_window_missing_warn: Option<Instant> = None;
 
         while !shared.shutdown.load(Ordering::Acquire) {
-            let should_run = shared.active.load(Ordering::Acquire);
+            let should_run = shared.should_run_capture();
 
             if !should_run {
                 window_missing_since = None;
@@ -738,9 +1034,7 @@ mod win_capture {
                     Ok(g) => g,
                     Err(_) => break,
                 };
-                if !shared.shutdown.load(Ordering::Acquire)
-                    && !shared.active.load(Ordering::Acquire)
-                {
+                if !shared.shutdown.load(Ordering::Acquire) && !shared.should_run_capture() {
                     drop(shared.wake_cv.wait(guard));
                 }
                 continue;
@@ -929,5 +1223,41 @@ mod tests {
         assert!(!mode_supports_augments("TFT"));
         assert!(!mode_supports_augments("PRACTICETOOL"));
         assert!(!mode_supports_augments("TUTORIAL"));
+    }
+
+    #[test]
+    fn set_loading_targets_deduplicates_and_controls_capture_wakeup() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let manifest = Arc::new(RwLock::new(hex_core::RoiManifest::default()));
+        let mut controller = VisionController::start(Vec::new(), Vec::new(), manifest, tx);
+
+        assert!(!controller.shared.should_run_capture());
+        assert_eq!(controller.shared.loading_targets_gen.load(Ordering::Acquire), 0);
+
+        let targets = LoadingAlignmentTargets {
+            game_id: 99,
+            team_one: vec![crate::ocr::LoadingSlotTarget {
+                name_zh: "卡莎".to_owned(),
+                title_zh: "虚空之女".to_owned(),
+                alias: "Kaisa".to_owned(),
+                summoner_name: "p1".to_owned(),
+            }],
+            team_two: Vec::new(),
+        };
+
+        controller.set_loading_targets(Some(targets.clone()));
+        assert!(controller.shared.should_run_capture());
+        assert_eq!(controller.shared.loading_targets_gen.load(Ordering::Acquire), 1);
+
+        // Identical target update must not bump generation (preserves locked/attempt state).
+        controller.set_loading_targets(Some(targets));
+        assert_eq!(controller.shared.loading_targets_gen.load(Ordering::Acquire), 1);
+
+        // Clearing targets disables pending capture when augment mode is inactive.
+        controller.set_loading_targets(None);
+        assert!(!controller.shared.should_run_capture());
+        assert_eq!(controller.shared.loading_targets_gen.load(Ordering::Acquire), 2);
+
+        controller.shutdown();
     }
 }

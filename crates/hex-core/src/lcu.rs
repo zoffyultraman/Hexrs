@@ -963,6 +963,36 @@ enum RawBenchEntry {
     },
 }
 
+fn extract_participant_display_name(p: &RawGameflowParticipant) -> String {
+    let game_name = p.game_name.trim();
+    if !game_name.is_empty() {
+        return game_name.to_owned();
+    }
+    let riot_id = p.riot_id.trim();
+    if !riot_id.is_empty() {
+        if let Some((before_hash, _)) = riot_id.split_once('#') {
+            let trimmed = before_hash.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        } else {
+            return riot_id.to_owned();
+        }
+    }
+    p.summoner_name.trim().to_owned()
+}
+
+fn parse_selected_position_rank(position: &str) -> Option<u8> {
+    match position.trim().to_ascii_uppercase().as_str() {
+        "TOP" => Some(0),
+        "JUNGLE" => Some(1),
+        "MIDDLE" | "MID" => Some(2),
+        "BOTTOM" | "BOT" | "ADC" => Some(3),
+        "UTILITY" | "SUPPORT" | "SUP" => Some(4),
+        _ => None,
+    }
+}
+
 fn into_gameflow_session_snapshot(raw: RawGameflowSession) -> GameflowSessionSnapshot {
     let mut selection_map: HashMap<String, i32> = HashMap::new();
     for sel in raw.game_data.player_champion_selections.into_iter().flatten() {
@@ -973,22 +1003,41 @@ fn into_gameflow_session_snapshot(raw: RawGameflowSession) -> GameflowSessionSna
     }
 
     let map_team = |raw_team: Vec<Option<RawGameflowParticipant>>| -> Vec<LoadingPlayerSlot> {
-        raw_team
+        let mut entries: Vec<(Option<u8>, LoadingPlayerSlot)> = raw_team
             .into_iter()
             .flatten()
-            .enumerate()
-            .map(|(slot_index, p)| {
+            .map(|p| {
                 let puuid = p.puuid.trim().to_owned();
+                let display_name = extract_participant_display_name(&p);
+                let role_rank = parse_selected_position_rank(&p.selected_position);
                 let champion_id = if p.champion_id > 0 {
                     p.champion_id
                 } else {
                     selection_map.get(&puuid).copied().unwrap_or(0)
                 };
-                LoadingPlayerSlot {
-                    slot_index,
-                    champion_id,
-                    puuid,
-                }
+                (
+                    role_rank,
+                    LoadingPlayerSlot {
+                        slot_index: 0,
+                        champion_id,
+                        puuid,
+                        display_name,
+                    },
+                )
+            })
+            .collect();
+
+        let known_roles = entries.iter().filter(|(rank, _)| rank.is_some()).count();
+        if known_roles >= 3 {
+            entries.sort_by_key(|(rank, _)| rank.unwrap_or(u8::MAX));
+        }
+
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(slot_index, (_, mut slot))| {
+                slot.slot_index = slot_index;
+                slot
             })
             .collect()
     };
@@ -1045,6 +1094,17 @@ struct RawGameflowParticipant {
     champion_id: i32,
     #[serde(deserialize_with = "deserialize_null_default")]
     puuid: String,
+    #[serde(rename = "gameName", deserialize_with = "deserialize_null_default")]
+    game_name: String,
+    #[serde(rename = "riotId", deserialize_with = "deserialize_null_default")]
+    riot_id: String,
+    #[serde(rename = "summonerName", deserialize_with = "deserialize_null_default")]
+    summoner_name: String,
+    #[serde(
+        rename = "selectedPosition",
+        deserialize_with = "deserialize_null_default"
+    )]
+    selected_position: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1170,6 +1230,64 @@ mod tests {
         let del_frame = r#"[8,"OnJsonApiEvent_lol-gameflow_v1_session",{"eventType":"Delete","data":null}]"#;
         match parse_wamp_event(del_frame) {
             Some(LcuWsEvent::GameflowPhase(phase)) => assert_eq!(phase, "None"),
+            other => panic!("unexpected parsed event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sorts_sr_team_by_selected_position_and_preserves_aram_order() {
+        let sr_frame = r#"[8,"OnJsonApiEvent_lol-gameflow_v1_session",{"eventType":"Update","data":{"phase":"GameStart","gameData":{"gameId":1001,"queue":{"id":420,"gameMode":"CLASSIC"},"teamOne":[{"championId":412,"puuid":"sup-p","selectedPosition":"UTILITY"},{"championId":157,"puuid":"mid-p","selectedPosition":"mid"},{"championId":86,"puuid":"top-p","selectedPosition":"TOP"},{"championId":145,"puuid":"adc-p","selectedPosition":"ADC"},{"championId":64,"puuid":"jg-p","selectedPosition":"Jungle"}],"teamTwo":[{"championId":1,"puuid":"u1","selectedPosition":""},{"championId":22,"puuid":"bot-p","selectedPosition":"BOTTOM"},{"championId":2,"puuid":"u2","selectedPosition":"NONE"},{"championId":122,"puuid":"top2-p","selectedPosition":"TOP"},{"championId":104,"puuid":"jg2-p","selectedPosition":"JUNGLE"}]}}}]"#;
+        match parse_wamp_event(sr_frame) {
+            Some(LcuWsEvent::GameflowSessionUpdated(sess)) => {
+                let t1_puuids: Vec<&str> = sess.team_one.iter().map(|s| s.puuid.as_str()).collect();
+                let t1_indices: Vec<usize> = sess.team_one.iter().map(|s| s.slot_index).collect();
+                assert_eq!(t1_puuids, vec!["top-p", "jg-p", "mid-p", "adc-p", "sup-p"]);
+                assert_eq!(t1_indices, vec![0, 1, 2, 3, 4]);
+                assert_eq!(sess.team_one[0].champion_id, 86);
+                assert_eq!(sess.team_one[4].champion_id, 412);
+
+                let t2_puuids: Vec<&str> = sess.team_two.iter().map(|s| s.puuid.as_str()).collect();
+                let t2_indices: Vec<usize> = sess.team_two.iter().map(|s| s.slot_index).collect();
+                assert_eq!(t2_puuids, vec!["top2-p", "jg2-p", "bot-p", "u1", "u2"]);
+                assert_eq!(t2_indices, vec![0, 1, 2, 3, 4]);
+            }
+            other => panic!("unexpected parsed event: {other:?}"),
+        }
+
+        // ARAM / KIWI without >=3 standard positions preserves original order.
+        let aram_frame = r#"[8,"OnJsonApiEvent_lol-gameflow_v1_session",{"eventType":"Update","data":{"phase":"GameStart","gameData":{"gameId":1002,"queue":{"id":2400,"gameMode":"KIWI"},"teamOne":[{"championId":25,"puuid":"a1","selectedPosition":"UTILITY"},{"championId":523,"puuid":"a2","selectedPosition":""},{"championId":145,"puuid":"a3","selectedPosition":"TOP"},{"championId":104,"puuid":"a4","selectedPosition":"NONE"},{"championId":147,"puuid":"a5","selectedPosition":null}],"teamTwo":[]}}}]"#;
+        match parse_wamp_event(aram_frame) {
+            Some(LcuWsEvent::GameflowSessionUpdated(sess)) => {
+                let puuids: Vec<&str> = sess.team_one.iter().map(|s| s.puuid.as_str()).collect();
+                let champs: Vec<i32> = sess.team_one.iter().map(|s| s.champion_id).collect();
+                assert_eq!(puuids, vec!["a1", "a2", "a3", "a4", "a5"]);
+                assert_eq!(champs, vec![25, 523, 145, 104, 147]);
+            }
+            other => panic!("unexpected parsed event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extracts_display_name_with_priority_fallback() {
+        let frame = r#"[8,"OnJsonApiEvent_lol-gameflow_v1_session",{"eventType":"Update","data":{"phase":"GameStart","gameData":{"gameId":2001,"queue":{"id":2400,"gameMode":"KIWI"},"teamOne":[{"championId":1,"puuid":"p1","gameName":"  GameNameWin  ","riotId":"RiotHead#1234","summonerName":"OldSumm"},{"championId":2,"puuid":"p2","gameName":"   ","riotId":"  RiotSplit #9999 ","summonerName":"OldSumm2"},{"championId":3,"puuid":"p3","gameName":null,"riotId":"  RiotNoHash  ","summonerName":"OldSumm3"},{"championId":4,"puuid":"p4","gameName":"","riotId":"  #1234 ","summonerName":"  SummFallback  "},{"championId":5,"puuid":"p5","gameName":null,"riotId":null,"summonerName":null}],"teamTwo":[]}}}]"#;
+        match parse_wamp_event(frame) {
+            Some(LcuWsEvent::GameflowSessionUpdated(sess)) => {
+                let names: Vec<&str> = sess
+                    .team_one
+                    .iter()
+                    .map(|s| s.display_name.as_str())
+                    .collect();
+                assert_eq!(
+                    names,
+                    vec![
+                        "GameNameWin",
+                        "RiotSplit",
+                        "RiotNoHash",
+                        "SummFallback",
+                        ""
+                    ]
+                );
+            }
             other => panic!("unexpected parsed event: {other:?}"),
         }
     }

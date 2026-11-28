@@ -602,6 +602,7 @@ impl CoordinatorState {
                                 s.pick_intent
                             },
                             puuid: s.puuid.clone(),
+                            display_name: String::new(),
                         })
                         .collect();
                 }
@@ -1234,16 +1235,23 @@ fn backfill_missing_allies(
             } else {
                 ally.puuid.clone()
             };
+            let display_name = if !t.display_name.is_empty() {
+                t.display_name.clone()
+            } else {
+                ally.display_name.clone()
+            };
             result.push(LoadingPlayerSlot {
                 slot_index: result.len(),
                 champion_id,
                 puuid,
+                display_name,
             });
         } else {
             result.push(LoadingPlayerSlot {
                 slot_index: result.len(),
                 champion_id: ally.champion_id,
                 puuid: ally.puuid.clone(),
+                display_name: ally.display_name.clone(),
             });
         }
 
@@ -1258,6 +1266,7 @@ fn backfill_missing_allies(
                 slot_index: result.len(),
                 champion_id: t.champion_id,
                 puuid: t.puuid,
+                display_name: t.display_name,
             });
         }
     }
@@ -1623,6 +1632,7 @@ mod tests {
             slot_index,
             champion_id,
             puuid: puuid.to_owned(),
+            display_name: String::new(),
         }
     }
 

@@ -34,6 +34,24 @@ pub struct OcrMatchDiagnostic {
     pub reject_reason: &'static str,
 }
 
+/// Target identity metadata for a single loading-screen player card.
+/// Transient in-memory only; never log `summoner_name` or target text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadingSlotTarget {
+    pub name_zh: String,
+    pub title_zh: String,
+    pub alias: String,
+    pub summoner_name: String,
+}
+
+/// Target rosters for top (`team_one`) and bottom (`team_two`) loading-screen rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadingAlignmentTargets {
+    pub game_id: u64,
+    pub team_one: Vec<LoadingSlotTarget>,
+    pub team_two: Vec<LoadingSlotTarget>,
+}
+
 #[derive(Debug, Clone)]
 struct NormalizedAugmentEntry {
     augment_id: i32,
@@ -493,6 +511,363 @@ fn char_levenshtein(a: &str, b: &str) -> usize {
     prev[n]
 }
 
+struct NormalizedLoadingTarget {
+    name_zh: String,
+    name_zh_chars: Vec<char>,
+    title_zh: String,
+    title_zh_chars: Vec<char>,
+    alias: String,
+    summoner: String,
+    summoner_chars: Vec<char>,
+}
+
+impl NormalizedLoadingTarget {
+    fn from_target(t: &LoadingSlotTarget) -> Self {
+        let name_zh = normalize_ocr_text(&t.name_zh);
+        let name_zh_chars = name_zh.chars().collect();
+        let title_zh = normalize_ocr_text(&t.title_zh);
+        let title_zh_chars = title_zh.chars().collect();
+        let alias = normalize_ocr_text(&t.alias);
+        let summoner = normalize_ocr_text(&t.summoner_name);
+        let summoner_chars = summoner.chars().collect();
+        Self {
+            name_zh,
+            name_zh_chars,
+            title_zh,
+            title_zh_chars,
+            alias,
+            summoner,
+            summoner_chars,
+        }
+    }
+}
+
+fn longest_common_substring_chars(a: &[char], b: &[char]) -> usize {
+    if a.is_empty() || b.is_empty() {
+        return 0;
+    }
+    let mut prev = vec![0usize; b.len() + 1];
+    let mut curr = vec![0usize; b.len() + 1];
+    let mut best = 0usize;
+    for &ca in a {
+        for (j, &cb) in b.iter().enumerate() {
+            if ca == cb {
+                let v = prev[j] + 1;
+                curr[j + 1] = v;
+                if v > best {
+                    best = v;
+                }
+            } else {
+                curr[j + 1] = 0;
+            }
+        }
+        std::mem::swap(&mut prev, &mut curr);
+        curr.fill(0);
+    }
+    best
+}
+
+fn count_shared_non_ascii_chars(hay: &[char], needle: &[char]) -> usize {
+    let mut seen: Vec<char> = Vec::new();
+    let mut shared = 0usize;
+    for &c in needle {
+        if c.is_ascii() || seen.contains(&c) {
+            continue;
+        }
+        seen.push(c);
+        if hay.contains(&c) {
+            shared += 1;
+        }
+    }
+    shared
+}
+
+fn score_loading_summoner(
+    col_lines: &[(String, Vec<char>)],
+    col_joined: &str,
+    needle: &str,
+    needle_chars: &[char],
+) -> i32 {
+    let n_len = needle_chars.len();
+    if n_len == 0 {
+        return 0;
+    }
+    if n_len == 1 {
+        return if !needle_chars[0].is_ascii()
+            && col_lines.iter().any(|(l, _)| l.as_str() == needle)
+        {
+            900
+        } else {
+            0
+        };
+    }
+
+    let mut best = 0i32;
+    let has_non_ascii = needle_chars.iter().any(|c| !c.is_ascii());
+    for (line, line_chars) in col_lines {
+        if line.as_str() == needle {
+            best = best.max(1200 + (n_len as i32) * 10);
+        } else if line.contains(needle) {
+            best = best.max(950 + (n_len as i32) * 10);
+        } else if line_chars.len() >= 2
+            && line_chars.len() * 2 >= n_len
+            && needle.contains(line.as_str())
+        {
+            best = best.max(520 + (line_chars.len() as i32) * 10);
+        } else if n_len >= 3 {
+            let lcs = longest_common_substring_chars(line_chars, needle_chars);
+            if has_non_ascii {
+                let shared = count_shared_non_ascii_chars(line_chars, needle_chars);
+                if (lcs >= 2 && lcs * 2 >= n_len) || (shared >= 2 && shared * 2 >= n_len) {
+                    best = best.max(180 + (lcs as i32) * 60 + (shared as i32) * 35);
+                }
+            } else if n_len >= 4 && lcs >= 3 && lcs * 2 >= n_len {
+                best = best.max(180 + (lcs as i32) * 60);
+            }
+        }
+    }
+
+    if best < 900 && col_joined.contains(needle) {
+        best = best.max(900 + (n_len as i32) * 10);
+    }
+    best
+}
+
+fn score_loading_name_zh(
+    col_lines: &[(String, Vec<char>)],
+    col_joined: &str,
+    needle: &str,
+    needle_chars: &[char],
+) -> i32 {
+    let n_len = needle_chars.len();
+    if n_len == 0 {
+        return 0;
+    }
+    if n_len == 1 {
+        if !needle_chars[0].is_ascii() {
+            if col_lines.iter().any(|(l, _)| l.as_str() == needle) {
+                return 720;
+            }
+            if col_lines.iter().any(|(l, _)| l.ends_with(needle)) {
+                return 360;
+            }
+        }
+        return 0;
+    }
+
+    let mut best = 0i32;
+    for (line, line_chars) in col_lines {
+        if line.as_str() == needle {
+            best = best.max(850 + (n_len as i32) * 10);
+        } else if line.contains(needle) {
+            let suffix_bonus = if line.ends_with(needle) { 80 } else { 0 };
+            best = best.max(700 + (n_len as i32) * 10 + suffix_bonus);
+        } else if n_len >= 3 {
+            let lcs = longest_common_substring_chars(line_chars, needle_chars);
+            let shared = count_shared_non_ascii_chars(line_chars, needle_chars);
+            if shared >= 2 && shared * 2 >= n_len {
+                best = best.max(220 + (lcs as i32) * 80 + (shared as i32) * 40);
+            }
+        }
+    }
+
+    if best < 680 && col_joined.contains(needle) {
+        best = best.max(680 + (n_len as i32) * 10);
+    }
+    best
+}
+
+fn score_loading_title_zh(
+    col_lines: &[(String, Vec<char>)],
+    col_joined: &str,
+    needle: &str,
+    needle_chars: &[char],
+) -> i32 {
+    let n_len = needle_chars.len();
+    if n_len < 2 {
+        return 0;
+    }
+
+    let mut best = 0i32;
+    let min_shared = if n_len >= 4 { 3 } else { 2 };
+    for (line, line_chars) in col_lines {
+        if line.as_str() == needle {
+            best = best.max(800 + (n_len as i32) * 10);
+        } else if line.contains(needle) {
+            best = best.max(650 + (n_len as i32) * 10);
+        } else if n_len >= 3 {
+            let lcs = longest_common_substring_chars(line_chars, needle_chars);
+            let shared = count_shared_non_ascii_chars(line_chars, needle_chars);
+            if shared >= min_shared && (n_len >= 4 || lcs >= 2) {
+                best = best.max(200 + (lcs as i32) * 70 + (shared as i32) * 35);
+            }
+        }
+    }
+
+    if best < 630 && col_joined.contains(needle) {
+        best = best.max(630 + (n_len as i32) * 10);
+    }
+    best
+}
+
+fn score_loading_alias(col_lines: &[(String, Vec<char>)], col_joined: &str, needle: &str) -> i32 {
+    let n_len = needle.chars().count();
+    if n_len < 2 {
+        return 0;
+    }
+
+    let mut best = 0i32;
+    for (line, _) in col_lines {
+        if line.as_str() == needle {
+            best = best.max(700 + (n_len as i32) * 5);
+        } else if n_len >= 4 && line.contains(needle) {
+            best = best.max(500 + (n_len as i32) * 5);
+        }
+    }
+
+    if best < 480 && n_len >= 4 && col_joined.contains(needle) {
+        best = best.max(480 + (n_len as i32) * 5);
+    }
+    best
+}
+
+fn score_loading_column_against_target(
+    col_lines: &[(String, Vec<char>)],
+    col_joined: &str,
+    target: &NormalizedLoadingTarget,
+) -> i32 {
+    if col_lines.is_empty() {
+        return 0;
+    }
+    let summoner_score =
+        score_loading_summoner(col_lines, col_joined, &target.summoner, &target.summoner_chars);
+    let name_score =
+        score_loading_name_zh(col_lines, col_joined, &target.name_zh, &target.name_zh_chars);
+    let title_score =
+        score_loading_title_zh(col_lines, col_joined, &target.title_zh, &target.title_zh_chars);
+    let alias_score = score_loading_alias(col_lines, col_joined, &target.alias);
+    let champ_score = name_score.max(title_score).max(alias_score);
+    summoner_score + champ_score
+}
+
+fn generate_permutations(n: usize) -> Vec<Vec<usize>> {
+    fn backtrack(start: usize, current: &mut [usize], out: &mut Vec<Vec<usize>>) {
+        if start == current.len() {
+            out.push(current.to_vec());
+            return;
+        }
+        for i in start..current.len() {
+            current.swap(start, i);
+            backtrack(start + 1, current, out);
+            current.swap(start, i);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut current: Vec<usize> = (0..n).collect();
+    backtrack(0, &mut current, &mut out);
+    out
+}
+
+/// Aligns a single 1..=5 player loading-screen row from WinRT OCR line hits using calibrated
+/// card X-geometry and optimal 1-to-1 permutation matching (`n! <= 120`).
+///
+/// Returns `Some((order, matched_cols, total_score))` where `order[visual_col]` is the index
+/// into `targets` occupying visual column `visual_col`, or `None` on blank/low-confidence frames.
+pub fn align_loading_row_from_ocr(
+    lines: &[OcrLineHit],
+    targets: &[LoadingSlotTarget],
+    frame_w: u32,
+    frame_h: u32,
+) -> Option<(Vec<usize>, usize, i32)> {
+    let n = targets.len();
+    if n == 0 || n > 5 || lines.is_empty() {
+        return None;
+    }
+
+    let w = frame_w.max(320) as f32;
+    let h = frame_h.max(200) as f32;
+    let raw_card_w = h * 0.2328;
+    let raw_gap = h * 0.0411;
+    let raw_total = raw_card_w * 5.0 + raw_gap * 4.0;
+    let scale = if raw_total > w * 0.90 {
+        (w * 0.90) / raw_total
+    } else {
+        1.0
+    };
+    let card_w = raw_card_w * scale;
+    let card_gap = raw_gap * scale;
+    let row_w = card_w * 5.0 + card_gap * 4.0;
+    let row_left = ((w - row_w) * 0.5 - w * 0.0015).max(0.0);
+    let half_pitch_norm = (card_w + card_gap) * 0.5 / w;
+
+    let mut col_lines: Vec<Vec<(String, Vec<char>)>> = vec![Vec::new(); n];
+    for hit in lines {
+        let norm = normalize_ocr_text(&hit.text);
+        if norm.is_empty() {
+            continue;
+        }
+        let mut best_col: Option<(usize, f32)> = None;
+        for col in 0..n {
+            let col_left = (row_left + col as f32 * (card_w + card_gap)) / w;
+            let col_center = col_left + (card_w * 0.5) / w;
+            let dist = (hit.center_x_norm - col_center).abs();
+            if dist <= half_pitch_norm && best_col.map(|(_, d)| dist < d).unwrap_or(true) {
+                best_col = Some((col, dist));
+            }
+        }
+        if let Some((col, _)) = best_col {
+            let chars: Vec<char> = norm.chars().collect();
+            col_lines[col].push((norm, chars));
+        }
+    }
+
+    let col_joined: Vec<String> = col_lines
+        .iter()
+        .map(|items| items.iter().map(|(s, _)| s.as_str()).collect::<String>())
+        .collect();
+    let norm_targets: Vec<NormalizedLoadingTarget> = targets
+        .iter()
+        .map(NormalizedLoadingTarget::from_target)
+        .collect();
+
+    let mut scores = vec![vec![0i32; n]; n];
+    for col in 0..n {
+        for (target_idx, target) in norm_targets.iter().enumerate() {
+            scores[col][target_idx] =
+                score_loading_column_against_target(&col_lines[col], &col_joined[col], target);
+        }
+    }
+
+    let mut best: Option<((i32, usize, usize, usize), Vec<usize>)> = None;
+    for perm in generate_permutations(n) {
+        let total_score: i32 = (0..n).map(|col| scores[col][perm[col]]).sum();
+        let matched_cols: usize = (0..n).filter(|&col| scores[col][perm[col]] > 0).count();
+        let identity_hits: usize = (0..n).filter(|&col| perm[col] == col).count();
+        let mut in_order_pairs = 0usize;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if perm[i] < perm[j] {
+                    in_order_pairs += 1;
+                }
+            }
+        }
+        let key = (total_score, matched_cols, identity_hits, in_order_pairs);
+        if best.as_ref().map(|(bk, _)| key > *bk).unwrap_or(true) {
+            best = Some((key, perm));
+        }
+    }
+
+    let ((best_score, best_matched, _, _), best_perm) = best?;
+    let min_matched = n.min(2);
+    let min_score = (min_matched as i32) * 250;
+    if best_matched < min_matched || best_score < min_score {
+        return None;
+    }
+
+    Some((best_perm, best_matched, best_score))
+}
+
 #[cfg(target_os = "windows")]
 mod win_ocr {
     use windows::core::h;
@@ -569,16 +944,23 @@ mod win_ocr {
             self.language_tag.to_ascii_lowercase().starts_with("zh")
         }
 
-        /// Crops the augment card band (`x: 0.0..1.0, y: 0.25..0.68`), runs WinRT OCR, and
-        /// maps recognized line bounding centers back to full-frame normalized coordinates.
-        pub fn recognize_augment_region(
+        /// Crops a horizontal band (`x: 0.0..1.0, y: y_start..y_end`), runs WinRT OCR, and
+        /// maps recognized line bounding centers back to full-frame normalized `[0..1]` coordinates.
+        pub fn recognize_band(
             &self,
             frame_rgba: &[u8],
             width: u32,
             height: u32,
+            y_start: f32,
+            y_end: f32,
             bgra_scratch: &mut Vec<u8>,
         ) -> Option<Vec<OcrLineHit>> {
             if width < 32 || height < 32 {
+                return None;
+            }
+            let y_start = y_start.clamp(0.0, 1.0);
+            let y_end = y_end.clamp(0.0, 1.0);
+            if y_end <= y_start {
                 return None;
             }
             let expected_len = (width as usize)
@@ -590,8 +972,8 @@ mod win_ocr {
 
             let x0 = ((width as f32 * CROP_X_START).floor() as u32).min(width.saturating_sub(1));
             let x1 = ((width as f32 * CROP_X_END).ceil() as u32).clamp(x0 + 1, width);
-            let y0 = ((height as f32 * CROP_Y_START).floor() as u32).min(height.saturating_sub(1));
-            let y1 = ((height as f32 * CROP_Y_END).ceil() as u32).clamp(y0 + 1, height);
+            let y0 = ((height as f32 * y_start).floor() as u32).min(height.saturating_sub(1));
+            let y1 = ((height as f32 * y_end).ceil() as u32).clamp(y0 + 1, height);
 
             let cw = x1 - x0;
             let ch = y1 - y0;
@@ -665,6 +1047,25 @@ mod win_ocr {
             }
 
             Some(hits)
+        }
+
+        /// Crops the augment card band (`x: 0.0..1.0, y: 0.25..0.68`), runs WinRT OCR, and
+        /// maps recognized line bounding centers back to full-frame normalized coordinates.
+        pub fn recognize_augment_region(
+            &self,
+            frame_rgba: &[u8],
+            width: u32,
+            height: u32,
+            bgra_scratch: &mut Vec<u8>,
+        ) -> Option<Vec<OcrLineHit>> {
+            self.recognize_band(
+                frame_rgba,
+                width,
+                height,
+                CROP_Y_START,
+                CROP_Y_END,
+                bgra_scratch,
+            )
         }
     }
 }
@@ -1124,5 +1525,306 @@ mod tests {
         ]);
         assert_eq!(misaligned.reject_reason, "row_alignment_or_spacing_rejected");
         assert_eq!(misaligned.matched_hits.len(), 2);
+    }
+
+    fn loading_col_center_x(col: usize, frame_w: u32, frame_h: u32) -> f32 {
+        let w = frame_w.max(320) as f32;
+        let h = frame_h.max(200) as f32;
+        let raw_card_w = h * 0.2328;
+        let raw_gap = h * 0.0411;
+        let raw_total = raw_card_w * 5.0 + raw_gap * 4.0;
+        let scale = if raw_total > w * 0.90 {
+            (w * 0.90) / raw_total
+        } else {
+            1.0
+        };
+        let card_w = raw_card_w * scale;
+        let card_gap = raw_gap * scale;
+        let row_w = card_w * 5.0 + card_gap * 4.0;
+        let row_left = ((w - row_w) * 0.5 - w * 0.0015).max(0.0);
+        (row_left + col as f32 * (card_w + card_gap) + card_w * 0.5) / w
+    }
+
+    #[test]
+    fn aligns_top_loading_row_real_capture_sample() {
+        let targets = vec![
+            LoadingSlotTarget {
+                name_zh: "莫甘娜".to_owned(),
+                title_zh: "堕落天使".to_owned(),
+                alias: "Morgana".to_owned(),
+                summoner_name: "忘忧君c".to_owned(),
+            },
+            LoadingSlotTarget {
+                name_zh: "厄斐琉斯".to_owned(),
+                title_zh: "残月之肃".to_owned(),
+                alias: "Aphelios".to_owned(),
+                summoner_name: "薇古丝的黑影".to_owned(),
+            },
+            LoadingSlotTarget {
+                name_zh: "卡莎".to_owned(),
+                title_zh: "虚空之女".to_owned(),
+                alias: "Kaisa".to_owned(),
+                summoner_name: "汤坑ikun、中分头".to_owned(),
+            },
+            LoadingSlotTarget {
+                name_zh: "格雷福斯".to_owned(),
+                title_zh: "法外狂徒".to_owned(),
+                alias: "Graves".to_owned(),
+                summoner_name: "让我看看谁是笨比".to_owned(),
+            },
+            LoadingSlotTarget {
+                name_zh: "萨勒芬妮".to_owned(),
+                title_zh: "星籁歌姬".to_owned(),
+                alias: "Seraphine".to_owned(),
+                summoner_name: "黑影的薇古丝".to_owned(),
+            },
+        ];
+
+        let (fw, fh) = (1920, 1080);
+        let c = |col: usize| loading_col_center_x(col, fw, fh);
+        let ocr_lines = vec![
+            OcrLineHit {
+                text: "黑帮教父 格雷福斯".to_owned(),
+                center_x_norm: c(0),
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "让我看看谁是笨比".to_owned(),
+                center_x_norm: c(0),
+                center_y_norm: 0.45,
+            },
+            OcrLineHit {
+                text: "至臻 K/DA ALL OUT 卡莎".to_owned(),
+                center_x_norm: c(1),
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "汤坑ikun、中分头".to_owned(),
+                center_x_norm: c(1),
+                center_y_norm: 0.45,
+            },
+            OcrLineHit {
+                text: "花仙子 萨勒芬妮".to_owned(),
+                center_x_norm: c(2),
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "黑影的薇古丝".to_owned(),
+                center_x_norm: c(2),
+                center_y_norm: 0.45,
+            },
+            OcrLineHit {
+                text: "鬼魂新娘 莫甘娜".to_owned(),
+                center_x_norm: c(3),
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "忘忧君c".to_owned(),
+                center_x_norm: c(3),
+                center_y_norm: 0.45,
+            },
+            OcrLineHit {
+                text: "灵魂莲华 厄斐琉斯".to_owned(),
+                center_x_norm: c(4),
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "薇古丝的黑影".to_owned(),
+                center_x_norm: c(4),
+                center_y_norm: 0.45,
+            },
+        ];
+
+        let (order, matched_cols, total_score) =
+            align_loading_row_from_ocr(&ocr_lines, &targets, fw, fh)
+                .expect("top loading row should align");
+        assert_eq!(order, vec![3, 2, 4, 0, 1]);
+        assert_eq!(matched_cols, 5);
+        assert!(total_score >= 5000);
+    }
+
+    #[test]
+    fn aligns_bottom_loading_row_with_partial_ocr_and_title_fallback() {
+        let full_targets = vec![
+            LoadingSlotTarget {
+                name_zh: "赛恩".to_owned(),
+                title_zh: "亡灵战神".to_owned(),
+                alias: "Sion".to_owned(),
+                summoner_name: "蒋心来".to_owned(),
+            },
+            LoadingSlotTarget {
+                name_zh: "辛德拉".to_owned(),
+                title_zh: "暗黑元首".to_owned(),
+                alias: "Syndra".to_owned(),
+                summoner_name: "输也很厉害了".to_owned(),
+            },
+            LoadingSlotTarget {
+                name_zh: "克格莫".to_owned(),
+                title_zh: "深渊巨口".to_owned(),
+                alias: "KogMaw".to_owned(),
+                summoner_name: "彼岸花、忆".to_owned(),
+            },
+            LoadingSlotTarget {
+                name_zh: "墨菲特".to_owned(),
+                title_zh: "熔岩巨兽".to_owned(),
+                alias: "Malphite".to_owned(),
+                summoner_name: "跳跳糖真好吃".to_owned(),
+            },
+            LoadingSlotTarget {
+                name_zh: "凯尔".to_owned(),
+                title_zh: "正义天使".to_owned(),
+                alias: "Kayle".to_owned(),
+                summoner_name: "啪怕Z".to_owned(),
+            },
+        ];
+
+        let (fw, fh) = (2560, 1440);
+        let c = |col: usize| loading_col_center_x(col, fw, fh);
+
+        // Full OCR lines (skin/hero + summoner names).
+        let full_lines = vec![
+            OcrLineHit {
+                text: "至臻 星之守护者 辛德拉".to_owned(),
+                center_x_norm: c(0),
+                center_y_norm: 0.89,
+            },
+            OcrLineHit {
+                text: "输也很厉害了".to_owned(),
+                center_x_norm: c(0),
+                center_y_norm: 0.93,
+            },
+            OcrLineHit {
+                text: "霸天巨兽 墨菲特".to_owned(),
+                center_x_norm: c(1),
+                center_y_norm: 0.89,
+            },
+            OcrLineHit {
+                text: "跳跳糖真好吃".to_owned(),
+                center_x_norm: c(1),
+                center_y_norm: 0.93,
+            },
+            OcrLineHit {
+                text: "电格莫".to_owned(),
+                center_x_norm: c(2),
+                center_y_norm: 0.89,
+            },
+            OcrLineHit {
+                text: "彼岸花、忆".to_owned(),
+                center_x_norm: c(2),
+                center_y_norm: 0.93,
+            },
+            OcrLineHit {
+                text: "钢铁之翼 凯尔".to_owned(),
+                center_x_norm: c(3),
+                center_y_norm: 0.89,
+            },
+            OcrLineHit {
+                text: "啪怕Z".to_owned(),
+                center_x_norm: c(3),
+                center_y_norm: 0.93,
+            },
+            OcrLineHit {
+                text: "亡灵战神".to_owned(),
+                center_x_norm: c(4),
+                center_y_norm: 0.89,
+            },
+            OcrLineHit {
+                text: "蒋心来".to_owned(),
+                center_x_norm: c(4),
+                center_y_norm: 0.93,
+            },
+        ];
+        let (order, matched_cols, _) =
+            align_loading_row_from_ocr(&full_lines, &full_targets, fw, fh)
+                .expect("bottom row with full OCR should align");
+        assert_eq!(order, vec![1, 3, 2, 4, 0]);
+        assert_eq!(matched_cols, 5);
+
+        // Hero/skin lines only (no summoner names at all), including partial "电格莫" -> "克格莫" and "亡灵战神" -> "赛恩".
+        let hero_only_lines = vec![
+            OcrLineHit {
+                text: "至臻 星之守护者 辛德拉".to_owned(),
+                center_x_norm: c(0),
+                center_y_norm: 0.89,
+            },
+            OcrLineHit {
+                text: "霸天巨兽 墨菲特".to_owned(),
+                center_x_norm: c(1),
+                center_y_norm: 0.89,
+            },
+            OcrLineHit {
+                text: "电格莫".to_owned(),
+                center_x_norm: c(2),
+                center_y_norm: 0.89,
+            },
+            OcrLineHit {
+                text: "钢铁之翼 凯尔".to_owned(),
+                center_x_norm: c(3),
+                center_y_norm: 0.89,
+            },
+            OcrLineHit {
+                text: "亡灵战神".to_owned(),
+                center_x_norm: c(4),
+                center_y_norm: 0.89,
+            },
+        ];
+        let targets_no_summoner: Vec<LoadingSlotTarget> = full_targets
+            .iter()
+            .map(|t| LoadingSlotTarget {
+                summoner_name: String::new(),
+                ..t.clone()
+            })
+            .collect();
+        let (order_hero_only, matched_hero_only, _) =
+            align_loading_row_from_ocr(&hero_only_lines, &targets_no_summoner, fw, fh)
+                .expect("hero/skin-only bottom row should still align accurately");
+        assert_eq!(order_hero_only, vec![1, 3, 2, 4, 0]);
+        assert_eq!(matched_hero_only, 5);
+    }
+
+    #[test]
+    fn rejects_empty_and_noise_loading_ocr_frames() {
+        let targets = vec![
+            LoadingSlotTarget {
+                name_zh: "赛恩".to_owned(),
+                title_zh: "亡灵战神".to_owned(),
+                alias: "Sion".to_owned(),
+                summoner_name: "蒋心来".to_owned(),
+            },
+            LoadingSlotTarget {
+                name_zh: "辛德拉".to_owned(),
+                title_zh: "暗黑元首".to_owned(),
+                alias: "Syndra".to_owned(),
+                summoner_name: "输也很厉害了".to_owned(),
+            },
+            LoadingSlotTarget {
+                name_zh: "克格莫".to_owned(),
+                title_zh: "深渊巨口".to_owned(),
+                alias: "KogMaw".to_owned(),
+                summoner_name: "彼岸花、忆".to_owned(),
+            },
+        ];
+
+        assert_eq!(align_loading_row_from_ocr(&[], &targets, 1920, 1080), None);
+        assert_eq!(align_loading_row_from_ocr(&[], &[], 1920, 1080), None);
+
+        let noise = vec![
+            OcrLineHit {
+                text: "100%".to_owned(),
+                center_x_norm: loading_col_center_x(0, 1920, 1080),
+                center_y_norm: 0.42,
+            },
+            OcrLineHit {
+                text: "正在加载游戏提示".to_owned(),
+                center_x_norm: loading_col_center_x(1, 1920, 1080),
+                center_y_norm: 0.42,
+            },
+            OcrLineHit {
+                text: "42ms".to_owned(),
+                center_x_norm: loading_col_center_x(2, 1920, 1080),
+                center_y_norm: 0.42,
+            },
+        ];
+        assert_eq!(align_loading_row_from_ocr(&noise, &targets, 1920, 1080), None);
     }
 }

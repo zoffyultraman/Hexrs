@@ -10,7 +10,10 @@ pub use capture::{
 };
 #[cfg(target_os = "windows")]
 pub use ocr::WinOcrRecognizer;
-pub use ocr::{AugmentTextMatcher, OcrLineHit, OcrMatchDiagnostic, OcrOfferMatch};
+pub use ocr::{
+    align_loading_row_from_ocr, AugmentTextMatcher, LoadingAlignmentTargets, LoadingSlotTarget,
+    OcrLineHit, OcrMatchDiagnostic, OcrOfferMatch,
+};
 pub use phash::{
     compute_phash_from_rgba32, compute_region_phash, hamming_distance, AugmentMatcher,
 };

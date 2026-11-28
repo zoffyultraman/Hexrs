@@ -405,6 +405,10 @@ pub struct LoadingPlayerSlot {
     pub slot_index: usize,
     pub champion_id: i32,
     pub puuid: String,
+    /// Transient in-memory Riot/summoner display name for OCR card-order alignment only.
+    /// Never log, persist to disk, or emit to telemetry.
+    #[serde(default)]
+    pub display_name: String,
 }
 
 /// Snapshot of both 5-player teams and their ARAM Mayhem ratings during match loading.
@@ -427,6 +431,11 @@ pub enum AppEvent {
     ChampSelectUpdated(ChampSelectState),
     TeamRatingsUpdated(TeamRatingsSnapshot),
     LoadingScreenUpdated(LoadingScreenSnapshot),
+    LoadingCardOrderDetected {
+        game_id: u64,
+        team_one_order: Vec<usize>,
+        team_two_order: Vec<usize>,
+    },
     LoadingScreenCleared,
     LiveGameUpdated(LiveGameState),
     EndOfGameCaptured(EndOfGameStats),
