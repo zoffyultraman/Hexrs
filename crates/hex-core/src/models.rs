@@ -431,6 +431,8 @@ pub enum AppEvent {
     ChampSelectUpdated(ChampSelectState),
     TeamRatingsUpdated(TeamRatingsSnapshot),
     LoadingScreenUpdated(LoadingScreenSnapshot),
+    /// Refreshes the active match's 10-player roster/ratings in-game (e.g. Tab panel) without showing the loading overlay.
+    MatchRosterUpdated(LoadingScreenSnapshot),
     LoadingCardOrderDetected {
         game_id: u64,
         team_one_order: Vec<usize>,
