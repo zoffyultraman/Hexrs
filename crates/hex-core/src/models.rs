@@ -389,12 +389,43 @@ pub struct TeamRatingsSnapshot {
     pub premade_groups: Vec<PremadeGroupSummary>,
 }
 
+/// Which team side the local player belongs to on the match loading screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LoadingTeamSide {
+    #[default]
+    Blue,
+    Red,
+}
+
+/// One participant slot on the 10-player loading screen (`teamOne` or `teamTwo`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LoadingPlayerSlot {
+    pub slot_index: usize,
+    pub champion_id: i32,
+    pub puuid: String,
+}
+
+/// Snapshot of both 5-player teams and their ARAM Mayhem ratings during match loading.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct LoadingScreenSnapshot {
+    pub game_id: u64,
+    pub game_mode: String,
+    pub queue_id: Option<i32>,
+    pub local_side: LoadingTeamSide,
+    pub team_one: Vec<LoadingPlayerSlot>,
+    pub team_two: Vec<LoadingPlayerSlot>,
+    pub team_one_ratings: TeamRatingsSnapshot,
+    pub team_two_ratings: TeamRatingsSnapshot,
+}
+
 /// Core events streamed from `hex-core` (and `hex-vision`) to the UI layer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AppEvent {
     ModeChanged(AppMode),
     ChampSelectUpdated(ChampSelectState),
     TeamRatingsUpdated(TeamRatingsSnapshot),
+    LoadingScreenUpdated(LoadingScreenSnapshot),
+    LoadingScreenCleared,
     LiveGameUpdated(LiveGameState),
     EndOfGameCaptured(EndOfGameStats),
     AugmentOfferDetected {

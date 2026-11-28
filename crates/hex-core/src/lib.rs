@@ -8,13 +8,14 @@ pub mod process;
 pub mod sgp;
 pub mod state_machine;
 
-pub use lcu::{LcuClient, LcuWsEvent};
+pub use lcu::{GameflowSessionSnapshot, LcuClient, LcuWsEvent};
 pub use live::LiveClient;
 pub use models::{
     AppEvent, AppMode, AspectRoiPreset, AugmentOfferLayout, ChampSelectState,
-    EndOfGameParticipant, EndOfGameStats, HeroTier, LiveGameState, PremadeGroupSummary,
-    RatingTierRule, RatingTitlesConfig, RoiManifest, RoiRect, SummonerRatingStatus,
-    SummonerRatingSummary, TeamRatingsSnapshot, TeamSlot,
+    EndOfGameParticipant, EndOfGameStats, HeroTier, LiveGameState, LoadingPlayerSlot,
+    LoadingScreenSnapshot, LoadingTeamSide, PremadeGroupSummary, RatingTierRule,
+    RatingTitlesConfig, RoiManifest, RoiRect, SummonerRatingStatus, SummonerRatingSummary,
+    TeamRatingsSnapshot, TeamSlot,
 };
 pub use player_rating::{
     analyze_team_ratings, is_valid_kiwi_match, score_single_match_performance, MatchFetchResult,

@@ -28,7 +28,9 @@ use tokio_tungstenite::tungstenite::protocol::Message;
 use tokio_tungstenite::{connect_async_tls_with_config, Connector};
 use tracing::{debug, warn};
 
-use crate::models::{ChampSelectState, EndOfGameParticipant, EndOfGameStats, TeamSlot};
+use crate::models::{
+    ChampSelectState, EndOfGameParticipant, EndOfGameStats, LoadingPlayerSlot, TeamSlot,
+};
 use crate::player_rating::{
     is_valid_kiwi_match, MatchFetchResult, NormalizedMatch, NormalizedParticipant,
 };
@@ -41,6 +43,18 @@ const EVENT_SUBSET_CHAMPIONS_LEGACY: &str =
     "OnJsonApiEvent_lol-champ-select_v1_subset-champion-list";
 const EVENT_EOG_STATS: &str = "OnJsonApiEvent_lol-end-of-game_v1_eog-stats-block";
 const EVENT_GAMEFLOW_PHASE: &str = "OnJsonApiEvent_lol-gameflow_v1_gameflow-phase";
+const EVENT_GAMEFLOW_SESSION: &str = "OnJsonApiEvent_lol-gameflow_v1_session";
+
+/// Snapshot of `/lol-gameflow/v1/session` containing phase, mode/queue, and both 5-player teams.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GameflowSessionSnapshot {
+    pub phase: String,
+    pub game_id: u64,
+    pub game_mode: String,
+    pub queue_id: Option<i32>,
+    pub team_one: Vec<LoadingPlayerSlot>,
+    pub team_two: Vec<LoadingPlayerSlot>,
+}
 
 /// Events produced by the LCU WebSocket subscription loop.
 #[derive(Debug, Clone)]
@@ -49,6 +63,7 @@ pub enum LcuWsEvent {
     Disconnected,
     WsError(String),
     GameflowPhase(String),
+    GameflowSessionUpdated(GameflowSessionSnapshot),
     ChampSelectUpdated(ChampSelectState),
     SubsetChampionsUpdated(Vec<i32>),
     ChampSelectEnded,
@@ -188,6 +203,28 @@ impl LcuClient {
                 return None;
             };
             Some((mode, queue_id))
+        }))
+    }
+
+    /// Queries `/lol-gameflow/v1/session` returning full phase, queue, and 10-player team rosters.
+    pub async fn get_gameflow_session(&self) -> Result<Option<GameflowSessionSnapshot>> {
+        let raw = self
+            .get_json::<RawGameflowSession>("/lol-gameflow/v1/session")
+            .await?;
+        Ok(raw.map(into_gameflow_session_snapshot))
+    }
+
+    /// Queries `/lol-summoner/v1/current-summoner` for the local player's non-empty PUUID.
+    pub async fn get_current_summoner_puuid(&self) -> Result<Option<String>> {
+        let raw = self
+            .get_json::<serde_json::Value>("/lol-summoner/v1/current-summoner")
+            .await?;
+        Ok(raw.and_then(|val| {
+            val.get("puuid")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
         }))
     }
 
@@ -353,6 +390,7 @@ impl LcuClient {
             EVENT_SUBSET_CHAMPIONS_LEGACY,
             EVENT_EOG_STATS,
             EVENT_GAMEFLOW_PHASE,
+            EVENT_GAMEFLOW_SESSION,
         ] {
             let sub_frame = format!(r#"[5, "{topic}"]"#);
             write
@@ -517,6 +555,21 @@ pub fn parse_wamp_event(text: &str) -> Option<LcuWsEvent> {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .map(|phase| LcuWsEvent::GameflowPhase(phase.to_owned()))
+            }
+        }
+        EVENT_GAMEFLOW_SESSION => {
+            if envelope.event_type.eq_ignore_ascii_case("Delete") {
+                Some(LcuWsEvent::GameflowPhase("None".to_owned()))
+            } else {
+                match serde_json::from_value::<RawGameflowSession>(envelope.data) {
+                    Ok(raw) => Some(LcuWsEvent::GameflowSessionUpdated(
+                        into_gameflow_session_snapshot(raw),
+                    )),
+                    Err(err) => {
+                        warn!(error = %err, "failed to deserialize LCU WS gameflow session payload");
+                        None
+                    }
+                }
             }
         }
         EVENT_EOG_STATS => {
@@ -910,9 +963,57 @@ enum RawBenchEntry {
     },
 }
 
+fn into_gameflow_session_snapshot(raw: RawGameflowSession) -> GameflowSessionSnapshot {
+    let mut selection_map: HashMap<String, i32> = HashMap::new();
+    for sel in raw.game_data.player_champion_selections.into_iter().flatten() {
+        let puuid = sel.puuid.trim();
+        if !puuid.is_empty() && sel.champion_id > 0 {
+            selection_map.insert(puuid.to_owned(), sel.champion_id);
+        }
+    }
+
+    let map_team = |raw_team: Vec<Option<RawGameflowParticipant>>| -> Vec<LoadingPlayerSlot> {
+        raw_team
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(slot_index, p)| {
+                let puuid = p.puuid.trim().to_owned();
+                let champion_id = if p.champion_id > 0 {
+                    p.champion_id
+                } else {
+                    selection_map.get(&puuid).copied().unwrap_or(0)
+                };
+                LoadingPlayerSlot {
+                    slot_index,
+                    champion_id,
+                    puuid,
+                }
+            })
+            .collect()
+    };
+
+    let game_mode = if !raw.game_data.queue.game_mode.is_empty() {
+        raw.game_data.queue.game_mode
+    } else {
+        raw.map.game_mode
+    };
+
+    GameflowSessionSnapshot {
+        phase: raw.phase,
+        game_id: raw.game_data.game_id,
+        game_mode,
+        queue_id: raw.game_data.queue.id,
+        team_one: map_team(raw.game_data.team_one),
+        team_two: map_team(raw.game_data.team_two),
+    }
+}
+
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RawGameflowSession {
+    #[serde(deserialize_with = "deserialize_null_default")]
+    phase: String,
     #[serde(rename = "gameData", deserialize_with = "deserialize_null_default")]
     game_data: RawGameflowGameData,
     #[serde(deserialize_with = "deserialize_null_default")]
@@ -922,8 +1023,37 @@ struct RawGameflowSession {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 struct RawGameflowGameData {
+    #[serde(rename = "gameId", deserialize_with = "deserialize_null_default")]
+    game_id: u64,
     #[serde(deserialize_with = "deserialize_null_default")]
     queue: RawGameflowQueue,
+    #[serde(rename = "teamOne", deserialize_with = "deserialize_null_default")]
+    team_one: Vec<Option<RawGameflowParticipant>>,
+    #[serde(rename = "teamTwo", deserialize_with = "deserialize_null_default")]
+    team_two: Vec<Option<RawGameflowParticipant>>,
+    #[serde(
+        rename = "playerChampionSelections",
+        deserialize_with = "deserialize_null_default"
+    )]
+    player_champion_selections: Vec<Option<RawChampionSelection>>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawGameflowParticipant {
+    #[serde(rename = "championId", deserialize_with = "deserialize_null_default")]
+    champion_id: i32,
+    #[serde(deserialize_with = "deserialize_null_default")]
+    puuid: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawChampionSelection {
+    #[serde(deserialize_with = "deserialize_null_default")]
+    puuid: String,
+    #[serde(rename = "championId", deserialize_with = "deserialize_null_default")]
+    champion_id: i32,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -1012,6 +1142,34 @@ mod tests {
                 assert_eq!(state.local_champion_id, 0);
                 assert_eq!(state.bench_champions, vec![32]);
             }
+            other => panic!("unexpected parsed event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_gameflow_session_ws_event_with_selection_fallback() {
+        let frame = r#"[8,"OnJsonApiEvent_lol-gameflow_v1_session",{"eventType":"Update","data":{"phase":"GameStart","gameData":{"gameId":987654321,"queue":{"id":2400,"gameMode":"KIWI"},"teamOne":[{"championId":157,"puuid":"p1"},{"championId":0,"puuid":"p2"}],"teamTwo":[{"championId":32,"puuid":"p6"}],"playerChampionSelections":[{"puuid":"p2","championId":432}]}}}]"#;
+        match parse_wamp_event(frame) {
+            Some(LcuWsEvent::GameflowSessionUpdated(sess)) => {
+                assert_eq!(sess.phase, "GameStart");
+                assert_eq!(sess.game_id, 987654321);
+                assert_eq!(sess.game_mode, "KIWI");
+                assert_eq!(sess.queue_id, Some(2400));
+                assert_eq!(sess.team_one.len(), 2);
+                assert_eq!(sess.team_one[0].slot_index, 0);
+                assert_eq!(sess.team_one[0].champion_id, 157);
+                assert_eq!(sess.team_one[1].slot_index, 1);
+                assert_eq!(sess.team_one[1].champion_id, 432);
+                assert_eq!(sess.team_one[1].puuid, "p2");
+                assert_eq!(sess.team_two.len(), 1);
+                assert_eq!(sess.team_two[0].champion_id, 32);
+            }
+            other => panic!("unexpected parsed event: {other:?}"),
+        }
+
+        let del_frame = r#"[8,"OnJsonApiEvent_lol-gameflow_v1_session",{"eventType":"Delete","data":null}]"#;
+        match parse_wamp_event(del_frame) {
+            Some(LcuWsEvent::GameflowPhase(phase)) => assert_eq!(phase, "None"),
             other => panic!("unexpected parsed event: {other:?}"),
         }
     }
