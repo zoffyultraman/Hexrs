@@ -107,6 +107,20 @@ pub struct ChampSelectState {
     pub rerolls_remaining: u32,
 }
 
+/// One participant entry extracted from the Live Client Data API (`allPlayers`).
+/// `display_name` is transient in-memory only (used for Tab OCR alignment); never log,
+/// persist to disk, or emit to telemetry.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LivePlayerEntry {
+    pub team: LoadingTeamSide,
+    pub champion_name: String,
+    pub raw_champion_name: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub position: String,
+}
+
 /// Snapshot of the local player's in-game state from the Live Client Data API (`127.0.0.1:2999`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct LiveGameState {
@@ -125,6 +139,8 @@ pub struct LiveGameState {
     pub respawn_timer: f64,
     #[serde(default)]
     pub game_started_event: bool,
+    #[serde(default)]
+    pub players: Vec<LivePlayerEntry>,
 }
 
 /// Strictly anonymized end-of-game participant record (zero PII: no names, PUUIDs, or Riot IDs).
@@ -441,6 +457,11 @@ pub enum AppEvent {
         game_id: u64,
         team_one_order: Vec<usize>,
         team_two_order: Vec<usize>,
+    },
+    TabRowOrderDetected {
+        game_id: u64,
+        left_order: Vec<usize>,
+        right_order: Vec<usize>,
     },
     LoadingScreenCleared,
     LiveGameUpdated(LiveGameState),

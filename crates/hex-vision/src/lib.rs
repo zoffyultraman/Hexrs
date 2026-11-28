@@ -11,8 +11,9 @@ pub use capture::{
 #[cfg(target_os = "windows")]
 pub use ocr::WinOcrRecognizer;
 pub use ocr::{
-    align_loading_row_from_ocr, AugmentTextMatcher, LoadingAlignmentTargets, LoadingSlotTarget,
-    OcrLineHit, OcrMatchDiagnostic, OcrOfferMatch,
+    align_loading_row_from_ocr, align_tab_column_from_ocr, AugmentTextMatcher,
+    LoadingAlignmentTargets, LoadingSlotTarget, OcrLineHit, OcrMatchDiagnostic, OcrOfferMatch,
+    TabAlignmentTargets,
 };
 pub use phash::{
     compute_phash_from_rgba32, compute_region_phash, hamming_distance, AugmentMatcher,

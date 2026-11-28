@@ -12,8 +12,8 @@ pub use lcu::{GameflowSessionSnapshot, LcuClient, LcuWsEvent};
 pub use live::LiveClient;
 pub use models::{
     AppEvent, AppMode, AspectRoiPreset, AugmentOfferLayout, ChampSelectState,
-    EndOfGameParticipant, EndOfGameStats, HeroTier, LiveGameState, LoadingPlayerSlot,
-    LoadingScreenSnapshot, LoadingTeamSide, PremadeGroupSummary, RatingTierRule,
+    EndOfGameParticipant, EndOfGameStats, HeroTier, LiveGameState, LivePlayerEntry,
+    LoadingPlayerSlot, LoadingScreenSnapshot, LoadingTeamSide, PremadeGroupSummary, RatingTierRule,
     RatingTitlesConfig, RoiManifest, RoiRect, SummonerRatingStatus, SummonerRatingSummary,
     TeamRatingsSnapshot, TeamSlot,
 };

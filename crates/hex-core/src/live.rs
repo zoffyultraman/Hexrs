@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use reqwest::StatusCode;
 use serde::Deserialize;
 
-use crate::models::LiveGameState;
+use crate::models::{LiveGameState, LivePlayerEntry, LoadingTeamSide};
 
 const LIVE_ALL_GAME_DATA_URL: &str = "https://127.0.0.1:2999/liveclientdata/allgamedata";
 
@@ -54,6 +54,44 @@ impl LiveClient {
     }
 }
 
+fn extract_live_player_display_name(p: &RawLivePlayer) -> String {
+    let game_name = p.riot_id_game_name.trim();
+    if !game_name.is_empty() {
+        return game_name.to_owned();
+    }
+    let riot_id = p.riot_id.trim();
+    if !riot_id.is_empty() {
+        if let Some((before_hash, _)) = riot_id.split_once('#') {
+            let trimmed = before_hash.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
+        } else {
+            return riot_id.to_owned();
+        }
+    }
+    p.summoner_name.trim().to_owned()
+}
+
+fn parse_live_position_rank(position: &str) -> Option<u8> {
+    match position.trim().to_ascii_uppercase().as_str() {
+        "TOP" => Some(0),
+        "JUNGLE" => Some(1),
+        "MIDDLE" | "MID" => Some(2),
+        "BOTTOM" | "BOT" | "ADC" => Some(3),
+        "UTILITY" | "SUPPORT" | "SUP" => Some(4),
+        _ => None,
+    }
+}
+
+fn sort_team_live_players(mut entries: Vec<(Option<u8>, LivePlayerEntry)>) -> Vec<LivePlayerEntry> {
+    let known_roles = entries.iter().filter(|(rank, _)| rank.is_some()).count();
+    if known_roles >= 3 {
+        entries.sort_by_key(|(rank, _)| rank.unwrap_or(u8::MAX));
+    }
+    entries.into_iter().map(|(_, entry)| entry).collect()
+}
+
 fn into_live_game_state(raw: RawAllGameData) -> LiveGameState {
     // Match activePlayer transiently against allPlayers, then discard summoner/riotId PII.
     // Only fall back to the sole player in 1-player modes (Practice Tool); never grab player 0 in multiplayer.
@@ -94,6 +132,30 @@ fn into_live_game_state(raw: RawAllGameData) -> LiveGameState {
         .iter()
         .any(|e| matches!(e.event_name.as_str(), "GameStart" | "MinionsSpawning"));
 
+    let mut blue_entries = Vec::new();
+    let mut red_entries = Vec::new();
+    for p in &raw.all_players {
+        let team = if p.team.trim().eq_ignore_ascii_case("CHAOS") {
+            LoadingTeamSide::Red
+        } else {
+            LoadingTeamSide::Blue
+        };
+        let role_rank = parse_live_position_rank(&p.position);
+        let entry = LivePlayerEntry {
+            team,
+            champion_name: p.champion_name.clone(),
+            raw_champion_name: p.raw_champion_name.clone(),
+            display_name: extract_live_player_display_name(p),
+            position: p.position.trim().to_owned(),
+        };
+        match team {
+            LoadingTeamSide::Blue => blue_entries.push((role_rank, entry)),
+            LoadingTeamSide::Red => red_entries.push((role_rank, entry)),
+        }
+    }
+    let mut players = sort_team_live_players(blue_entries);
+    players.extend(sort_team_live_players(red_entries));
+
     LiveGameState {
         game_mode: raw.game_data.game_mode,
         game_time_secs: raw.game_data.game_time,
@@ -106,6 +168,7 @@ fn into_live_game_state(raw: RawAllGameData) -> LiveGameState {
         is_dead,
         respawn_timer,
         game_started_event,
+        players,
     }
 }
 
@@ -219,6 +282,10 @@ struct RawLivePlayer {
     riot_id: String,
     #[serde(rename = "riotIdGameName")]
     riot_id_game_name: String,
+    #[serde(default)]
+    team: String,
+    #[serde(default)]
+    position: String,
     #[serde(rename = "isDead")]
     is_dead: bool,
     #[serde(rename = "respawnTimer")]
@@ -361,5 +428,85 @@ mod tests {
             "game_character_displayname_Yasuo"
         );
         assert_eq!(solo_state.owned_item_ids, vec![1055]);
+    }
+
+    #[test]
+    fn extracts_ten_live_players_with_sr_role_presort_and_aram_order() {
+        let sr_raw: RawAllGameData = serde_json::from_str(
+            r#"{
+                "activePlayer": {"riotIdGameName": "MidStar"},
+                "allPlayers": [
+                    {"team": "ORDER", "position": "UTILITY", "championName": "锤石", "rawChampionName": "game_character_displayname_Thresh", "summonerName": "匿名玩家1"},
+                    {"team": "ORDER", "position": "MID", "championName": "辛德拉", "rawChampionName": "game_character_displayname_Syndra", "riotIdGameName": "MidStar", "riotId": "MidStar#111"},
+                    {"team": "ORDER", "position": "TOP", "championName": "赛恩", "rawChampionName": "game_character_displayname_Sion", "riotId": "TopHero#222"},
+                    {"team": "ORDER", "position": "ADC", "championName": "卡莎", "rawChampionName": "game_character_displayname_Kaisa", "summonerName": "BotCarry"},
+                    {"team": "ORDER", "position": "JUNGLE", "championName": "李青", "rawChampionName": "game_character_displayname_LeeSin", "riotIdGameName": "JgKing"},
+                    {"team": "CHAOS", "position": "BOTTOM", "championName": "厄斐琉斯", "rawChampionName": "game_character_displayname_Aphelios", "summonerName": "RedBot"},
+                    {"team": "CHAOS", "position": "TOP", "championName": "墨菲特", "rawChampionName": "game_character_displayname_Malphite", "summonerName": "奥术先驱"},
+                    {"team": "CHAOS", "position": "SUPPORT", "championName": "莫甘娜", "rawChampionName": "game_character_displayname_Morgana", "riotId": "RedSup#888"},
+                    {"team": "CHAOS", "position": "JUNGLE", "championName": "格雷福斯", "rawChampionName": "game_character_displayname_Graves", "summonerName": "RedJg"},
+                    {"team": "CHAOS", "position": "MIDDLE", "championName": "泽拉斯", "rawChampionName": "game_character_displayname_Xerath", "riotIdGameName": "BattlecastXerat"}
+                ],
+                "gameData": {"gameMode": "CLASSIC", "gameTime": 180.0}
+            }"#,
+        )
+        .expect("parse 10-player SR payload");
+        let sr_state = into_live_game_state(sr_raw);
+        assert_eq!(sr_state.players.len(), 10);
+
+        let blue_names: Vec<&str> = sr_state
+            .players
+            .iter()
+            .filter(|p| p.team == LoadingTeamSide::Blue)
+            .map(|p| p.display_name.as_str())
+            .collect();
+        let red_names: Vec<&str> = sr_state
+            .players
+            .iter()
+            .filter(|p| p.team == LoadingTeamSide::Red)
+            .map(|p| p.display_name.as_str())
+            .collect();
+        assert_eq!(
+            blue_names,
+            vec!["TopHero", "JgKing", "MidStar", "BotCarry", "匿名玩家1"]
+        );
+        assert_eq!(
+            red_names,
+            vec!["奥术先驱", "RedJg", "BattlecastXerat", "RedBot", "RedSup"]
+        );
+        assert_eq!(
+            sr_state.players[2].raw_champion_name,
+            "game_character_displayname_Syndra"
+        );
+
+        // ARAM / KIWI without positions preserves original per-team order including anonymous names.
+        let aram_raw: RawAllGameData = serde_json::from_str(
+            r#"{
+                "activePlayer": {"summonerName": "烟花花火"},
+                "allPlayers": [
+                    {"team": "ORDER", "position": "NONE", "championName": "辛德拉", "rawChampionName": "game_character_displayname_Syndra", "summonerName": "烟花花火"},
+                    {"team": "CHAOS", "position": "", "championName": "泽拉斯", "rawChampionName": "game_character_displayname_Xerath", "summonerName": "BattlecastXerat"},
+                    {"team": "ORDER", "position": "NONE", "championName": "卡莎", "rawChampionName": "game_character_displayname_Kaisa", "summonerName": "奇异行者"},
+                    {"team": "CHAOS", "position": "NONE", "championName": "墨菲特", "rawChampionName": "game_character_displayname_Malphite", "riotId": "输也很厉害了#9999"}
+                ],
+                "gameData": {"gameMode": "KIWI", "gameTime": 90.0}
+            }"#,
+        )
+        .expect("parse ARAM payload");
+        let aram_state = into_live_game_state(aram_raw);
+        let aram_order: Vec<(LoadingTeamSide, &str)> = aram_state
+            .players
+            .iter()
+            .map(|p| (p.team, p.display_name.as_str()))
+            .collect();
+        assert_eq!(
+            aram_order,
+            vec![
+                (LoadingTeamSide::Blue, "烟花花火"),
+                (LoadingTeamSide::Blue, "奇异行者"),
+                (LoadingTeamSide::Red, "BattlecastXerat"),
+                (LoadingTeamSide::Red, "输也很厉害了"),
+            ]
+        );
     }
 }

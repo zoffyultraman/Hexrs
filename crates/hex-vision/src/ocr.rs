@@ -52,6 +52,15 @@ pub struct LoadingAlignmentTargets {
     pub team_two: Vec<LoadingSlotTarget>,
 }
 
+/// Target summoner/anonymous display names for left and right in-game Tab scoreboard columns.
+/// Transient in-memory only; never log `left_names` or `right_names`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabAlignmentTargets {
+    pub game_id: u64,
+    pub left_names: Vec<String>,
+    pub right_names: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 struct NormalizedAugmentEntry {
     augment_id: i32,
@@ -769,19 +778,51 @@ fn generate_permutations(n: usize) -> Vec<Vec<usize>> {
     out
 }
 
+fn generate_combinations(total: usize, k: usize) -> Vec<Vec<usize>> {
+    fn backtrack(
+        start: usize,
+        total: usize,
+        k: usize,
+        current: &mut Vec<usize>,
+        out: &mut Vec<Vec<usize>>,
+    ) {
+        if current.len() == k {
+            out.push(current.clone());
+            return;
+        }
+        let remaining_needed = k - current.len();
+        for i in start..=(total - remaining_needed) {
+            current.push(i);
+            backtrack(i + 1, total, k, current, out);
+            current.pop();
+        }
+    }
+
+    let mut out = Vec::new();
+    if k == 0 || k > total {
+        return out;
+    }
+    let mut current = Vec::with_capacity(k);
+    backtrack(0, total, k, &mut current, &mut out);
+    out
+}
+
 /// Aligns a single 1..=5 player loading-screen row from WinRT OCR line hits using calibrated
-/// card X-geometry and optimal 1-to-1 permutation matching (`n! <= 120`).
+/// 5-column card X-geometry and optimal 1-to-1 permutation matching (`<= 120` assignments).
 ///
-/// Returns `Some((order, matched_cols, total_score))` where `order[visual_col]` is the index
-/// into `targets` occupying visual column `visual_col`, or `None` on blank/low-confidence frames.
+/// Always buckets OCR lines across all 5 visual columns (`0..5`) so `n < 5` partial rosters
+/// still match players sitting in columns 4 or 5. Returns `Some((order, matched_cols, total_score))`
+/// where `order[k]` is the index into `targets` in left-to-right visual order, or `None` on
+/// blank/low-confidence frames.
 pub fn align_loading_row_from_ocr(
     lines: &[OcrLineHit],
     targets: &[LoadingSlotTarget],
     frame_w: u32,
     frame_h: u32,
 ) -> Option<(Vec<usize>, usize, i32)> {
+    const VISUAL_COLS: usize = 5;
     let n = targets.len();
-    if n == 0 || n > 5 || lines.is_empty() {
+    if n == 0 || n > VISUAL_COLS || lines.is_empty() {
         return None;
     }
 
@@ -801,14 +842,14 @@ pub fn align_loading_row_from_ocr(
     let row_left = ((w - row_w) * 0.5 - w * 0.0015).max(0.0);
     let half_pitch_norm = (card_w + card_gap) * 0.5 / w;
 
-    let mut col_lines: Vec<Vec<(String, Vec<char>)>> = vec![Vec::new(); n];
+    let mut col_lines: Vec<Vec<(String, Vec<char>)>> = vec![Vec::new(); VISUAL_COLS];
     for hit in lines {
         let norm = normalize_ocr_text(&hit.text);
         if norm.is_empty() {
             continue;
         }
         let mut best_col: Option<(usize, f32)> = None;
-        for col in 0..n {
+        for col in 0..VISUAL_COLS {
             let col_left = (row_left + col as f32 * (card_w + card_gap)) / w;
             let col_center = col_left + (card_w * 0.5) / w;
             let dist = (hit.center_x_norm - col_center).abs();
@@ -831,19 +872,117 @@ pub fn align_loading_row_from_ocr(
         .map(NormalizedLoadingTarget::from_target)
         .collect();
 
-    let mut scores = vec![vec![0i32; n]; n];
-    for col in 0..n {
+    let mut scores = vec![vec![0i32; n]; VISUAL_COLS];
+    for col in 0..VISUAL_COLS {
         for (target_idx, target) in norm_targets.iter().enumerate() {
             scores[col][target_idx] =
                 score_loading_column_against_target(&col_lines[col], &col_joined[col], target);
         }
     }
 
+    let perms = generate_permutations(n);
+    let col_combos = generate_combinations(VISUAL_COLS, n);
+    let mut best: Option<((i32, usize, usize, usize), Vec<usize>)> = None;
+    for cols in &col_combos {
+        for perm in &perms {
+            let total_score: i32 = (0..n).map(|k| scores[cols[k]][perm[k]]).sum();
+            let matched_cols: usize = (0..n).filter(|&k| scores[cols[k]][perm[k]] > 0).count();
+            let identity_hits: usize = (0..n).filter(|&k| perm[k] == k).count();
+            let mut in_order_pairs = 0usize;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    if perm[i] < perm[j] {
+                        in_order_pairs += 1;
+                    }
+                }
+            }
+            let key = (total_score, matched_cols, identity_hits, in_order_pairs);
+            if best.as_ref().map(|(bk, _)| key > *bk).unwrap_or(true) {
+                best = Some((key, perm.clone()));
+            }
+        }
+    }
+
+    let ((best_score, best_matched, _, _), best_perm) = best?;
+    let min_matched = n.min(2);
+    let min_score = (min_matched as i32) * 250;
+    if best_matched < min_matched || best_score < min_score {
+        return None;
+    }
+
+    Some((best_perm, best_matched, best_score))
+}
+
+/// Aligns a single 1..=5 row in-game Tab scoreboard column from WinRT OCR line hits.
+///
+/// Buckets OCR lines into native Tab row centers (`0.2871 + r * 0.0710 + 0.0322`, tolerance `0.036`)
+/// and finds the optimal 1-to-1 permutation (`n! <= 120`) using summoner-name scoring.
+/// Returns `Some((order, matched_rows, total_score))` where `order[visual_row]` is the index into
+/// `target_names` occupying `visual_row`, or `None` on blank/low-confidence frames.
+pub fn align_tab_column_from_ocr(
+    lines: &[OcrLineHit],
+    target_names: &[String],
+) -> Option<(Vec<usize>, usize, i32)> {
+    const TAB_ROW0_TOP: f32 = 0.2871;
+    const TAB_ROW_PITCH: f32 = 0.0710;
+    const TAB_ROW_HALF_H: f32 = 0.0322;
+    const TAB_ROW_TOL: f32 = 0.036;
+
+    let n = target_names.len();
+    if n == 0 || n > 5 || lines.is_empty() {
+        return None;
+    }
+
+    let mut row_lines: Vec<Vec<(String, Vec<char>)>> = vec![Vec::new(); n];
+    for hit in lines {
+        let norm = normalize_ocr_text(&hit.text);
+        if norm.is_empty() {
+            continue;
+        }
+        let mut best_row: Option<(usize, f32)> = None;
+        for row in 0..n {
+            let row_cy = TAB_ROW0_TOP + row as f32 * TAB_ROW_PITCH + TAB_ROW_HALF_H;
+            let dist = (hit.center_y_norm - row_cy).abs();
+            if dist <= TAB_ROW_TOL && best_row.map(|(_, d)| dist < d).unwrap_or(true) {
+                best_row = Some((row, dist));
+            }
+        }
+        if let Some((row, _)) = best_row {
+            let chars: Vec<char> = norm.chars().collect();
+            row_lines[row].push((norm, chars));
+        }
+    }
+
+    let row_joined: Vec<String> = row_lines
+        .iter()
+        .map(|items| items.iter().map(|(s, _)| s.as_str()).collect::<String>())
+        .collect();
+    let norm_targets: Vec<(String, Vec<char>)> = target_names
+        .iter()
+        .map(|name| {
+            let norm = normalize_ocr_text(name);
+            let chars = norm.chars().collect();
+            (norm, chars)
+        })
+        .collect();
+
+    let mut scores = vec![vec![0i32; n]; n];
+    for row in 0..n {
+        for (target_idx, (needle, needle_chars)) in norm_targets.iter().enumerate() {
+            scores[row][target_idx] = score_loading_summoner(
+                &row_lines[row],
+                &row_joined[row],
+                needle,
+                needle_chars,
+            );
+        }
+    }
+
     let mut best: Option<((i32, usize, usize, usize), Vec<usize>)> = None;
     for perm in generate_permutations(n) {
-        let total_score: i32 = (0..n).map(|col| scores[col][perm[col]]).sum();
-        let matched_cols: usize = (0..n).filter(|&col| scores[col][perm[col]] > 0).count();
-        let identity_hits: usize = (0..n).filter(|&col| perm[col] == col).count();
+        let total_score: i32 = (0..n).map(|row| scores[row][perm[row]]).sum();
+        let matched_rows: usize = (0..n).filter(|&row| scores[row][perm[row]] > 0).count();
+        let identity_hits: usize = (0..n).filter(|&row| perm[row] == row).count();
         let mut in_order_pairs = 0usize;
         for i in 0..n {
             for j in (i + 1)..n {
@@ -852,7 +991,7 @@ pub fn align_loading_row_from_ocr(
                 }
             }
         }
-        let key = (total_score, matched_cols, identity_hits, in_order_pairs);
+        let key = (total_score, matched_rows, identity_hits, in_order_pairs);
         if best.as_ref().map(|(bk, _)| key > *bk).unwrap_or(true) {
             best = Some((key, perm));
         }
@@ -944,23 +1083,30 @@ mod win_ocr {
             self.language_tag.to_ascii_lowercase().starts_with("zh")
         }
 
-        /// Crops a horizontal band (`x: 0.0..1.0, y: y_start..y_end`), runs WinRT OCR, and
-        /// maps recognized line bounding centers back to full-frame normalized `[0..1]` coordinates.
-        pub fn recognize_band(
+        /// Crops a normalized rectangle (`x_start..x_end`, `y_start..y_end`), optionally applies
+        /// 2× nearest-neighbor integer upscaling for small fonts (e.g. in-game Tab names), runs
+        /// WinRT OCR, and maps recognized line bounding centers back to full-frame `[0..1]` coords.
+        #[allow(clippy::too_many_arguments)]
+        pub fn recognize_rect_scaled(
             &self,
             frame_rgba: &[u8],
             width: u32,
             height: u32,
+            x_start: f32,
             y_start: f32,
+            x_end: f32,
             y_end: f32,
+            upscale_2x: bool,
             bgra_scratch: &mut Vec<u8>,
         ) -> Option<Vec<OcrLineHit>> {
             if width < 32 || height < 32 {
                 return None;
             }
+            let x_start = x_start.clamp(0.0, 1.0);
+            let x_end = x_end.clamp(0.0, 1.0);
             let y_start = y_start.clamp(0.0, 1.0);
             let y_end = y_end.clamp(0.0, 1.0);
-            if y_end <= y_start {
+            if x_end <= x_start || y_end <= y_start {
                 return None;
             }
             let expected_len = (width as usize)
@@ -970,8 +1116,8 @@ mod win_ocr {
                 return None;
             }
 
-            let x0 = ((width as f32 * CROP_X_START).floor() as u32).min(width.saturating_sub(1));
-            let x1 = ((width as f32 * CROP_X_END).ceil() as u32).clamp(x0 + 1, width);
+            let x0 = ((width as f32 * x_start).floor() as u32).min(width.saturating_sub(1));
+            let x1 = ((width as f32 * x_end).ceil() as u32).clamp(x0 + 1, width);
             let y0 = ((height as f32 * y_start).floor() as u32).min(height.saturating_sub(1));
             let y1 = ((height as f32 * y_end).ceil() as u32).clamp(y0 + 1, height);
 
@@ -981,19 +1127,48 @@ mod win_ocr {
                 return None;
             }
 
-            let crop_bytes = (cw as usize).checked_mul(ch as usize)?.checked_mul(4)?;
+            let (out_w, out_h) = if upscale_2x {
+                (cw.checked_mul(2)?, ch.checked_mul(2)?)
+            } else {
+                (cw, ch)
+            };
+            let out_w_i32 = i32::try_from(out_w).ok()?;
+            let out_h_i32 = i32::try_from(out_h).ok()?;
+            let crop_bytes = (out_w as usize)
+                .checked_mul(out_h as usize)?
+                .checked_mul(4)?;
             bgra_scratch.clear();
             bgra_scratch.reserve(crop_bytes);
 
             let src_stride = width as usize * 4;
-            for py in y0..y1 {
-                let row_start = py as usize * src_stride + x0 as usize * 4;
-                let row_end = row_start + cw as usize * 4;
-                for px_bytes in frame_rgba[row_start..row_end].chunks_exact(4) {
-                    bgra_scratch.push(px_bytes[2]);
-                    bgra_scratch.push(px_bytes[1]);
-                    bgra_scratch.push(px_bytes[0]);
-                    bgra_scratch.push(255);
+            if upscale_2x {
+                let out_row_bytes = (out_w as usize).checked_mul(4)?;
+                for py in y0..y1 {
+                    let row_start = py as usize * src_stride + x0 as usize * 4;
+                    let row_end = row_start + cw as usize * 4;
+                    let dst_row_start = bgra_scratch.len();
+                    for px_bytes in frame_rgba[row_start..row_end].chunks_exact(4) {
+                        bgra_scratch.push(px_bytes[2]);
+                        bgra_scratch.push(px_bytes[1]);
+                        bgra_scratch.push(px_bytes[0]);
+                        bgra_scratch.push(255);
+                        bgra_scratch.push(px_bytes[2]);
+                        bgra_scratch.push(px_bytes[1]);
+                        bgra_scratch.push(px_bytes[0]);
+                        bgra_scratch.push(255);
+                    }
+                    bgra_scratch.extend_from_within(dst_row_start..dst_row_start + out_row_bytes);
+                }
+            } else {
+                for py in y0..y1 {
+                    let row_start = py as usize * src_stride + x0 as usize * 4;
+                    let row_end = row_start + cw as usize * 4;
+                    for px_bytes in frame_rgba[row_start..row_end].chunks_exact(4) {
+                        bgra_scratch.push(px_bytes[2]);
+                        bgra_scratch.push(px_bytes[1]);
+                        bgra_scratch.push(px_bytes[0]);
+                        bgra_scratch.push(255);
+                    }
                 }
             }
 
@@ -1003,8 +1178,8 @@ mod win_ocr {
             let bitmap = SoftwareBitmap::CreateCopyWithAlphaFromBuffer(
                 &buffer,
                 BitmapPixelFormat::Bgra8,
-                cw as i32,
-                ch as i32,
+                out_w_i32,
+                out_h_i32,
                 BitmapAlphaMode::Premultiplied,
             )
             .ok()?;
@@ -1012,6 +1187,7 @@ mod win_ocr {
             let ocr_result = self.engine.RecognizeAsync(&bitmap).ok()?.get().ok()?;
             let lines = ocr_result.Lines().ok()?;
 
+            let scale_div = if upscale_2x { 2.0 } else { 1.0 };
             let mut hits = Vec::new();
             for line in lines {
                 let text = line.Text().ok()?.to_string();
@@ -1041,12 +1217,36 @@ mod win_ocr {
                 let rect_cy = (min_y + max_y) * 0.5;
                 hits.push(OcrLineHit {
                     text,
-                    center_x_norm: (x0 as f32 + rect_cx) / width as f32,
-                    center_y_norm: (y0 as f32 + rect_cy) / height as f32,
+                    center_x_norm: (x0 as f32 + rect_cx / scale_div) / width as f32,
+                    center_y_norm: (y0 as f32 + rect_cy / scale_div) / height as f32,
                 });
             }
 
             Some(hits)
+        }
+
+        /// Crops a horizontal band (`x: 0.0..1.0, y: y_start..y_end`), runs WinRT OCR, and
+        /// maps recognized line bounding centers back to full-frame normalized `[0..1]` coordinates.
+        pub fn recognize_band(
+            &self,
+            frame_rgba: &[u8],
+            width: u32,
+            height: u32,
+            y_start: f32,
+            y_end: f32,
+            bgra_scratch: &mut Vec<u8>,
+        ) -> Option<Vec<OcrLineHit>> {
+            self.recognize_rect_scaled(
+                frame_rgba,
+                width,
+                height,
+                CROP_X_START,
+                y_start,
+                CROP_X_END,
+                y_end,
+                false,
+                bgra_scratch,
+            )
         }
 
         /// Crops the augment card band (`x: 0.0..1.0, y: 0.25..0.68`), runs WinRT OCR, and
@@ -1826,5 +2026,171 @@ mod tests {
             },
         ];
         assert_eq!(align_loading_row_from_ocr(&noise, &targets, 1920, 1080), None);
+    }
+
+    fn tab_row_cy(row: usize) -> f32 {
+        0.2871 + row as f32 * 0.0710 + 0.0322
+    }
+
+    #[test]
+    fn aligns_tab_columns_with_anonymous_names_prefixed_names_and_noise_rejection() {
+        // (a) Left column real capture sample: unordered targets -> exact visual order restoration.
+        let left_targets = vec![
+            "白春茶红尘人心".to_owned(),
+            "奥术先驱".to_owned(),
+            "烟花花火".to_owned(),
+            "奇异行者".to_owned(),
+            "你见过我所有美好".to_owned(),
+        ];
+        let left_ocr = vec![
+            OcrLineHit {
+                text: "烟花花火".to_owned(),
+                center_x_norm: 0.35,
+                center_y_norm: tab_row_cy(0),
+            },
+            OcrLineHit {
+                text: "你见过我所有美好".to_owned(),
+                center_x_norm: 0.35,
+                center_y_norm: tab_row_cy(1),
+            },
+            OcrLineHit {
+                text: "白春茶红尘人心".to_owned(),
+                center_x_norm: 0.35,
+                center_y_norm: tab_row_cy(2),
+            },
+            OcrLineHit {
+                text: "奇异行者".to_owned(),
+                center_x_norm: 0.35,
+                center_y_norm: tab_row_cy(3),
+            },
+            OcrLineHit {
+                text: "奥术先驱".to_owned(),
+                center_x_norm: 0.35,
+                center_y_norm: tab_row_cy(4),
+            },
+        ];
+        let (left_order, left_matched, _) = align_tab_column_from_ocr(&left_ocr, &left_targets)
+            .expect("left Tab column should align");
+        assert_eq!(left_order, vec![2, 4, 0, 3, 1]);
+        assert_eq!(left_matched, 5);
+
+        // (b) Right column real sample with club/tag prefix ("KDA 输也很厉害了") and case-insensitive English ("BattlecastXerat").
+        let right_targets = vec![
+            "跳跳糖真好吃".to_owned(),
+            "battlecastxerat".to_owned(),
+            "蒋心来".to_owned(),
+            "输也很厉害了".to_owned(),
+            "彼岸花、忆".to_owned(),
+        ];
+        let right_ocr = vec![
+            OcrLineHit {
+                text: "KDA 输也很厉害了".to_owned(),
+                center_x_norm: 0.72,
+                center_y_norm: tab_row_cy(0),
+            },
+            OcrLineHit {
+                text: "BattlecastXerat".to_owned(),
+                center_x_norm: 0.72,
+                center_y_norm: tab_row_cy(1),
+            },
+            OcrLineHit {
+                text: "彼岸花、忆".to_owned(),
+                center_x_norm: 0.72,
+                center_y_norm: tab_row_cy(2),
+            },
+            OcrLineHit {
+                text: "跳跳糖真好吃".to_owned(),
+                center_x_norm: 0.72,
+                center_y_norm: tab_row_cy(3),
+            },
+            OcrLineHit {
+                text: "蒋心来".to_owned(),
+                center_x_norm: 0.72,
+                center_y_norm: tab_row_cy(4),
+            },
+        ];
+        let (right_order, right_matched, _) = align_tab_column_from_ocr(&right_ocr, &right_targets)
+            .expect("right Tab column should align");
+        assert_eq!(right_order, vec![3, 1, 4, 0, 2]);
+        assert_eq!(right_matched, 5);
+
+        // (c) Empty or pure noise returns None.
+        assert_eq!(align_tab_column_from_ocr(&[], &left_targets), None);
+        let noise_lines = vec![
+            OcrLineHit {
+                text: "0/2/5".to_owned(),
+                center_x_norm: 0.35,
+                center_y_norm: tab_row_cy(0),
+            },
+            OcrLineHit {
+                text: "128 CS".to_owned(),
+                center_x_norm: 0.35,
+                center_y_norm: tab_row_cy(1),
+            },
+            OcrLineHit {
+                text: "14:32".to_owned(),
+                center_x_norm: 0.35,
+                center_y_norm: tab_row_cy(2),
+            },
+        ];
+        assert_eq!(align_tab_column_from_ocr(&noise_lines, &left_targets), None);
+    }
+
+    #[test]
+    fn aligns_partial_three_player_loading_row_across_columns_0_3_4() {
+        let targets = vec![
+            LoadingSlotTarget {
+                name_zh: "莫甘娜".to_owned(),
+                title_zh: "堕落天使".to_owned(),
+                alias: "Morgana".to_owned(),
+                summoner_name: "忘忧君c".to_owned(),
+            },
+            LoadingSlotTarget {
+                name_zh: "卡莎".to_owned(),
+                title_zh: "虚空之女".to_owned(),
+                alias: "Kaisa".to_owned(),
+                summoner_name: "汤坑ikun、中分头".to_owned(),
+            },
+            LoadingSlotTarget {
+                name_zh: "赛恩".to_owned(),
+                title_zh: "亡灵战神".to_owned(),
+                alias: "Sion".to_owned(),
+                summoner_name: "蒋心来".to_owned(),
+            },
+        ];
+        let (fw, fh) = (1920, 1080);
+        let c = |col: usize| loading_col_center_x(col, fw, fh);
+        let ocr_lines = vec![
+            OcrLineHit {
+                text: "亡灵战神".to_owned(),
+                center_x_norm: c(0),
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "未知路人甲".to_owned(),
+                center_x_norm: c(1),
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "未知路人乙".to_owned(),
+                center_x_norm: c(2),
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "鬼魂新娘 莫甘娜".to_owned(),
+                center_x_norm: c(3),
+                center_y_norm: 0.41,
+            },
+            OcrLineHit {
+                text: "至臻 K/DA ALL OUT 卡莎".to_owned(),
+                center_x_norm: c(4),
+                center_y_norm: 0.41,
+            },
+        ];
+
+        let (order, matched_cols, _) = align_loading_row_from_ocr(&ocr_lines, &targets, fw, fh)
+            .expect("partial 3-player loading row at cols [0, 3, 4] should align");
+        assert_eq!(order, vec![2, 0, 1]);
+        assert_eq!(matched_cols, 3);
     }
 }

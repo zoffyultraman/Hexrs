@@ -8,7 +8,7 @@ use hex_core::AppEvent;
 use hex_data::{AugmentHashEntry, AugmentNameEntry};
 use tracing::{debug, info, warn};
 
-use crate::ocr::{AugmentTextMatcher, LoadingAlignmentTargets};
+use crate::ocr::{AugmentTextMatcher, LoadingAlignmentTargets, TabAlignmentTargets};
 use crate::phash::AugmentMatcher;
 use crate::roi::SharedRoiManifest;
 
@@ -163,6 +163,9 @@ struct VisionShared {
     loading_targets: RwLock<Option<LoadingAlignmentTargets>>,
     loading_targets_gen: AtomicU64,
     loading_scan_pending: AtomicBool,
+    tab_targets: RwLock<Option<TabAlignmentTargets>>,
+    tab_targets_gen: AtomicU64,
+    tab_scan_pending: AtomicBool,
     shutdown: AtomicBool,
     max_distance: AtomicU32,
     game_ctx: RwLock<VisionGameContext>,
@@ -175,7 +178,9 @@ struct VisionShared {
 impl VisionShared {
     #[cfg(any(target_os = "windows", test))]
     fn should_run_capture(&self) -> bool {
-        self.active.load(Ordering::Acquire) || self.loading_scan_pending.load(Ordering::Acquire)
+        self.active.load(Ordering::Acquire)
+            || self.loading_scan_pending.load(Ordering::Acquire)
+            || self.tab_scan_pending.load(Ordering::Acquire)
     }
 
     fn notify_supervisor(&self) {
@@ -239,6 +244,9 @@ impl VisionController {
             loading_targets: RwLock::new(None),
             loading_targets_gen: AtomicU64::new(0),
             loading_scan_pending: AtomicBool::new(false),
+            tab_targets: RwLock::new(None),
+            tab_targets_gen: AtomicU64::new(0),
+            tab_scan_pending: AtomicBool::new(false),
             shutdown: AtomicBool::new(false),
             max_distance: AtomicU32::new(DEFAULT_MAX_HAMMING_DISTANCE),
             game_ctx: RwLock::new(VisionGameContext::default()),
@@ -420,6 +428,48 @@ impl VisionController {
         self.shared.notify_supervisor();
     }
 
+    /// Sets or clears in-game Tab scoreboard row alignment targets.
+    ///
+    /// Deduplicates identical active `Some` targets so holding Tab retains its single-frame lock;
+    /// passing `None` clears the targets and lets WGC hibernate when augment scanning is inactive.
+    /// Never logs player/target names.
+    pub fn set_tab_targets(&self, targets: Option<TabAlignmentTargets>) {
+        let normalized = targets.filter(|t| !t.left_names.is_empty() || !t.right_names.is_empty());
+        let changed = if let Ok(mut guard) = self.shared.tab_targets.write() {
+            if *guard == normalized {
+                false
+            } else {
+                *guard = normalized.clone();
+                true
+            }
+        } else {
+            false
+        };
+
+        if !changed {
+            return;
+        }
+
+        let pending = normalized.is_some();
+        self.shared.tab_targets_gen.fetch_add(1, Ordering::AcqRel);
+        self.shared
+            .tab_scan_pending
+            .store(pending, Ordering::Release);
+
+        if let Some(ref t) = normalized {
+            debug!(
+                game_id = t.game_id,
+                left_len = t.left_names.len(),
+                right_len = t.right_names.len(),
+                "updated tab scoreboard OCR alignment targets"
+            );
+        } else {
+            debug!("cleared tab scoreboard OCR alignment targets");
+        }
+
+        self.shared.notify_supervisor();
+    }
+
     /// Stops any active capture session and shuts down the supervisor thread.
     pub fn shutdown(&mut self) {
         self.shared.active.store(false, Ordering::Release);
@@ -434,6 +484,13 @@ impl VisionController {
         self.shared
             .loading_targets_gen
             .fetch_add(1, Ordering::AcqRel);
+        self.shared
+            .tab_scan_pending
+            .store(false, Ordering::Release);
+        if let Ok(mut guard) = self.shared.tab_targets.write() {
+            *guard = None;
+        }
+        self.shared.tab_targets_gen.fetch_add(1, Ordering::AcqRel);
         self.shared.shutdown.store(true, Ordering::Release);
         self.shared.notify_supervisor();
 
@@ -468,7 +525,10 @@ mod win_capture {
     use windows_capture::window::Window as CaptureWindow;
 
     use super::VisionShared;
-    use crate::ocr::{align_loading_row_from_ocr, LoadingAlignmentTargets, WinOcrRecognizer};
+    use crate::ocr::{
+        align_loading_row_from_ocr, align_tab_column_from_ocr, LoadingAlignmentTargets,
+        TabAlignmentTargets, WinOcrRecognizer,
+    };
     use crate::roi::{detect_augment_screen, select_preset};
 
     const FRAME_PROCESS_INTERVAL: Duration = Duration::from_millis(400);
@@ -478,6 +538,10 @@ mod win_capture {
     const LOADING_BOTTOM_BAND_Y_START: f32 = 0.855;
     const LOADING_BOTTOM_BAND_Y_END: f32 = 0.965;
     const LOADING_MAX_ATTEMPTS: u8 = 12;
+    const TAB_FRAME_INTERVAL: Duration = Duration::from_millis(180);
+    const TAB_BAND_Y_START: f32 = 0.282;
+    const TAB_BAND_Y_END: f32 = 0.638;
+    const TAB_MAX_ATTEMPTS: u8 = 5;
     const OFFER_DEDUP_COOLDOWN: Duration = Duration::from_secs(4);
     const CLEAR_AFTER_MISSES: u8 = 3;
     const WINDOW_RETRY_INTERVAL: Duration = Duration::from_millis(1000);
@@ -512,6 +576,27 @@ mod win_capture {
         }
     }
 
+    #[derive(Default)]
+    struct TabAlignmentState {
+        generation: u64,
+        targets: Option<TabAlignmentTargets>,
+        best_left: Option<(Vec<usize>, usize, i32)>,
+        best_right: Option<(Vec<usize>, usize, i32)>,
+        attempts: u8,
+        locked: bool,
+    }
+
+    impl TabAlignmentState {
+        fn reset_for(&mut self, generation: u64, targets: Option<TabAlignmentTargets>) {
+            self.generation = generation;
+            self.targets = targets;
+            self.best_left = None;
+            self.best_right = None;
+            self.attempts = 0;
+            self.locked = false;
+        }
+    }
+
     struct HexCaptureHandler {
         shared: Arc<VisionShared>,
         ocr_recognizer: Option<WinOcrRecognizer>,
@@ -520,6 +605,8 @@ mod win_capture {
         last_processed: Instant,
         last_loading_processed: Instant,
         loading_state: LoadingAlignmentState,
+        last_tab_processed: Instant,
+        tab_state: TabAlignmentState,
         last_emitted: Option<(Vec<i32>, Instant)>,
         last_frame_dims: Option<(u32, u32)>,
         last_ocr_err_log: Option<Instant>,
@@ -582,6 +669,8 @@ mod win_capture {
                 last_processed: Instant::now() - FRAME_PROCESS_INTERVAL,
                 last_loading_processed: Instant::now() - LOADING_FRAME_INTERVAL,
                 loading_state: LoadingAlignmentState::default(),
+                last_tab_processed: Instant::now() - TAB_FRAME_INTERVAL,
+                tab_state: TabAlignmentState::default(),
                 last_emitted: None,
                 last_frame_dims: None,
                 last_ocr_err_log: None,
@@ -803,6 +892,218 @@ mod win_capture {
                         team_two_matched = t2_matched,
                         attempts = self.loading_state.attempts,
                         "loading screen card alignment locked"
+                    );
+                }
+
+                return Ok(());
+            }
+
+            let tab_gen = self.shared.tab_targets_gen.load(Ordering::Acquire);
+            if tab_gen != self.tab_state.generation {
+                let next_targets = self
+                    .shared
+                    .tab_targets
+                    .read()
+                    .ok()
+                    .and_then(|g| g.clone());
+                self.tab_state.reset_for(tab_gen, next_targets);
+                self.last_tab_processed = Instant::now() - TAB_FRAME_INTERVAL;
+            }
+
+            if self.tab_state.targets.is_some() {
+                if self.tab_state.locked {
+                    return Ok(());
+                }
+                if self.last_tab_processed.elapsed() < TAB_FRAME_INTERVAL {
+                    return Ok(());
+                }
+                self.last_tab_processed = Instant::now();
+
+                let has_chinese_ocr = self
+                    .ocr_recognizer
+                    .as_ref()
+                    .map(|o| o.is_chinese())
+                    .unwrap_or(false);
+                if !has_chinese_ocr {
+                    let game_id = self
+                        .tab_state
+                        .targets
+                        .as_ref()
+                        .map(|t| t.game_id)
+                        .unwrap_or(0);
+                    warn!(
+                        game_id,
+                        "Chinese WinRT OcrEngine unavailable; skipping Tab scoreboard row alignment"
+                    );
+                    self.tab_state.locked = true;
+                    self.shared
+                        .tab_scan_pending
+                        .store(false, Ordering::Release);
+                    return Ok(());
+                }
+
+                let (left_res, right_res) = {
+                    let (Some(targets), Some(ocr)) = (
+                        self.tab_state.targets.as_ref(),
+                        self.ocr_recognizer.as_ref(),
+                    ) else {
+                        return Ok(());
+                    };
+
+                    let buffer = frame.buffer()?;
+                    let width = buffer.width();
+                    let height = buffer.height();
+                    let rgba = buffer.as_nopadding_buffer(&mut self.scratch_buf);
+
+                    if self.last_frame_dims != Some((width, height)) {
+                        self.last_frame_dims = Some((width, height));
+                        info!(
+                            width,
+                            height,
+                            ocr_lang = %ocr.language_tag(),
+                            "WGC capture frame stream active"
+                        );
+                    }
+
+                    let w = width.max(1) as f32;
+                    let h = height.max(1) as f32;
+                    let left_x0 = ((0.5 * w - 0.30 * h) / w).clamp(0.0, 0.5);
+                    let left_x1 = ((0.5 * w - 0.002 * h) / w).clamp(0.0, 0.5);
+                    let right_x0 = ((0.5 * w + 0.24 * h) / w).clamp(0.5, 1.0);
+                    let right_x1 = ((0.5 * w + 0.52 * h) / w).clamp(0.5, 1.0);
+
+                    let left = if !targets.left_names.is_empty() && left_x1 > left_x0 {
+                        ocr.recognize_rect_scaled(
+                            rgba,
+                            width,
+                            height,
+                            left_x0,
+                            TAB_BAND_Y_START,
+                            left_x1,
+                            TAB_BAND_Y_END,
+                            true,
+                            &mut self.bgra_scratch,
+                        )
+                        .and_then(|lines| align_tab_column_from_ocr(&lines, &targets.left_names))
+                    } else {
+                        None
+                    };
+
+                    let right = if !targets.right_names.is_empty() && right_x1 > right_x0 {
+                        ocr.recognize_rect_scaled(
+                            rgba,
+                            width,
+                            height,
+                            right_x0,
+                            TAB_BAND_Y_START,
+                            right_x1,
+                            TAB_BAND_Y_END,
+                            true,
+                            &mut self.bgra_scratch,
+                        )
+                        .and_then(|lines| align_tab_column_from_ocr(&lines, &targets.right_names))
+                    } else {
+                        None
+                    };
+
+                    (left, right)
+                };
+
+                self.tab_state.attempts = self.tab_state.attempts.saturating_add(1);
+
+                let mut improved = false;
+                if let Some((order, matched_rows, score)) = left_res {
+                    let is_better = self
+                        .tab_state
+                        .best_left
+                        .as_ref()
+                        .map(|(_, prev_rows, prev_score)| {
+                            matched_rows > *prev_rows
+                                || (matched_rows == *prev_rows && score > *prev_score)
+                        })
+                        .unwrap_or(true);
+                    if is_better {
+                        self.tab_state.best_left = Some((order, matched_rows, score));
+                        improved = true;
+                    }
+                }
+                if let Some((order, matched_rows, score)) = right_res {
+                    let is_better = self
+                        .tab_state
+                        .best_right
+                        .as_ref()
+                        .map(|(_, prev_rows, prev_score)| {
+                            matched_rows > *prev_rows
+                                || (matched_rows == *prev_rows && score > *prev_score)
+                        })
+                        .unwrap_or(true);
+                    if is_better {
+                        self.tab_state.best_right = Some((order, matched_rows, score));
+                        improved = true;
+                    }
+                }
+
+                let (game_id, left_len, right_len) = self
+                    .tab_state
+                    .targets
+                    .as_ref()
+                    .map(|t| (t.game_id, t.left_names.len(), t.right_names.len()))
+                    .unwrap_or((0, 0, 0));
+                let left_matched = self
+                    .tab_state
+                    .best_left
+                    .as_ref()
+                    .map(|(_, m, _)| *m)
+                    .unwrap_or(0);
+                let right_matched = self
+                    .tab_state
+                    .best_right
+                    .as_ref()
+                    .map(|(_, m, _)| *m)
+                    .unwrap_or(0);
+
+                if improved {
+                    let left_order = self
+                        .tab_state
+                        .best_left
+                        .as_ref()
+                        .map(|(o, _, _)| o.clone())
+                        .unwrap_or_else(|| (0..left_len).collect());
+                    let right_order = self
+                        .tab_state
+                        .best_right
+                        .as_ref()
+                        .map(|(o, _, _)| o.clone())
+                        .unwrap_or_else(|| (0..right_len).collect());
+                    info!(
+                        game_id,
+                        ?left_order,
+                        ?right_order,
+                        left_matched,
+                        right_matched,
+                        attempts = self.tab_state.attempts,
+                        "detected Tab scoreboard row order"
+                    );
+                    let _ = self.shared.event_tx.send(AppEvent::TabRowOrderDetected {
+                        game_id,
+                        left_order,
+                        right_order,
+                    });
+                }
+
+                let left_ready = left_len == 0 || left_matched >= left_len.min(3);
+                let right_ready = right_len == 0 || right_matched >= right_len.min(3);
+                if (left_ready && right_ready) || self.tab_state.attempts >= TAB_MAX_ATTEMPTS {
+                    self.tab_state.locked = true;
+                    self.shared
+                        .tab_scan_pending
+                        .store(false, Ordering::Release);
+                    info!(
+                        game_id,
+                        left_matched,
+                        right_matched,
+                        attempts = self.tab_state.attempts,
+                        "Tab scoreboard row alignment locked"
                     );
                 }
 
@@ -1257,6 +1558,42 @@ mod tests {
         controller.set_loading_targets(None);
         assert!(!controller.shared.should_run_capture());
         assert_eq!(controller.shared.loading_targets_gen.load(Ordering::Acquire), 2);
+
+        controller.shutdown();
+    }
+
+    #[test]
+    fn set_tab_targets_deduplicates_and_rearms_after_clear() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let manifest = Arc::new(RwLock::new(hex_core::RoiManifest::default()));
+        let mut controller = VisionController::start(Vec::new(), Vec::new(), manifest, tx);
+
+        assert!(!controller.shared.should_run_capture());
+        assert_eq!(controller.shared.tab_targets_gen.load(Ordering::Acquire), 0);
+
+        let targets = TabAlignmentTargets {
+            game_id: 505,
+            left_names: vec!["烟花花火".to_owned(), "奥术先驱".to_owned()],
+            right_names: vec!["输也很厉害了".to_owned(), "BattlecastXerat".to_owned()],
+        };
+
+        controller.set_tab_targets(Some(targets.clone()));
+        assert!(controller.shared.should_run_capture());
+        assert_eq!(controller.shared.tab_targets_gen.load(Ordering::Acquire), 1);
+
+        // Identical active targets must not bump generation while Tab stays held.
+        controller.set_tab_targets(Some(targets.clone()));
+        assert_eq!(controller.shared.tab_targets_gen.load(Ordering::Acquire), 1);
+
+        // Releasing Tab clears targets and allows WGC to hibernate.
+        controller.set_tab_targets(None);
+        assert!(!controller.shared.should_run_capture());
+        assert_eq!(controller.shared.tab_targets_gen.load(Ordering::Acquire), 2);
+
+        // Holding Tab again re-arms scan and bumps generation.
+        controller.set_tab_targets(Some(targets));
+        assert!(controller.shared.should_run_capture());
+        assert_eq!(controller.shared.tab_targets_gen.load(Ordering::Acquire), 3);
 
         controller.shutdown();
     }
