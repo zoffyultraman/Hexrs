@@ -906,6 +906,7 @@ impl HexrsApp {
             game_mode: "KIWI".to_owned(),
             queue_id: Some(2400),
             local_side: LoadingTeamSide::Blue,
+            local_champion_id: Some(BLUE_IDS[0]),
             team_one,
             team_two,
             team_one_ratings: self.preview_team_ratings(),
@@ -1486,10 +1487,12 @@ impl HexrsApp {
                     slot.tier_index = tier_index;
                     slot.title = title;
                 }
+                let local_champion_id = snap.local_champion_id;
                 let targets = self.build_loading_alignment_targets(&snap);
                 self.last_match_loading_screen = Some(snap.clone());
                 self.loading_screen = Some(snap);
                 self.vision.set_loading_targets(Some(targets));
+                self.maybe_populate_hero_from_roster(local_champion_id);
                 self.reset_window_sync_cache();
             }
             AppEvent::LoadingCardOrderDetected {
@@ -1546,7 +1549,9 @@ impl HexrsApp {
                     slot.tier_index = tier_index;
                     slot.title = title;
                 }
+                let local_champion_id = snap.local_champion_id;
                 self.last_match_loading_screen = Some(snap);
+                self.maybe_populate_hero_from_roster(local_champion_id);
                 self.reset_window_sync_cache();
             }
             AppEvent::LiveGameUpdated(live) => {
@@ -1693,20 +1698,40 @@ impl HexrsApp {
         self.reset_window_sync_cache();
     }
 
+    fn maybe_populate_hero_from_roster(&mut self, local_champion_id: Option<i32>) {
+        if self.mode == AppMode::InGameOverlay && self.active_hero_id.is_none() {
+            if let Some(local_id) = local_champion_id.filter(|&id| id > 0) {
+                let owned_items = self
+                    .live_game
+                    .as_ref()
+                    .map(|l| l.owned_item_ids.clone())
+                    .unwrap_or_default();
+                self.populate_hero_hud_state(Some(local_id), None, &owned_items);
+            }
+        }
+    }
+
     fn refresh_live_game_data(&mut self, live: &LiveGameState) {
         self.vision.update_game_context(
             self.mode == AppMode::InGameOverlay && self.overlay_visible,
             live_game_to_vision_ctx(live),
         );
 
-        let hero_id = live
-            .active_champion_id
-            .or_else(|| {
+        let roster_local_champion_id = self
+            .loading_screen
+            .as_ref()
+            .or(self.last_match_loading_screen.as_ref())
+            .and_then(|s| s.local_champion_id);
+        let hero_id = resolve_live_hero_id_with(
+            live,
+            roster_local_champion_id,
+            self.active_champ_select_hero_id,
+            |name| {
                 self.meta
                     .as_ref()
-                    .and_then(|meta| meta.resolve_champion_id_by_alias(&live.active_champion_name))
-            })
-            .or(self.active_champ_select_hero_id);
+                    .and_then(|meta| meta.resolve_champion_id_by_alias(name))
+            },
+        );
 
         let fallback_name = (!live.active_champion_name.is_empty())
             .then_some(live.active_champion_name.as_str());
@@ -2545,6 +2570,23 @@ fn diag_row_colored(label: &str, value: String, value_color: Rgba) -> Div {
         )
 }
 
+fn resolve_live_hero_id_with<F>(
+    live: &LiveGameState,
+    roster_local_champion_id: Option<i32>,
+    champ_select_hero_id: Option<i32>,
+    mut resolve_by_alias: F,
+) -> Option<i32>
+where
+    F: FnMut(&str) -> Option<i32>,
+{
+    live.active_champion_id
+        .filter(|&id| id > 0)
+        .or_else(|| resolve_by_alias(&live.active_champion_raw_name).filter(|&id| id > 0))
+        .or_else(|| resolve_by_alias(&live.active_champion_name).filter(|&id| id > 0))
+        .or_else(|| roster_local_champion_id.filter(|&id| id > 0))
+        .or_else(|| champ_select_hero_id.filter(|&id| id > 0))
+}
+
 fn snapshot_has_augment_wings(snap: &LoadingScreenSnapshot) -> bool {
     snap.queue_id == Some(2400)
         || snap.queue_id == Some(1700)
@@ -2645,11 +2687,69 @@ fn format_rect_info(rect: Option<WindowRectInfo>) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        map_loading_team_slots_with, order_subset_cards_for_display, resolve_slot_order,
-        snapshot_has_augment_wings, tab_scoreboard_side_meta, HeroTier, LoadingCardHeroData,
-        LoadingPlayerSlot, LoadingScreenSnapshot, LoadingTeamSide, RatingTitlesConfig,
-        SummonerRatingStatus, SummonerRatingSummary, TeamRatingsSnapshot,
+        map_loading_team_slots_with, order_subset_cards_for_display, resolve_live_hero_id_with,
+        resolve_slot_order, snapshot_has_augment_wings, tab_scoreboard_side_meta, HeroTier,
+        LiveGameState, LoadingCardHeroData, LoadingPlayerSlot, LoadingScreenSnapshot,
+        LoadingTeamSide, RatingTitlesConfig, SummonerRatingStatus, SummonerRatingSummary,
+        TeamRatingsSnapshot,
     };
+
+    #[test]
+    fn resolves_live_hero_id_by_five_level_priority_and_skips_invalid_ids() {
+        let lookup = |name: &str| match name {
+            "game_character_displayname_Ahri" => Some(103),
+            "亚索" => Some(157),
+            "invalid_zero" => Some(0),
+            _ => None,
+        };
+
+        // 1. Direct live.active_champion_id takes highest priority.
+        let mut live = LiveGameState {
+            active_champion_id: Some(238),
+            active_champion_raw_name: "game_character_displayname_Ahri".to_owned(),
+            active_champion_name: "亚索".to_owned(),
+            ..LiveGameState::default()
+        };
+        assert_eq!(
+            resolve_live_hero_id_with(&live, Some(64), Some(11), lookup),
+            Some(238)
+        );
+
+        // 2. Non-positive active_champion_id falls back to active_champion_raw_name.
+        live.active_champion_id = Some(0);
+        assert_eq!(
+            resolve_live_hero_id_with(&live, Some(64), Some(11), lookup),
+            Some(103)
+        );
+
+        // 3. Unresolved/invalid raw_name falls back to active_champion_name.
+        live.active_champion_id = None;
+        live.active_champion_raw_name = "invalid_zero".to_owned();
+        assert_eq!(
+            resolve_live_hero_id_with(&live, Some(64), Some(11), lookup),
+            Some(157)
+        );
+
+        // 4. Unresolved live names fall back to roster local_champion_id.
+        live.active_champion_raw_name.clear();
+        live.active_champion_name.clear();
+        assert_eq!(
+            resolve_live_hero_id_with(&live, Some(64), Some(11), lookup),
+            Some(64)
+        );
+
+        // 5. Invalid/missing roster local_champion_id falls back to champ_select_hero_id.
+        assert_eq!(
+            resolve_live_hero_id_with(&live, Some(0), Some(11), lookup),
+            Some(11)
+        );
+
+        // 6. All missing or non-positive returns None.
+        assert_eq!(
+            resolve_live_hero_id_with(&live, Some(-1), Some(0), lookup),
+            None
+        );
+    }
 
     #[test]
     fn detects_augment_wings_modes_and_queues() {
