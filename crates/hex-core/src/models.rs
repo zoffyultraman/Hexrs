@@ -121,6 +121,8 @@ pub struct LiveGameState {
     pub is_dead: bool,
     #[serde(default)]
     pub respawn_timer: f64,
+    #[serde(default)]
+    pub game_started_event: bool,
 }
 
 /// Strictly anonymized end-of-game participant record (zero PII: no names, PUUIDs, or Riot IDs).

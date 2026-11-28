@@ -78,6 +78,11 @@ fn into_live_game_state(raw: RawAllGameData) -> LiveGameState {
 
     let is_dead = matched_player.map(|p| p.is_dead).unwrap_or(false);
     let respawn_timer = matched_player.map(|p| p.respawn_timer).unwrap_or(0.0);
+    let game_started_event = raw
+        .events
+        .events
+        .iter()
+        .any(|e| matches!(e.event_name.as_str(), "GameStart" | "MinionsSpawning"));
 
     LiveGameState {
         game_mode: raw.game_data.game_mode,
@@ -89,6 +94,7 @@ fn into_live_game_state(raw: RawAllGameData) -> LiveGameState {
         owned_item_ids,
         is_dead,
         respawn_timer,
+        game_started_event,
     }
 }
 
@@ -113,6 +119,22 @@ struct RawAllGameData {
     all_players: Vec<RawLivePlayer>,
     #[serde(rename = "gameData")]
     game_data: RawGameData,
+    #[serde(default)]
+    events: RawLiveEvents,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawLiveEvents {
+    #[serde(rename = "Events", default)]
+    events: Vec<RawLiveEvent>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(default)]
+struct RawLiveEvent {
+    #[serde(rename = "EventName", default)]
+    event_name: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -161,4 +183,26 @@ struct RawGameData {
     game_mode: String,
     #[serde(rename = "gameTime")]
     game_time: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_game_started_event_from_live_events() {
+        let empty_raw: RawAllGameData = serde_json::from_str(
+            r#"{"gameData":{"gameMode":"KIWI","gameTime":0.03},"events":{"Events":[]}}"#,
+        )
+        .expect("parse empty events");
+        let empty_state = into_live_game_state(empty_raw);
+        assert!(!empty_state.game_started_event);
+
+        let started_raw: RawAllGameData = serde_json::from_str(
+            r#"{"gameData":{"gameMode":"KIWI","gameTime":2.4},"events":{"Events":[{"EventName":"GameStart"}]}}"#,
+        )
+        .expect("parse GameStart event");
+        let started_state = into_live_game_state(started_raw);
+        assert!(started_state.game_started_event);
+    }
 }

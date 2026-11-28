@@ -226,12 +226,15 @@ struct CoordinatorState {
     last_champ_select: Option<ChampSelectState>,
     local_puuid: Option<String>,
     last_ally_puuids: Vec<String>,
+    last_champ_select_allies: Vec<LoadingPlayerSlot>,
     loading_session: Option<GameflowSessionSnapshot>,
     loading_active: bool,
     loading_session_fetch_in_flight: bool,
     loading_ratings_fetch_in_flight: bool,
+    loading_incomplete_retries: u8,
     last_loading_rated_key: Vec<String>,
     live_match_started: bool,
+    first_live_game_time: Option<f64>,
     gameflow_fetch_in_flight: bool,
     subset_fetch_in_flight: bool,
     match_cache: HashMap<String, (Instant, MatchFetchResult)>,
@@ -262,12 +265,15 @@ impl CoordinatorState {
             last_champ_select: None,
             local_puuid: None,
             last_ally_puuids: Vec::new(),
+            last_champ_select_allies: Vec::new(),
             loading_session: None,
             loading_active: false,
             loading_session_fetch_in_flight: false,
             loading_ratings_fetch_in_flight: false,
+            loading_incomplete_retries: 0,
             last_loading_rated_key: Vec::new(),
             live_match_started: false,
+            first_live_game_time: None,
             gameflow_fetch_in_flight: false,
             subset_fetch_in_flight: false,
             match_cache: HashMap::new(),
@@ -330,6 +336,7 @@ impl CoordinatorState {
 
         if prev_game_running && !self.snapshot.game_running {
             self.live_match_started = false;
+            self.first_live_game_time = None;
             self.clear_loading_screen();
         }
 
@@ -345,10 +352,12 @@ impl CoordinatorState {
             self.last_champ_select = None;
             self.local_puuid = None;
             self.last_ally_puuids.clear();
+            self.last_champ_select_allies.clear();
             self.clear_loading_screen();
             self.loading_session_fetch_in_flight = false;
             self.loading_ratings_fetch_in_flight = false;
             self.live_match_started = false;
+            self.first_live_game_time = None;
             self.gameflow_fetch_in_flight = false;
             self.subset_fetch_in_flight = false;
             self.match_cache.clear();
@@ -453,6 +462,7 @@ impl CoordinatorState {
         let was_active = self.loading_active || self.loading_session.is_some();
         self.loading_session = None;
         self.loading_active = false;
+        self.loading_incomplete_retries = 0;
         self.last_loading_rated_key.clear();
         if was_active {
             let _ = self.event_tx.send(AppEvent::LoadingScreenCleared);
@@ -511,6 +521,7 @@ impl CoordinatorState {
                 if phase == "ChampSelect" {
                     self.in_champ_select = true;
                     self.live_match_started = false;
+                    self.first_live_game_time = None;
                     self.clear_loading_screen();
                     if self.last_champ_select.is_none() {
                         if let Some(client) = self.active_lcu.clone() {
@@ -528,6 +539,7 @@ impl CoordinatorState {
                 } else if is_post_or_lobby_phase(&phase) {
                     self.clear_champ_select_state();
                     self.live_match_started = false;
+                    self.first_live_game_time = None;
                     self.clear_loading_screen();
                 }
             }
@@ -541,6 +553,7 @@ impl CoordinatorState {
                 );
                 if session.phase == "ChampSelect" {
                     self.live_match_started = false;
+                    self.first_live_game_time = None;
                     self.clear_loading_screen();
                 } else if is_loading_phase(&session.phase) {
                     self.clear_champ_select_state();
@@ -548,6 +561,7 @@ impl CoordinatorState {
                 } else if is_post_or_lobby_phase(&session.phase) {
                     self.clear_champ_select_state();
                     self.live_match_started = false;
+                    self.first_live_game_time = None;
                     self.clear_loading_screen();
                 }
             }
@@ -555,6 +569,7 @@ impl CoordinatorState {
                 self.in_champ_select = true;
                 self.last_lcu_error = None;
                 self.live_match_started = false;
+                self.first_live_game_time = None;
                 self.clear_loading_screen();
                 let state = self.normalize_champ_select(raw_state);
 
@@ -573,6 +588,22 @@ impl CoordinatorState {
                     .collect();
                 if !ally_puuids.is_empty() {
                     self.last_ally_puuids = ally_puuids;
+                }
+                if !state.my_team.is_empty() {
+                    self.last_champ_select_allies = state
+                        .my_team
+                        .iter()
+                        .enumerate()
+                        .map(|(slot_index, s)| LoadingPlayerSlot {
+                            slot_index,
+                            champion_id: if s.champion_id > 0 {
+                                s.champion_id
+                            } else {
+                                s.pick_intent
+                            },
+                            puuid: s.puuid.clone(),
+                        })
+                        .collect();
                 }
 
                 if state.game_mode.is_empty() && !self.gameflow_fetch_in_flight {
@@ -645,6 +676,7 @@ impl CoordinatorState {
                             info!("LCU gameflow-phase=ChampSelect detected via REST fallback");
                             self.in_champ_select = true;
                             self.live_match_started = false;
+                            self.first_live_game_time = None;
                             self.clear_loading_screen();
                             self.sync_shared_and_mode();
                             synced = true;
@@ -661,6 +693,7 @@ impl CoordinatorState {
                     }
                     Some(phase) if is_post_or_lobby_phase(phase) => {
                         self.live_match_started = false;
+                        self.first_live_game_time = None;
                         self.clear_loading_screen();
                         if self.in_champ_select {
                             self.handle_ws_event(LcuWsEvent::ChampSelectEnded, channels);
@@ -693,12 +726,29 @@ impl CoordinatorState {
                 if !self.live_api_active {
                     info!(
                         game_mode = %live_state.game_mode,
+                        game_time_secs = live_state.game_time_secs,
+                        game_started_event = live_state.game_started_event,
                         "Live Client Data API (127.0.0.1:2999) detected active match"
                     );
                     self.live_api_active = true;
                 }
-                if live_state.game_time_secs > 0.0 {
+                if self.first_live_game_time.is_none() {
+                    self.first_live_game_time = Some(live_state.game_time_secs);
+                }
+                if !self.live_match_started
+                    && should_mark_match_started(
+                        live_state.game_time_secs,
+                        live_state.game_started_event,
+                        self.first_live_game_time,
+                    )
+                {
                     self.live_match_started = true;
+                    info!(
+                        game_time_secs = live_state.game_time_secs,
+                        game_started_event = live_state.game_started_event,
+                        first_live_game_time = ?self.first_live_game_time,
+                        "match clock advancing; clearing loading screen"
+                    );
                     self.clear_loading_screen();
                 }
                 let _ = self.event_tx.send(AppEvent::LiveGameUpdated(live_state));
@@ -707,6 +757,7 @@ impl CoordinatorState {
             Ok(None) => {
                 if !self.snapshot.game_running {
                     self.live_match_started = false;
+                    self.first_live_game_time = None;
                     self.clear_loading_screen();
                 }
                 if self.live_api_active {
@@ -718,6 +769,7 @@ impl CoordinatorState {
                 debug!(error = %err, "Live API poll failed");
                 if !self.snapshot.game_running {
                     self.live_match_started = false;
+                    self.first_live_game_time = None;
                     self.clear_loading_screen();
                 }
                 if self.live_api_active {
@@ -927,19 +979,50 @@ impl CoordinatorState {
 
     fn apply_loading_session(
         &mut self,
-        session: GameflowSessionSnapshot,
+        mut session: GameflowSessionSnapshot,
         channels: &CoordinatorChannels,
     ) {
         if self.live_match_started || (session.team_one.is_empty() && session.team_two.is_empty()) {
             return;
         }
 
+        let raw_team_one = session.team_one.len();
+        let raw_team_two = session.team_two.len();
+        let local_side = determine_local_side(
+            self.local_puuid.as_deref(),
+            &self.last_ally_puuids,
+            &session.team_one,
+            &session.team_two,
+        );
+        match local_side {
+            LoadingTeamSide::Blue => {
+                session.team_one =
+                    backfill_missing_allies(session.team_one, &self.last_champ_select_allies);
+            }
+            LoadingTeamSide::Red => {
+                session.team_two =
+                    backfill_missing_allies(session.team_two, &self.last_champ_select_allies);
+            }
+        }
+
+        info!(
+            raw_team_one,
+            raw_team_two,
+            team_one = session.team_one.len(),
+            team_two = session.team_two.len(),
+            ?local_side,
+            "updated loading screen session"
+        );
+
+        let unchanged = self.loading_active && self.loading_session.as_ref() == Some(&session);
         self.loading_session = Some(session.clone());
         self.loading_active = true;
 
-        // 0ms instant emit: cached allies resolve immediately while uncached enemies show Loading.
-        let snapshot = self.build_loading_screen_snapshot(&session, None);
-        let _ = self.event_tx.send(AppEvent::LoadingScreenUpdated(snapshot));
+        if !unchanged {
+            // 0ms instant emit: cached allies resolve immediately while uncached enemies show Loading.
+            let snapshot = self.build_loading_screen_snapshot(&session, None);
+            let _ = self.event_tx.send(AppEvent::LoadingScreenUpdated(snapshot));
+        }
 
         self.maybe_refresh_loading_ratings(channels);
     }
@@ -1090,6 +1173,99 @@ fn is_post_or_lobby_phase(phase: &str) -> bool {
         phase,
         "None" | "Lobby" | "Matchmaking" | "EndOfGame" | "PreEndOfGame" | "WaitingForStats"
     )
+}
+
+fn should_mark_match_started(
+    game_time_secs: f64,
+    game_started_event: bool,
+    first_seen_time: Option<f64>,
+) -> bool {
+    let advanced = first_seen_time
+        .map(|t0| game_time_secs - t0 >= 1.5)
+        .unwrap_or(false);
+    (game_started_event && game_time_secs >= 1.5 && advanced)
+        || (game_time_secs >= 5.0 && advanced)
+}
+
+fn backfill_missing_allies(
+    mut team: Vec<LoadingPlayerSlot>,
+    champ_select_allies: &[LoadingPlayerSlot],
+) -> Vec<LoadingPlayerSlot> {
+    if team.len() >= champ_select_allies.len() || champ_select_allies.is_empty() {
+        for (idx, slot) in team.iter_mut().enumerate() {
+            slot.slot_index = idx;
+        }
+        return team;
+    }
+
+    let mut used = vec![false; team.len()];
+    let mut result = Vec::with_capacity(5);
+
+    for ally in champ_select_allies {
+        let matched_idx = if !ally.puuid.is_empty() {
+            team.iter()
+                .enumerate()
+                .find(|(i, t)| !used[*i] && !t.puuid.is_empty() && t.puuid == ally.puuid)
+                .map(|(i, _)| i)
+        } else {
+            None
+        }
+        .or_else(|| {
+            if ally.champion_id > 0 {
+                team.iter()
+                    .enumerate()
+                    .find(|(i, t)| !used[*i] && t.champion_id == ally.champion_id)
+                    .map(|(i, _)| i)
+            } else {
+                None
+            }
+        });
+
+        if let Some(i) = matched_idx {
+            used[i] = true;
+            let t = &team[i];
+            let champion_id = if t.champion_id > 0 {
+                t.champion_id
+            } else {
+                ally.champion_id
+            };
+            let puuid = if !t.puuid.is_empty() {
+                t.puuid.clone()
+            } else {
+                ally.puuid.clone()
+            };
+            result.push(LoadingPlayerSlot {
+                slot_index: result.len(),
+                champion_id,
+                puuid,
+            });
+        } else {
+            result.push(LoadingPlayerSlot {
+                slot_index: result.len(),
+                champion_id: ally.champion_id,
+                puuid: ally.puuid.clone(),
+            });
+        }
+
+        if result.len() >= 5 {
+            break;
+        }
+    }
+
+    for (i, t) in team.into_iter().enumerate() {
+        if !used[i] && result.len() < 5 {
+            result.push(LoadingPlayerSlot {
+                slot_index: result.len(),
+                champion_id: t.champion_id,
+                puuid: t.puuid,
+            });
+        }
+    }
+
+    for (idx, slot) in result.iter_mut().enumerate() {
+        slot.slot_index = idx;
+    }
+    result
 }
 
 fn determine_local_side(
@@ -1340,11 +1516,23 @@ async fn run_coordinator(
                 state.handle_process_snapshot(snapshot, &channels);
             }
             _ = champ_poll_tick.tick() => {
+                let loading_incomplete = state.loading_active
+                    && !state.live_match_started
+                    && state.loading_incomplete_retries < 8
+                    && state
+                        .loading_session
+                        .as_ref()
+                        .map(|s| s.team_one.len() < 5 || s.team_two.len() < 5)
+                        .unwrap_or(false);
                 if state.snapshot.game_running
                     && !state.live_match_started
                     && state.loading_session.is_none()
                     && !state.loading_session_fetch_in_flight
                 {
+                    state.trigger_loading_session_fetch(&channels);
+                } else if loading_incomplete && !state.loading_session_fetch_in_flight {
+                    state.loading_incomplete_retries =
+                        state.loading_incomplete_retries.saturating_add(1);
                     state.trigger_loading_session_fetch(&channels);
                 } else if !state.snapshot.game_running
                     && !state.live_api_active
@@ -1487,19 +1675,31 @@ mod tests {
             team_two: vec![make_loading_slot(0, 32, "p6")],
         });
 
-        // game_time_secs == 0.0 during loading must keep loading_active intact
+        // Initial static 0.03s at 82% loading must NOT clear loading_active
         state.handle_live_poll_result(Ok(Some(LiveGameState {
             game_mode: "KIWI".to_owned(),
-            game_time_secs: 0.0,
+            game_time_secs: 0.03,
+            game_started_event: false,
             ..Default::default()
         })));
         assert!(state.loading_active);
         assert!(!state.live_match_started);
 
-        // Once game_time_secs > 0.0, loading screen clears and emits LoadingScreenCleared
+        // Stalled 0.03s still must NOT clear loading_active
         state.handle_live_poll_result(Ok(Some(LiveGameState {
             game_mode: "KIWI".to_owned(),
-            game_time_secs: 1.25,
+            game_time_secs: 0.03,
+            game_started_event: true,
+            ..Default::default()
+        })));
+        assert!(state.loading_active);
+        assert!(!state.live_match_started);
+
+        // Once GameStart event is present and clock advances to 2.0s, loading screen clears
+        state.handle_live_poll_result(Ok(Some(LiveGameState {
+            game_mode: "KIWI".to_owned(),
+            game_time_secs: 2.0,
+            game_started_event: true,
             ..Default::default()
         })));
         assert!(!state.loading_active);
@@ -1510,5 +1710,37 @@ mod tests {
         assert!(emitted
             .iter()
             .any(|ev| matches!(ev, AppEvent::LoadingScreenCleared)));
+    }
+
+    #[test]
+    fn backfill_missing_allies_restores_five_player_roster() {
+        let champ_select_allies = vec![
+            make_loading_slot(0, 157, "p1"),
+            make_loading_slot(1, 32, "p2"),
+            make_loading_slot(2, 89, "p3"),
+            make_loading_slot(3, 145, "p4"),
+            make_loading_slot(4, 54, "p5"),
+        ];
+        // Partial 3/5 LCU teamOne payload (with p3 having swapped to champion 432)
+        let partial_team = vec![
+            make_loading_slot(0, 157, "p1"),
+            make_loading_slot(1, 432, "p3"),
+            make_loading_slot(2, 54, "p5"),
+        ];
+
+        let restored = backfill_missing_allies(partial_team, &champ_select_allies);
+        assert_eq!(restored.len(), 5);
+        assert_eq!(restored[0].slot_index, 0);
+        assert_eq!(restored[0].puuid, "p1");
+        assert_eq!(restored[1].slot_index, 1);
+        assert_eq!(restored[1].puuid, "p2");
+        assert_eq!(restored[1].champion_id, 32);
+        assert_eq!(restored[2].slot_index, 2);
+        assert_eq!(restored[2].puuid, "p3");
+        assert_eq!(restored[2].champion_id, 432);
+        assert_eq!(restored[3].slot_index, 3);
+        assert_eq!(restored[3].puuid, "p4");
+        assert_eq!(restored[4].slot_index, 4);
+        assert_eq!(restored[4].puuid, "p5");
     }
 }
