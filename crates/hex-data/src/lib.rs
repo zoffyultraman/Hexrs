@@ -1,11 +1,18 @@
 //! Local SQLite read-only meta queries, Zstd hot-update loader, icon cache, and anonymized EOG reporting.
 
+pub mod app_update;
 pub mod db;
 pub mod icons;
 pub mod reporter;
 pub mod schema;
 pub mod seed;
 pub mod updater;
+
+pub use app_update::{
+    check_app_update, check_app_update_async, spawn_app_update_check, AppUpdateConfig,
+    AppUpdateOutcome, ParsedAppVersion, VersionChannel, DEFAULT_RELEASES_API_URL,
+    DEFAULT_RELEASES_PAGE_URL,
+};
 
 pub use db::{
     bayesian_smoothed_win_rate, data_dir, db_path, AugmentEvaluation, AugmentHashEntry,

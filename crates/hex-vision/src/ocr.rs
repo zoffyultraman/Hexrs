@@ -839,7 +839,7 @@ pub fn align_loading_row_from_ocr(
     let card_w = raw_card_w * scale;
     let card_gap = raw_gap * scale;
     let row_w = card_w * 5.0 + card_gap * 4.0;
-    let row_left = ((w - row_w) * 0.5 - w * 0.0015).max(0.0);
+    let row_left = ((w - row_w) * 0.5 - w * 0.0033).max(0.0);
     let half_pitch_norm = (card_w + card_gap) * 0.5 / w;
 
     let mut col_lines: Vec<Vec<(String, Vec<char>)>> = vec![Vec::new(); VISUAL_COLS];

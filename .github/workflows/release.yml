@@ -21,6 +21,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
@@ -65,6 +67,32 @@ jobs:
 
       - name: Cache Cargo dependencies and artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Resolve release version metadata
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          if (-not [string]::IsNullOrWhiteSpace($env:GITHUB_REF) -and $env:GITHUB_REF.StartsWith("refs/tags/") -and -not [string]::IsNullOrWhiteSpace($env:GITHUB_REF_NAME)) {
+            $appVersion = $env:GITHUB_REF_NAME.Trim()
+          } else {
+            $appVersion = (git describe --tags --abbrev=7 --always 2>$null | Select-Object -First 1)
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($appVersion)) {
+              $appVersion = "v0.1.0"
+            } else {
+              $appVersion = $appVersion.Trim()
+            }
+          }
+          $gitSha = (git rev-parse --short=7 HEAD 2>$null | Select-Object -First 1)
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($gitSha)) {
+            $gitSha = "unknown"
+          } else {
+            $gitSha = $gitSha.Trim()
+          }
+          Write-Host "HEXRS_APP_VERSION=$appVersion"
+          Write-Host "HEXRS_GIT_SHA=$gitSha"
+          Add-Content -Path $env:GITHUB_ENV -Value "HEXRS_APP_VERSION=$appVersion"
+          Add-Content -Path $env:GITHUB_ENV -Value "HEXRS_GIT_SHA=$gitSha"
+          exit 0
 
       - name: Build Hexrs release binary (x86_64)
         run: cargo build --release --target x86_64-pc-windows-msvc --bin Hexrs
