@@ -353,16 +353,30 @@ impl MetaEngine {
         Ok(())
     }
 
-    /// Resolves a champion ID from a Live API `championName`, alias, or Chinese name.
+    /// Resolves a champion ID from a Live API `championName`, `rawChampionName`, alias, Chinese name, or Chinese title.
     pub fn resolve_champion_id_by_alias(&self, alias_or_name: &str) -> Option<i32> {
-        let target = normalize_identifier(alias_or_name);
-        if target.is_empty() {
+        let trimmed = alias_or_name.trim();
+        if trimmed.is_empty() {
             return None;
         }
 
+        const RAW_PREFIX: &str = "game_character_displayname_";
+        let stripped = if trimmed
+            .get(..RAW_PREFIX.len())
+            .map(|prefix| prefix.eq_ignore_ascii_case(RAW_PREFIX))
+            .unwrap_or(false)
+        {
+            trimmed[RAW_PREFIX.len()..].trim()
+        } else {
+            trimmed
+        };
+
+        let target_ascii = normalize_identifier(trimmed);
+        let stripped_ascii = normalize_identifier(stripped);
+
         let conn = self.conn.lock().ok()?;
         let mut stmt = conn
-            .prepare("SELECT hero_id, alias, name_zh FROM champions")
+            .prepare("SELECT hero_id, alias, name_zh, title_zh FROM champions")
             .ok()?;
         let rows = stmt
             .query_map([], |row| {
@@ -370,13 +384,27 @@ impl MetaEngine {
                     row.get::<_, i32>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
                 ))
             })
             .ok()?;
 
-        for row in rows.flatten() {
-            if normalize_identifier(&row.1) == target || row.2.trim() == alias_or_name.trim() {
-                return Some(row.0);
+        for (hero_id, alias, name_zh, title_zh) in rows.flatten() {
+            let alias_norm = normalize_identifier(&alias);
+            if !alias_norm.is_empty()
+                && ((!target_ascii.is_empty() && alias_norm == target_ascii)
+                    || (!stripped_ascii.is_empty() && alias_norm == stripped_ascii))
+            {
+                return Some(hero_id);
+            }
+
+            let name_trimmed = name_zh.trim();
+            let title_trimmed = title_zh.trim();
+            if (!name_trimmed.is_empty() && (name_trimmed == trimmed || name_trimmed == stripped))
+                || (!title_trimmed.is_empty()
+                    && (title_trimmed == trimmed || title_trimmed == stripped))
+            {
+                return Some(hero_id);
             }
         }
         None
@@ -1450,5 +1478,45 @@ mod tests {
         assert_eq!(evals[2].sample_size, 0);
         assert_eq!(evals[2].tier, HeroTier::D);
         assert!((evals[2].win_rate - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolve_champion_id_supports_alias_raw_prefix_name_zh_and_title_zh() {
+        let conn = Connection::open_in_memory().expect("open in-memory sqlite");
+        init_schema(&conn).expect("init schema");
+        conn.execute(
+            "INSERT INTO champions (hero_id, name_zh, title_zh, alias) VALUES (?1, ?2, ?3, ?4)",
+            params![157, "亚索", "疾风剑豪", "Yasuo"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO champions (hero_id, name_zh, title_zh, alias) VALUES (?1, ?2, ?3, ?4)",
+            params![134, "辛德拉", "暗黑元首", "Syndra"],
+        )
+        .unwrap();
+        let engine = MetaEngine {
+            conn: Mutex::new(conn),
+        };
+
+        assert_eq!(engine.resolve_champion_id_by_alias("Yasuo"), Some(157));
+        assert_eq!(engine.resolve_champion_id_by_alias("  yasuo "), Some(157));
+        assert_eq!(
+            engine.resolve_champion_id_by_alias("game_character_displayname_Syndra"),
+            Some(134)
+        );
+        assert_eq!(
+            engine.resolve_champion_id_by_alias("GAME_CHARACTER_DISPLAYNAME_Yasuo"),
+            Some(157)
+        );
+        assert_eq!(engine.resolve_champion_id_by_alias("亚索"), Some(157));
+        assert_eq!(engine.resolve_champion_id_by_alias("疾风剑豪"), Some(157));
+        assert_eq!(engine.resolve_champion_id_by_alias("辛德拉"), Some(134));
+        assert_eq!(engine.resolve_champion_id_by_alias("暗黑元首"), Some(134));
+        assert_eq!(engine.resolve_champion_id_by_alias(""), None);
+        assert_eq!(engine.resolve_champion_id_by_alias("   "), None);
+        assert_eq!(
+            engine.resolve_champion_id_by_alias("game_character_displayname_"),
+            None
+        );
     }
 }

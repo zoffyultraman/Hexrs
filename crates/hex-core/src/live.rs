@@ -56,14 +56,24 @@ impl LiveClient {
 
 fn into_live_game_state(raw: RawAllGameData) -> LiveGameState {
     // Match activePlayer transiently against allPlayers, then discard summoner/riotId PII.
+    // Only fall back to the sole player in 1-player modes (Practice Tool); never grab player 0 in multiplayer.
     let matched_player = raw
         .all_players
         .iter()
         .find(|player| player_matches_active(player, &raw.active_player))
-        .or_else(|| raw.all_players.first());
+        .or_else(|| {
+            if raw.all_players.len() == 1 {
+                raw.all_players.first()
+            } else {
+                None
+            }
+        });
 
     let active_champion_name = matched_player
         .map(|p| p.champion_name.clone())
+        .unwrap_or_default();
+    let active_champion_raw_name = matched_player
+        .map(|p| p.raw_champion_name.clone())
         .unwrap_or_default();
 
     let owned_item_ids = matched_player
@@ -88,6 +98,7 @@ fn into_live_game_state(raw: RawAllGameData) -> LiveGameState {
         game_mode: raw.game_data.game_mode,
         game_time_secs: raw.game_data.game_time,
         active_champion_name,
+        active_champion_raw_name,
         active_champion_id: None,
         level: raw.active_player.level,
         current_gold: raw.active_player.current_gold,
@@ -98,16 +109,60 @@ fn into_live_game_state(raw: RawAllGameData) -> LiveGameState {
     }
 }
 
+fn normalize_identity(raw: &str) -> String {
+    raw.trim().to_lowercase()
+}
+
+fn strip_riot_tag(normalized: &str) -> &str {
+    match normalized.split_once('#') {
+        Some((head, _)) => head.trim(),
+        None => normalized,
+    }
+}
+
 fn player_matches_active(player: &RawLivePlayer, active: &RawActivePlayer) -> bool {
-    if !active.riot_id.is_empty() && player.riot_id == active.riot_id {
-        return true;
+    let a_riot = normalize_identity(&active.riot_id);
+    let p_riot = normalize_identity(&player.riot_id);
+    if !a_riot.is_empty() && !p_riot.is_empty() {
+        if a_riot == p_riot {
+            return true;
+        }
+        if a_riot.contains('#') && p_riot.contains('#') {
+            return false;
+        }
     }
-    if !active.riot_id_game_name.is_empty()
-        && player.riot_id_game_name == active.riot_id_game_name
-    {
-        return true;
+
+    let a_game = normalize_identity(&active.riot_id_game_name);
+    let p_game = normalize_identity(&player.riot_id_game_name);
+    let a_summ = normalize_identity(&active.summoner_name);
+    let p_summ = normalize_identity(&player.summoner_name);
+
+    let active_full = [a_riot.as_str(), a_game.as_str(), a_summ.as_str()];
+    let player_full = [p_riot.as_str(), p_game.as_str(), p_summ.as_str()];
+
+    for &af in &active_full {
+        if af.is_empty() {
+            continue;
+        }
+        if player_full.iter().any(|&pf| !pf.is_empty() && pf == af) {
+            return true;
+        }
     }
-    !active.summoner_name.is_empty() && player.summoner_name == active.summoner_name
+
+    for &af in &active_full {
+        let ab = strip_riot_tag(af);
+        if ab.is_empty() {
+            continue;
+        }
+        if player_full.iter().any(|&pf| {
+            let pb = strip_riot_tag(pf);
+            !pb.is_empty() && pb == ab
+        }) {
+            return true;
+        }
+    }
+
+    false
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -156,6 +211,8 @@ struct RawActivePlayer {
 struct RawLivePlayer {
     #[serde(rename = "championName")]
     champion_name: String,
+    #[serde(rename = "rawChampionName")]
+    raw_champion_name: String,
     #[serde(rename = "summonerName")]
     summoner_name: String,
     #[serde(rename = "riotId")]
@@ -204,5 +261,105 @@ mod tests {
         .expect("parse GameStart event");
         let started_state = into_live_game_state(started_raw);
         assert!(started_state.game_started_event);
+    }
+
+    #[test]
+    fn matches_active_player_with_tag_stripping_case_folding_and_raw_champion_name() {
+        let raw: RawAllGameData = serde_json::from_str(
+            r#"{
+                "activePlayer": {
+                    "level": 9,
+                    "currentGold": 1250.0,
+                    "summonerName": "  MidPlayer#12345 ",
+                    "riotId": "MidPlayer#12345",
+                    "riotIdGameName": ""
+                },
+                "allPlayers": [
+                    {
+                        "championName": "亚索",
+                        "rawChampionName": "game_character_displayname_Yasuo",
+                        "summonerName": "TopLaner",
+                        "riotId": "TopLaner#11111",
+                        "items": [{"itemID": 3031}]
+                    },
+                    {
+                        "championName": "辛德拉",
+                        "rawChampionName": "game_character_displayname_Syndra",
+                        "summonerName": "midplayer",
+                        "riotId": "",
+                        "riotIdGameName": "MIDPLAYER",
+                        "items": [{"itemID": 3089}, {"itemID": 3020}]
+                    }
+                ],
+                "gameData": {"gameMode": "KIWI", "gameTime": 420.0}
+            }"#,
+        )
+        .expect("parse live game data");
+
+        let state = into_live_game_state(raw);
+        assert_eq!(state.active_champion_name, "辛德拉");
+        assert_eq!(
+            state.active_champion_raw_name,
+            "game_character_displayname_Syndra"
+        );
+        assert_eq!(state.owned_item_ids, vec![3089, 3020]);
+
+        // Distinct `#tag` accounts sharing the same base name must match exact tag only.
+        let same_base_raw: RawAllGameData = serde_json::from_str(
+            r#"{
+                "activePlayer": {"riotId": "SameName#2222"},
+                "allPlayers": [
+                    {"championName": "亚索", "rawChampionName": "game_character_displayname_Yasuo", "riotId": "SameName#1111", "items": [{"itemID": 3031}]},
+                    {"championName": "卡莎", "rawChampionName": "game_character_displayname_Kaisa", "riotId": "samename#2222", "items": [{"itemID": 3124}]}
+                ],
+                "gameData": {"gameMode": "KIWI", "gameTime": 100.0}
+            }"#,
+        )
+        .expect("parse same base name payload");
+        let same_base_state = into_live_game_state(same_base_raw);
+        assert_eq!(same_base_state.active_champion_name, "卡莎");
+        assert_eq!(
+            same_base_state.active_champion_raw_name,
+            "game_character_displayname_Kaisa"
+        );
+        assert_eq!(same_base_state.owned_item_ids, vec![3124]);
+    }
+
+    #[test]
+    fn does_not_fallback_to_first_player_in_multiplayer_when_unmatched() {
+        let multi_raw: RawAllGameData = serde_json::from_str(
+            r#"{
+                "activePlayer": {"summonerName": "UnmatchedPlayer#9999"},
+                "allPlayers": [
+                    {"championName": "亚索", "rawChampionName": "game_character_displayname_Yasuo", "summonerName": "PlayerOne", "items": [{"itemID": 3031}]},
+                    {"championName": "辛德拉", "rawChampionName": "game_character_displayname_Syndra", "summonerName": "PlayerTwo", "items": [{"itemID": 3089}]}
+                ],
+                "gameData": {"gameMode": "KIWI", "gameTime": 200.0}
+            }"#,
+        )
+        .expect("parse unmatched multiplayer payload");
+        let multi_state = into_live_game_state(multi_raw);
+        assert!(multi_state.active_champion_name.is_empty());
+        assert!(multi_state.active_champion_raw_name.is_empty());
+        assert!(multi_state.owned_item_ids.is_empty());
+
+        // Single-player Practice Tool still falls back to the only player.
+        let solo_raw: RawAllGameData = serde_json::from_str(
+            r#"{
+                "activePlayer": {},
+                "allPlayers": [
+                    {"championName": "亚索", "rawChampionName": "game_character_displayname_Yasuo", "summonerName": "SoloTester", "items": [{"itemID": 1055}]}
+                ],
+                "gameData": {"gameMode": "PRACTICETOOL", "gameTime": 15.0}
+            }"#,
+        )
+        .expect("parse solo payload");
+        let solo_state = into_live_game_state(solo_raw);
+        assert_eq!(solo_state.active_champion_name, "亚索");
+        assert_eq!(
+            solo_state.active_champion_raw_name,
+            "game_character_displayname_Yasuo"
+        );
+        assert_eq!(solo_state.owned_item_ids, vec![1055]);
     }
 }

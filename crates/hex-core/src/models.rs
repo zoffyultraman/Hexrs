@@ -113,6 +113,8 @@ pub struct LiveGameState {
     pub game_mode: String,
     pub game_time_secs: f64,
     pub active_champion_name: String,
+    #[serde(default)]
+    pub active_champion_raw_name: String,
     pub active_champion_id: Option<i32>,
     pub level: u32,
     pub current_gold: f64,
@@ -418,6 +420,8 @@ pub struct LoadingScreenSnapshot {
     pub game_mode: String,
     pub queue_id: Option<i32>,
     pub local_side: LoadingTeamSide,
+    #[serde(default)]
+    pub local_champion_id: Option<i32>,
     pub team_one: Vec<LoadingPlayerSlot>,
     pub team_two: Vec<LoadingPlayerSlot>,
     pub team_one_ratings: TeamRatingsSnapshot,

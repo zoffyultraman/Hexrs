@@ -753,7 +753,7 @@ impl CoordinatorState {
     ) {
         self.live_poll_in_flight = false;
         match result {
-            Ok(Some(live_state)) => {
+            Ok(Some(mut live_state)) => {
                 if !self.live_api_active {
                     info!(
                         game_mode = %live_state.game_mode,
@@ -790,6 +790,9 @@ impl CoordinatorState {
                 {
                     self.midgame_roster_fetched = true;
                     self.trigger_loading_session_fetch(channels);
+                }
+                if live_state.active_champion_id.is_none() {
+                    live_state.active_champion_id = self.resolve_local_champion_id();
                 }
                 let _ = self.event_tx.send(AppEvent::LiveGameUpdated(live_state));
                 self.sync_shared_and_mode();
@@ -975,6 +978,23 @@ impl CoordinatorState {
         }
     }
 
+    fn resolve_local_champion_id(&self) -> Option<i32> {
+        self.loading_session
+            .as_ref()
+            .and_then(|sess| find_champion_id_for_puuid(self.local_puuid.as_deref(), sess))
+            .or_else(|| {
+                self.match_roster_session
+                    .as_ref()
+                    .and_then(|sess| find_champion_id_for_puuid(self.local_puuid.as_deref(), sess))
+            })
+            .or_else(|| {
+                self.last_champ_select
+                    .as_ref()
+                    .map(|cs| cs.local_champion_id)
+                    .filter(|&id| id > 0)
+            })
+    }
+
     fn build_loading_screen_snapshot(
         &mut self,
         session: &GameflowSessionSnapshot,
@@ -1001,6 +1021,7 @@ impl CoordinatorState {
             &session.team_one,
             &session.team_two,
         );
+        let local_champion_id = find_champion_id_for_puuid(self.local_puuid.as_deref(), session);
         let team_one_slots = loading_slots_to_team_slots(&session.team_one);
         let team_two_slots = loading_slots_to_team_slots(&session.team_two);
         let cfg = RatingTitlesConfig::default();
@@ -1012,6 +1033,7 @@ impl CoordinatorState {
             game_mode: session.game_mode.clone(),
             queue_id: session.queue_id,
             local_side,
+            local_champion_id,
             team_one: session.team_one.clone(),
             team_two: session.team_two.clone(),
             team_one_ratings,
@@ -1385,6 +1407,19 @@ fn backfill_missing_allies(
         slot.slot_index = idx;
     }
     result
+}
+
+fn find_champion_id_for_puuid(
+    local_puuid: Option<&str>,
+    session: &GameflowSessionSnapshot,
+) -> Option<i32> {
+    let lp = local_puuid.filter(|s| !s.is_empty())?;
+    session
+        .team_one
+        .iter()
+        .chain(session.team_two.iter())
+        .find(|slot| slot.puuid == lp && slot.champion_id > 0)
+        .map(|slot| slot.champion_id)
 }
 
 fn determine_local_side(
@@ -1976,6 +2011,52 @@ mod tests {
         assert!(state.match_roster_session.is_none());
         assert!(!state.midgame_roster_fetched);
         assert!(!state.live_match_started);
+    }
+
+    #[test]
+    fn build_loading_screen_snapshot_and_live_poll_inject_local_champion_id() {
+        let (event_tx, event_rx) = unbounded::<AppEvent>();
+        let shared = Arc::new(RwLock::new(CoreSharedState::default()));
+        let channels = make_test_channels();
+        let mut state = CoordinatorState::new(event_tx, shared);
+        let session = GameflowSessionSnapshot {
+            phase: "InProgress".to_owned(),
+            game_id: 999,
+            game_mode: "KIWI".to_owned(),
+            queue_id: Some(2400),
+            team_one: vec![make_loading_slot(0, 157, "p1")],
+            team_two: vec![make_loading_slot(0, 134, "p6")],
+        };
+        state.local_puuid = Some("p6".to_owned());
+        state.match_roster_session = Some(session.clone());
+
+        let snapshot = state.build_loading_screen_snapshot(&session, None);
+        assert_eq!(snapshot.local_side, LoadingTeamSide::Red);
+        assert_eq!(snapshot.local_champion_id, Some(134));
+
+        state.handle_live_poll_result(
+            Ok(Some(LiveGameState {
+                game_mode: "KIWI".to_owned(),
+                game_time_secs: 120.0,
+                active_champion_id: None,
+                ..Default::default()
+            })),
+            &channels,
+        );
+        let emitted: Vec<AppEvent> = event_rx.try_iter().collect();
+        assert!(emitted.iter().any(|ev| matches!(
+            ev,
+            AppEvent::LiveGameUpdated(live) if live.active_champion_id == Some(134)
+        )));
+
+        // When no loading/roster session is present, fall back to last_champ_select.local_champion_id.
+        state.loading_session = None;
+        state.match_roster_session = None;
+        state.last_champ_select = Some(ChampSelectState {
+            local_champion_id: 236,
+            ..Default::default()
+        });
+        assert_eq!(state.resolve_local_champion_id(), Some(236));
     }
 
     #[test]
