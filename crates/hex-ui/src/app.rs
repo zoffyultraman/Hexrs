@@ -17,7 +17,10 @@ use hex_data::{
     HeroPreview, HeroStats, IconCache, MetaEngine, TeamRecommendations, UpdateOutcome,
     UpdaterConfig,
 };
-use hex_vision::{SharedRoiManifest, VisionController, VisionGameContext};
+use hex_vision::{
+    LoadingAlignmentTargets, LoadingSlotTarget, SharedRoiManifest, VisionController,
+    VisionGameContext,
+};
 use tracing::{debug, info, warn};
 
 use crate::loading_overlay_view::{
@@ -79,6 +82,7 @@ pub struct HexrsApp {
     pub last_match_loading_screen: Option<LoadingScreenSnapshot>,
     pub manual_loading_overlay_open: bool,
     pub preview_loading_screen: bool,
+    loading_card_order: Option<(u64, Vec<usize>, Vec<usize>)>,
     meta: Option<MetaEngine>,
     icon_cache: IconCache,
     icon_ready_rx: Receiver<()>,
@@ -214,6 +218,7 @@ impl HexrsApp {
             last_match_loading_screen: None,
             manual_loading_overlay_open: false,
             preview_loading_screen: false,
+            loading_card_order: None,
             meta,
             icon_cache,
             icon_ready_rx,
@@ -819,6 +824,7 @@ impl HexrsApp {
                 slot_index,
                 champion_id,
                 puuid: format!("preview-blue-{slot_index}"),
+                display_name: String::new(),
             })
             .collect();
         let team_two: Vec<LoadingPlayerSlot> = RED_IDS
@@ -828,6 +834,7 @@ impl HexrsApp {
                 slot_index,
                 champion_id,
                 puuid: format!("preview-red-{slot_index}"),
+                display_name: String::new(),
             })
             .collect();
 
@@ -884,37 +891,50 @@ impl HexrsApp {
         }
     }
 
+    fn build_loading_alignment_targets(
+        &self,
+        snapshot: &LoadingScreenSnapshot,
+    ) -> LoadingAlignmentTargets {
+        let map_team = |slots: &[LoadingPlayerSlot]| -> Vec<LoadingSlotTarget> {
+            slots
+                .iter()
+                .take(5)
+                .map(|slot| {
+                    let (name_zh, title_zh, alias) = self
+                        .meta
+                        .as_ref()
+                        .and_then(|m| m.get_hero_stats(slot.champion_id))
+                        .map(|stats| (stats.name_zh, stats.title_zh, stats.alias))
+                        .unwrap_or_default();
+                    LoadingSlotTarget {
+                        name_zh,
+                        title_zh,
+                        alias,
+                        summoner_name: slot.display_name.clone(),
+                    }
+                })
+                .collect()
+        };
+        LoadingAlignmentTargets {
+            game_id: snapshot.game_id,
+            team_one: map_team(&snapshot.team_one),
+            team_two: map_team(&snapshot.team_two),
+        }
+    }
+
     fn map_loading_team_slots(
         &self,
         players: &[LoadingPlayerSlot],
         ratings: &TeamRatingsSnapshot,
+        order: Option<&[usize]>,
     ) -> Vec<LoadingCardSlotData> {
-        players
-            .iter()
-            .take(5)
-            .enumerate()
-            .map(|(idx, player)| {
-                let hero = self.lookup_loading_hero(player.champion_id);
-                let summoner = ratings
-                    .slots
-                    .get(idx)
-                    .map(summoner_summary_to_badge)
-                    .unwrap_or_else(|| {
-                        let (tier_index, title) =
-                            self.rating_titles.resolve(SummonerRatingStatus::Loading, 0);
-                        SummonerBadgeData {
-                            status: SummonerRatingStatus::Loading,
-                            score: 0,
-                            tier_index,
-                            title,
-                            streak: 0,
-                            premade_group_id: None,
-                            is_premade_last_mvp: false,
-                        }
-                    });
-                LoadingCardSlotData { hero, summoner }
-            })
-            .collect()
+        map_loading_team_slots_with(
+            players,
+            ratings,
+            order,
+            &self.rating_titles,
+            |hero_id| self.lookup_loading_hero(hero_id),
+        )
     }
 
     /// Computes the 10-player loading screen overlay state and its deferred Win32 window command.
@@ -980,8 +1000,16 @@ impl HexrsApp {
             return (LoadingOverlayState::default(), cmd);
         };
 
-        let team_one = self.map_loading_team_slots(&snap.team_one, &snap.team_one_ratings);
-        let team_two = self.map_loading_team_slots(&snap.team_two, &snap.team_two_ratings);
+        let (team_one_order, team_two_order) = match self.loading_card_order.as_ref() {
+            Some((gid, t1, t2)) if *gid == snap.game_id => {
+                (Some(t1.as_slice()), Some(t2.as_slice()))
+            }
+            _ => (None, None),
+        };
+        let team_one =
+            self.map_loading_team_slots(&snap.team_one, &snap.team_one_ratings, team_one_order);
+        let team_two =
+            self.map_loading_team_slots(&snap.team_two, &snap.team_two_ratings, team_two_order);
         let team_one_summary =
             compute_team_loading_summary(&snap.team_one_ratings, &self.rating_titles);
         let team_two_summary =
@@ -1158,6 +1186,8 @@ impl HexrsApp {
     fn clear_in_game_hud_state(&mut self) {
         self.owned_augment_ids.clear();
         self.clear_offered_augment_state();
+        self.vision.set_loading_targets(None);
+        self.loading_card_order = None;
         self.loading_screen = None;
         self.last_match_loading_screen = None;
         self.manual_loading_overlay_open = false;
@@ -1242,6 +1272,13 @@ impl HexrsApp {
             }
             AppEvent::LoadingScreenUpdated(mut snap) => {
                 self.refresh_rating_titles_if_changed();
+                if self
+                    .loading_card_order
+                    .as_ref()
+                    .is_some_and(|(gid, _, _)| *gid != snap.game_id)
+                {
+                    self.loading_card_order = None;
+                }
                 for slot in &mut snap.team_one_ratings.slots {
                     let (tier_index, title) = self.rating_titles.resolve(slot.status, slot.score);
                     slot.tier_index = tier_index;
@@ -1252,11 +1289,43 @@ impl HexrsApp {
                     slot.tier_index = tier_index;
                     slot.title = title;
                 }
+                let targets = self.build_loading_alignment_targets(&snap);
                 self.last_match_loading_screen = Some(snap.clone());
                 self.loading_screen = Some(snap);
+                self.vision.set_loading_targets(Some(targets));
                 self.reset_window_sync_cache();
             }
+            AppEvent::LoadingCardOrderDetected {
+                game_id,
+                team_one_order,
+                team_two_order,
+            } => {
+                let matches_current = self
+                    .loading_screen
+                    .as_ref()
+                    .is_some_and(|s| s.game_id == game_id)
+                    || self
+                        .last_match_loading_screen
+                        .as_ref()
+                        .is_some_and(|s| s.game_id == game_id);
+                if matches_current {
+                    info!(
+                        game_id,
+                        team_one_order = ?team_one_order,
+                        team_two_order = ?team_two_order,
+                        "applied OCR loading screen card order"
+                    );
+                    self.loading_card_order = Some((game_id, team_one_order, team_two_order));
+                    self.reset_window_sync_cache();
+                } else {
+                    debug!(
+                        game_id,
+                        "ignoring stale loading screen card order for non-active game"
+                    );
+                }
+            }
             AppEvent::LoadingScreenCleared => {
+                self.vision.set_loading_targets(None);
                 if self.loading_screen.take().is_some() {
                     self.reset_window_sync_cache();
                 }
@@ -2229,6 +2298,65 @@ fn diag_row_colored(label: &str, value: String, value_color: Rgba) -> Div {
         )
 }
 
+fn resolve_slot_order(order: Option<&[usize]>, len: usize) -> Vec<usize> {
+    if let Some(perm) = order {
+        if perm.len() == len {
+            let mut seen = vec![false; len];
+            let mut valid = true;
+            for &idx in perm {
+                if idx >= len || seen[idx] {
+                    valid = false;
+                    break;
+                }
+                seen[idx] = true;
+            }
+            if valid {
+                return perm.to_vec();
+            }
+        }
+    }
+    (0..len).collect()
+}
+
+fn map_loading_team_slots_with<F>(
+    players: &[LoadingPlayerSlot],
+    ratings: &TeamRatingsSnapshot,
+    order: Option<&[usize]>,
+    rating_titles: &RatingTitlesConfig,
+    mut lookup_hero: F,
+) -> Vec<LoadingCardSlotData>
+where
+    F: FnMut(i32) -> Option<LoadingCardHeroData>,
+{
+    let capped_len = players.len().min(5);
+    let indices = resolve_slot_order(order, capped_len);
+    indices
+        .into_iter()
+        .map(|idx| {
+            let player = &players[idx];
+            let hero = lookup_hero(player.champion_id);
+            let summoner = ratings
+                .slots
+                .get(idx)
+                .map(summoner_summary_to_badge)
+                .unwrap_or_else(|| {
+                    let (tier_index, title) =
+                        rating_titles.resolve(SummonerRatingStatus::Loading, 0);
+                    SummonerBadgeData {
+                        status: SummonerRatingStatus::Loading,
+                        score: 0,
+                        tier_index,
+                        title,
+                        streak: 0,
+                        premade_group_id: None,
+                        is_premade_last_mvp: false,
+                    }
+                });
+            LoadingCardSlotData { hero, summoner }
+        })
+        .collect()
+}
+
 fn order_subset_cards_for_display(ids: &[i32]) -> Vec<i32> {
     if ids.len() == 3 {
         vec![ids[0], ids[2], ids[1]]
@@ -2253,7 +2381,11 @@ fn format_rect_info(rect: Option<WindowRectInfo>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::order_subset_cards_for_display;
+    use super::{
+        map_loading_team_slots_with, order_subset_cards_for_display, resolve_slot_order,
+        HeroTier, LoadingCardHeroData, LoadingPlayerSlot, RatingTitlesConfig,
+        SummonerRatingStatus, SummonerRatingSummary, TeamRatingsSnapshot,
+    };
 
     #[test]
     fn subset_cards_visual_order_places_third_blessed_card_in_center() {
@@ -2262,5 +2394,120 @@ mod tests {
             order_subset_cards_for_display(&[14, 517, 497]),
             vec![14, 497, 517]
         );
+    }
+
+    #[test]
+    fn resolve_slot_order_validates_permutations_and_falls_back_safely() {
+        assert_eq!(resolve_slot_order(None, 5), vec![0, 1, 2, 3, 4]);
+        assert_eq!(
+            resolve_slot_order(Some(&[2, 0, 4, 1, 3]), 5),
+            vec![2, 0, 4, 1, 3]
+        );
+        // Length mismatch falls back to identity.
+        assert_eq!(resolve_slot_order(Some(&[1, 0]), 3), vec![0, 1, 2]);
+        // Duplicate index falls back to identity.
+        assert_eq!(resolve_slot_order(Some(&[0, 1, 1]), 3), vec![0, 1, 2]);
+        // Out-of-bounds index falls back to identity.
+        assert_eq!(resolve_slot_order(Some(&[0, 1, 3]), 3), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn map_loading_team_slots_reorders_heroes_and_ratings_in_lockstep() {
+        let players = vec![
+            LoadingPlayerSlot {
+                slot_index: 0,
+                champion_id: 101,
+                puuid: "p0".to_owned(),
+                display_name: String::new(),
+            },
+            LoadingPlayerSlot {
+                slot_index: 1,
+                champion_id: 102,
+                puuid: "p1".to_owned(),
+                display_name: String::new(),
+            },
+            LoadingPlayerSlot {
+                slot_index: 2,
+                champion_id: 103,
+                puuid: "p2".to_owned(),
+                display_name: String::new(),
+            },
+        ];
+        let ratings = TeamRatingsSnapshot {
+            slots: vec![
+                SummonerRatingSummary {
+                    cell_id: 0,
+                    status: SummonerRatingStatus::Ready,
+                    score: 88,
+                    tier_index: 0,
+                    title: "通天代".to_owned(),
+                    games_count: 15,
+                    win_rate: 60.0,
+                    avg_kda: 4.5,
+                    streak: 5,
+                    premade_group_id: Some(1),
+                    is_premade_last_mvp: true,
+                },
+                SummonerRatingSummary {
+                    cell_id: 1,
+                    status: SummonerRatingStatus::Ready,
+                    score: 62,
+                    tier_index: 2,
+                    title: "人上人".to_owned(),
+                    games_count: 10,
+                    win_rate: 51.0,
+                    avg_kda: 3.0,
+                    streak: -3,
+                    premade_group_id: Some(1),
+                    is_premade_last_mvp: false,
+                },
+                SummonerRatingSummary {
+                    cell_id: 2,
+                    status: SummonerRatingStatus::Private,
+                    score: 0,
+                    tier_index: 4,
+                    title: "隐藏".to_owned(),
+                    games_count: 0,
+                    win_rate: 0.0,
+                    avg_kda: 0.0,
+                    streak: 0,
+                    premade_group_id: None,
+                    is_premade_last_mvp: false,
+                },
+            ],
+            premade_groups: Vec::new(),
+        };
+        let titles = RatingTitlesConfig::default();
+
+        let mapped = map_loading_team_slots_with(
+            &players,
+            &ratings,
+            Some(&[2, 0, 1]),
+            &titles,
+            |hero_id| {
+                Some(LoadingCardHeroData {
+                    tier: HeroTier::S,
+                    win_rate: 50.0 + (hero_id - 100) as f64,
+                    name_zh: format!("H{hero_id}"),
+                })
+            },
+        );
+
+        assert_eq!(mapped.len(), 3);
+        assert_eq!(mapped[0].hero.as_ref().map(|h| h.name_zh.as_str()), Some("H103"));
+        assert_eq!(mapped[0].summoner.status, SummonerRatingStatus::Private);
+        assert_eq!(mapped[0].summoner.premade_group_id, None);
+
+        assert_eq!(mapped[1].hero.as_ref().map(|h| h.name_zh.as_str()), Some("H101"));
+        assert_eq!(mapped[1].summoner.score, 88);
+        assert_eq!(mapped[1].summoner.streak, 5);
+        assert_eq!(mapped[1].summoner.premade_group_id, Some(1));
+        assert!(mapped[1].summoner.is_premade_last_mvp);
+
+        assert_eq!(mapped[2].hero.as_ref().map(|h| h.name_zh.as_str()), Some("H102"));
+        assert_eq!(mapped[2].summoner.score, 62);
+        assert_eq!(mapped[2].summoner.streak, -3);
+        assert_eq!(mapped[2].summoner.premade_group_id, Some(1));
+        assert!(!mapped[2].summoner.is_premade_last_mvp);
     }
 }
