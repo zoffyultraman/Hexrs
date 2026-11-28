@@ -47,7 +47,7 @@ impl TrayController {
 
         let status_item = MenuItem::new("状态: 休眠中", false, None);
         let toggle_overlay_item = CheckMenuItem::new("显示悬浮窗", true, true, None);
-        let toggle_corner_item = MenuItem::new("局内位置: 左上角 (点击切右上角)", true, None);
+        let toggle_corner_item = MenuItem::new("局内位置: 右上角 (点击切左上角)", true, None);
         let toggle_diagnostics_item = CheckMenuItem::new("显示诊断面板", true, false, None);
         let toggle_telemetry_item = CheckMenuItem::new("匿名众包战绩上报", true, true, None);
         let check_update_item = MenuItem::new("检查数据热更新", true, None);

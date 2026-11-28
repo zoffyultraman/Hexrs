@@ -13,6 +13,7 @@ pub const DIAGNOSTICS_HEIGHT_DIP: f32 = 560.0;
 /// Compact in-game corner HUD dimensions in DIPs.
 pub const IN_GAME_HUD_WIDTH_DIP: f32 = 324.0;
 pub const IN_GAME_HUD_HEIGHT_DIP: f32 = 204.0;
+pub const IN_GAME_HUD_COLLAPSED_HEIGHT_DIP: f32 = 46.0;
 
 const CARD_WIDTH_RATIO: f32 = 0.78;
 const CARD_GAP_RATIO: f32 = 0.22;
@@ -48,8 +49,8 @@ pub fn compute_team_strip_width_dip(target_width_dip: f32) -> f32 {
 /// Corner anchor for the compact in-game HUD card.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverlayCorner {
-    #[default]
     TopLeft,
+    #[default]
     TopRight,
 }
 
@@ -74,6 +75,7 @@ pub enum Win32WindowAction {
         target_rect: Option<WindowRectInfo>,
         corner: OverlayCorner,
         visible: bool,
+        collapsed: bool,
     },
     InGameAugmentBar {
         target_rect: Option<WindowRectInfo>,
@@ -329,9 +331,9 @@ mod imp {
         compute_augment_bar_geometry, AugmentOfferLayout, OverlayCorner, Win32WindowAction,
         Win32WindowCommand, WindowRectInfo, BENCH_SLOT_HEIGHT_FRAC, BENCH_SLOT_PITCH_FRAC,
         BENCH_SLOT_WIDTH_FRAC, BENCH_STRIP_LEFT_FRAC, BENCH_STRIP_Y_FRAC, DIAGNOSTICS_HEIGHT_DIP,
-        DIAGNOSTICS_WIDTH_DIP, IN_GAME_HUD_HEIGHT_DIP, IN_GAME_HUD_WIDTH_DIP,
-        PICK_CARD_BADGE_HEIGHT_FRAC, PICK_CARD_GAP_FRAC, PICK_CARD_STRIP_Y_FRAC,
-        PICK_CARD_WIDTH_FRAC, SIDEBAR_WIDTH_DIP, TEAM_STRIP_RIGHT_FRAC,
+        DIAGNOSTICS_WIDTH_DIP, IN_GAME_HUD_COLLAPSED_HEIGHT_DIP, IN_GAME_HUD_HEIGHT_DIP,
+        IN_GAME_HUD_WIDTH_DIP, PICK_CARD_BADGE_HEIGHT_FRAC, PICK_CARD_GAP_FRAC,
+        PICK_CARD_STRIP_Y_FRAC, PICK_CARD_WIDTH_FRAC, SIDEBAR_WIDTH_DIP, TEAM_STRIP_RIGHT_FRAC,
     };
 
     const MIN_TARGET_WINDOW_DIM: i32 = 200;
@@ -432,8 +434,12 @@ mod imp {
         }
     }
 
-    /// Returns `true` when the active League in-game window (`RiotWindowClass`) owns foreground focus.
-    pub fn is_game_window_foreground(game_pid: Option<u32>, game_hwnd_raw: isize) -> bool {
+    /// Returns `true` when the active League in-game window (`RiotWindowClass`) or Hexrs HUD owns foreground focus.
+    pub fn is_game_window_foreground(
+        game_pid: Option<u32>,
+        game_hwnd_raw: isize,
+        own_hwnd_raw: isize,
+    ) -> bool {
         // SAFETY: Foreground window, PID, and class queries are read-only Win32 calls.
         unsafe {
             let fg = GetForegroundWindow();
@@ -441,7 +447,9 @@ mod imp {
                 return false;
             }
             let fg_raw = fg.0 as isize;
-            if game_hwnd_raw != 0 && fg_raw == game_hwnd_raw {
+            if (game_hwnd_raw != 0 && fg_raw == game_hwnd_raw)
+                || (own_hwnd_raw != 0 && fg_raw == own_hwnd_raw)
+            {
                 return true;
             }
             let mut fg_pid: u32 = 0;
@@ -811,7 +819,8 @@ mod imp {
                 target_rect,
                 corner,
                 visible,
-            } => set_in_game_overlay_mode_hwnd(hwnd, *target_rect, *corner, *visible),
+                collapsed,
+            } => set_in_game_overlay_mode_hwnd(hwnd, *target_rect, *corner, *visible, *collapsed),
             Win32WindowAction::InGameAugmentBar {
                 target_rect,
                 visible,
@@ -867,17 +876,18 @@ mod imp {
         Ok(())
     }
 
-    /// Anchors the compact `324x204` click-through corner HUD onto `League of Legends.exe`.
+    /// Anchors the compact collapsible corner HUD onto `League of Legends.exe`.
     fn set_in_game_overlay_mode_hwnd(
         hwnd: HWND,
         target_rect: Option<WindowRectInfo>,
         corner: OverlayCorner,
         visible: bool,
+        collapsed: bool,
     ) -> Result<()> {
 
         // SAFETY: `hwnd` belongs to the active GPUI window on the UI thread.
         unsafe {
-            apply_transparent_ex_style(hwnd, false);
+            apply_transparent_ex_style(hwnd, visible);
 
             let Some(target) = target_rect.filter(|_| visible) else {
                 let _ = ShowWindow(hwnd, SW_HIDE);
@@ -890,8 +900,13 @@ mod imp {
 
             let target_w = target.width().max(160);
             let target_h = target.height().max(80);
+            let hud_h_dip = if collapsed {
+                IN_GAME_HUD_COLLAPSED_HEIGHT_DIP
+            } else {
+                IN_GAME_HUD_HEIGHT_DIP
+            };
             let width_px = ((IN_GAME_HUD_WIDTH_DIP * scale).round() as i32).min(target_w);
-            let height_px = ((IN_GAME_HUD_HEIGHT_DIP * scale).round() as i32).min(target_h);
+            let height_px = ((hud_h_dip * scale).round() as i32).min(target_h);
             let margin_x = (14.0 * scale).round() as i32;
 
             let (raw_x, raw_y) = match corner {
@@ -1382,7 +1397,11 @@ mod imp {
     }
 
     /// Non-Windows stub for `is_game_window_foreground`.
-    pub fn is_game_window_foreground(_game_pid: Option<u32>, _game_hwnd_raw: isize) -> bool {
+    pub fn is_game_window_foreground(
+        _game_pid: Option<u32>,
+        _game_hwnd_raw: isize,
+        _own_hwnd_raw: isize,
+    ) -> bool {
         false
     }
 
@@ -1442,7 +1461,12 @@ pub use imp::{
 
 #[cfg(test)]
 mod tests {
-    use super::compute_loading_layout_dip;
+    use super::{compute_loading_layout_dip, OverlayCorner};
+
+    #[test]
+    fn overlay_corner_defaults_to_top_right() {
+        assert_eq!(OverlayCorner::default(), OverlayCorner::TopRight);
+    }
 
     #[test]
     fn loading_layout_fits_and_does_not_overlap_across_resolutions() {

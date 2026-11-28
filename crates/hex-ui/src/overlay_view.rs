@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use gpui::{div, img, prelude::*, px, Div, FontWeight, ObjectFit};
+use gpui::{div, img, prelude::*, px, Context, Div, FontWeight, ObjectFit};
 use hex_core::HeroTier;
 use hex_data::{AugmentEvaluation, BuildItemInfo, DynamicBuildPlan};
 
@@ -12,7 +12,7 @@ use crate::theme;
 use crate::win32::{AUGMENT_BAR_CARD_HEIGHT_DIP, AUGMENT_BAR_TOP_PAD_DIP};
 
 /// Renders either the 3-card augment strip (when an offer is active) or the compact corner equipment HUD.
-pub fn render_in_game_overlay(app: &HexrsApp) -> Div {
+pub fn render_in_game_overlay(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
     if !app.overlay_visible {
         return div().size_full().bg(theme::transparent());
     }
@@ -40,6 +40,32 @@ pub fn render_in_game_overlay(app: &HexrsApp) -> Div {
         .map(|plan| plan.playstyle_tag.clone())
         .filter(|tag| !tag.is_empty());
 
+    if app.in_game_hud_collapsed {
+        return components::hud_container(
+            theme::overlay_card_bg(),
+            Some(theme::border_subtle()),
+            AccentBar::Top(2.0, theme::gold()),
+        )
+        .size_full()
+        .overflow_hidden()
+        .px_2()
+        .py(px(4.0))
+        .rounded(px(4.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(6.0))
+        .text_color(theme::text_primary())
+        .child(render_hero_identity(
+            app.active_hero_icon.clone(),
+            hero_name,
+            playstyle_tag,
+            true,
+        ))
+        .child(render_hud_collapse_button(true, cx));
+    }
+
     components::hud_container(
         theme::overlay_card_bg(),
         Some(theme::border_subtle()),
@@ -58,6 +84,7 @@ pub fn render_in_game_overlay(app: &HexrsApp) -> Div {
         app.active_hero_icon.clone(),
         hero_name,
         playstyle_tag,
+        cx,
     ))
     .child(render_item_grid(app, app.dynamic_build.as_ref()))
 }
@@ -320,29 +347,55 @@ fn sanitize_augment_desc(raw: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn render_hero_header(
+fn render_hud_collapse_button(
+    collapsed: bool,
+    cx: &mut Context<HexrsApp>,
+) -> impl IntoElement {
+    let label = if collapsed { "展开 ▾" } else { "收起 ▴" };
+    div()
+        .id("toggle-in-game-hud-collapse-btn")
+        .cursor_pointer()
+        .px(px(6.0))
+        .py(px(2.0))
+        .rounded(px(3.0))
+        .bg(theme::card_elevated_bg())
+        .border_1()
+        .border_color(theme::border_subtle())
+        .hover(|s| s.bg(theme::bg_highlight()))
+        .text_size(px(11.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::gold())
+        .child(label)
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.toggle_in_game_hud_collapsed(cx);
+        }))
+}
+
+fn render_hero_identity(
     hero_icon: Option<PathBuf>,
     hero_name: String,
     playstyle_tag: Option<String>,
+    collapsed: bool,
 ) -> Div {
+    let portrait_size = if collapsed { 28.0 } else { 36.0 };
     let portrait = match hero_icon {
         Some(path) => div()
-            .w(px(36.0))
-            .h(px(36.0))
+            .w(px(portrait_size))
+            .h(px(portrait_size))
             .rounded(px(3.0))
             .overflow_hidden()
             .border_1()
             .border_color(theme::border_gold())
             .child(
                 img(path)
-                    .w(px(36.0))
-                    .h(px(36.0))
+                    .w(px(portrait_size))
+                    .h(px(portrait_size))
                     .rounded(px(3.0))
                     .object_fit(ObjectFit::Cover),
             ),
         None => div()
-            .w(px(36.0))
-            .h(px(36.0))
+            .w(px(portrait_size))
+            .h(px(portrait_size))
             .rounded(px(3.0))
             .bg(theme::gold_dim())
             .border_1()
@@ -350,14 +403,56 @@ fn render_hero_header(
             .flex()
             .items_center()
             .justify_center()
-            .text_xs()
+            .text_size(px(if collapsed { 10.0 } else { 11.0 }))
             .font_weight(FontWeight::BOLD)
             .text_color(theme::gold())
             .child("HEX"),
     };
 
-    let tag_badge = playstyle_tag.map(|tag| truncate_label(&tag, 7));
+    let max_tag_chars = if collapsed { 5 } else { 7 };
+    let tag_badge = playstyle_tag.map(|tag| truncate_label(&tag, max_tag_chars));
 
+    div()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(if collapsed { 6.0 } else { 8.0 }))
+        .child(portrait)
+        .child(
+            div()
+                .min_w_0()
+                .overflow_hidden()
+                .text_sm()
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme::text_primary())
+                .child(truncate_label(&hero_name, if collapsed { 6 } else { 8 })),
+        )
+        .when_some(tag_badge, |row, tag| {
+            row.child(
+                div()
+                    .px(px(5.0))
+                    .py(px(2.0))
+                    .rounded(px(2.0))
+                    .bg(theme::cyan_dim())
+                    .border_1()
+                    .border_color(theme::border_cyan())
+                    .text_size(px(10.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::cyan())
+                    .child(tag),
+            )
+        })
+}
+
+fn render_hero_header(
+    hero_icon: Option<PathBuf>,
+    hero_name: String,
+    playstyle_tag: Option<String>,
+    cx: &mut Context<HexrsApp>,
+) -> Div {
     div()
         .w_full()
         .h(px(38.0))
@@ -365,37 +460,9 @@ fn render_hero_header(
         .flex_row()
         .items_center()
         .justify_between()
-        .gap_2()
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .child(portrait)
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme::text_primary())
-                        .child(hero_name),
-                ),
-        )
-        .when_some(tag_badge, |row, tag| {
-            row.child(
-                div()
-                    .px(px(6.0))
-                    .py(px(2.0))
-                    .rounded(px(2.0))
-                    .bg(theme::cyan_dim())
-                    .border_1()
-                    .border_color(theme::border_cyan())
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::cyan())
-                    .child(tag),
-            )
-        })
+        .gap(px(6.0))
+        .child(render_hero_identity(hero_icon, hero_name, playstyle_tag, false))
+        .child(render_hud_collapse_button(false, cx))
 }
 
 fn render_item_grid(app: &HexrsApp, build: Option<&DynamicBuildPlan>) -> Div {

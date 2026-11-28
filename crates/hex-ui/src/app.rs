@@ -44,6 +44,7 @@ pub struct HexrsApp {
     pub lcu_connected: bool,
     pub overlay_visible: bool,
     pub overlay_corner: OverlayCorner,
+    pub in_game_hud_collapsed: bool,
     pub telemetry_enabled: bool,
     pub updater_refresh_requested: bool,
     pub diagnostics_open: bool,
@@ -98,6 +99,7 @@ pub struct HexrsApp {
         Option<WindowRectInfo>,
         OverlayCorner,
         bool,
+        bool,
         usize,
         Option<(usize, i32, i32, i32)>,
     )>,
@@ -119,7 +121,13 @@ impl HexrsApp {
     ) -> Self {
         let meta = match MetaEngine::open_default() {
             Ok(engine) => {
-                info!("MetaEngine initialized successfully");
+                let (hero_count, augment_count) = engine.stats_counts();
+                info!(
+                    data_version = %engine.data_version(),
+                    hero_count,
+                    augment_count,
+                    "MetaEngine initialized successfully"
+                );
                 Some(engine)
             }
             Err(err) => {
@@ -169,6 +177,7 @@ impl HexrsApp {
             lcu_connected,
             overlay_visible: true,
             overlay_corner: OverlayCorner::default(),
+            in_game_hud_collapsed: false,
             telemetry_enabled: true,
             updater_refresh_requested: false,
             diagnostics_open: false,
@@ -441,6 +450,17 @@ impl HexrsApp {
                 .as_ref()
                 .and_then(|engine| engine.get_hero_preview(hero_id));
         }
+        cx.notify();
+    }
+
+    /// Toggles the in-game corner build HUD between expanded (`324x204`) and compact header (`324x46`).
+    pub fn toggle_in_game_hud_collapsed(&mut self, cx: &mut Context<Self>) {
+        self.in_game_hud_collapsed = !self.in_game_hud_collapsed;
+        info!(
+            collapsed = self.in_game_hud_collapsed,
+            "toggled in-game corner build HUD collapsed state"
+        );
+        self.reset_window_sync_cache();
         cx.notify();
     }
 
@@ -1217,12 +1237,21 @@ impl HexrsApp {
                 capture_ms,
                 layout,
             } => {
-                debug!(?candidates, capture_ms, ?layout, "augment offer detected by hex-vision");
+                info!(
+                    ?candidates,
+                    capture_ms,
+                    ?layout,
+                    active_hero_id = ?self.active_hero_id,
+                    active_champ_select_hero_id = ?self.active_champ_select_hero_id,
+                    game_focused = self.game_focused,
+                    overlay_visible = self.overlay_visible,
+                    "augment offer detected by hex-vision"
+                );
                 self.evaluate_detected_offer(&candidates, capture_ms, layout);
             }
             AppEvent::AugmentOfferCleared => {
                 if !self.offered_augments.is_empty() || self.offered_augment_layout.is_some() {
-                    debug!("clearing augment offer strip");
+                    info!("clearing augment offer strip");
                     self.clear_offered_augment_state();
                     self.reset_window_sync_cache();
                 }
@@ -1248,12 +1277,27 @@ impl HexrsApp {
         layout: Option<AugmentOfferLayout>,
     ) {
         let Some(meta) = self.meta.as_ref() else {
+            warn!(
+                ?candidates,
+                "cannot evaluate augment offer: MetaEngine is not loaded"
+            );
             return;
         };
         let hero_id = self
             .active_hero_id
             .or(self.active_champ_select_hero_id)
             .unwrap_or(0);
+        if hero_id == 0 {
+            warn!(
+                ?candidates,
+                live_champ = self
+                    .live_game
+                    .as_ref()
+                    .map(|g| g.active_champion_name.as_str())
+                    .unwrap_or(""),
+                "evaluating augment offer with unresolved hero_id=0; using global averages"
+            );
+        }
 
         let mut slots = Vec::with_capacity(candidates.len().min(4));
         let mut matched_any = false;
@@ -1269,16 +1313,62 @@ impl HexrsApp {
                     slots.push(eval);
                     continue;
                 }
+                warn!(
+                    hero_id,
+                    aug_id,
+                    "augment_id missing from meta.db augment_meta; using unrecognized placeholder"
+                );
             }
             slots.push(placeholder_augment_eval());
         }
 
-        if matched_any {
-            self.offered_augments = slots;
-            self.offered_augment_layout = layout;
-            self.last_offer_capture_ms = Some(capture_ms);
-            self.reset_window_sync_cache();
+        let data_version = meta.data_version();
+        let summary: Vec<String> = slots
+            .iter()
+            .map(|eval| {
+                format!(
+                    "{}:{}({},{:.1}%,{:.1}%,n={},low={})",
+                    eval.augment_id,
+                    eval.name_zh,
+                    eval.tier.label(),
+                    eval.win_rate,
+                    eval.pick_rate,
+                    eval.sample_size,
+                    eval.low_sample
+                )
+            })
+            .collect();
+
+        if !matched_any {
+            warn!(
+                hero_id,
+                ?candidates,
+                data_version = %data_version,
+                "augment offer dropped: zero candidates resolved"
+            );
+            return;
         }
+
+        if slots.iter().any(|eval| eval.augment_id == 0 || eval.low_sample) {
+            warn!(
+                hero_id,
+                data_version = %data_version,
+                slots = ?summary,
+                "evaluated augment offer with unrecognized or low-sample slots"
+            );
+        } else {
+            info!(
+                hero_id,
+                data_version = %data_version,
+                slots = ?summary,
+                "evaluated augment offer"
+            );
+        }
+
+        self.offered_augments = slots;
+        self.offered_augment_layout = layout;
+        self.last_offer_capture_ms = Some(capture_ms);
+        self.reset_window_sync_cache();
     }
 
     fn refresh_live_game_data(&mut self, live: &LiveGameState) {
@@ -1454,6 +1544,7 @@ impl HexrsApp {
             self.game_focused = win32::is_game_window_foreground(
                 self.core_handle.game_pid(),
                 game_r.map(|r| r.hwnd_raw).unwrap_or(0),
+                0,
             );
             if !self.last_diagnostics_sync {
                 self.last_diagnostics_sync = true;
@@ -1522,6 +1613,7 @@ impl HexrsApp {
                 self.game_focused = win32::is_game_window_foreground(
                     self.core_handle.game_pid(),
                     detected_rect.map(|r| r.hwnd_raw).unwrap_or(0),
+                    hwnd_raw,
                 );
                 let base_visible = is_preview || (self.overlay_visible && self.game_focused);
                 let suppress_corner_for_loading = self.offered_augments.is_empty()
@@ -1557,11 +1649,35 @@ impl HexrsApp {
                     target_rect,
                     self.overlay_corner,
                     visible,
+                    self.in_game_hud_collapsed,
                     augment_slot_count,
                     quantized_layout,
                 );
                 if self.last_overlay_sync != Some(state) {
                     self.last_overlay_sync = Some(state);
+                    if augment_slot_count > 0 {
+                        if visible && target_rect.is_some() {
+                            info!(
+                                augment_slot_count,
+                                visible,
+                                overlay_visible = self.overlay_visible,
+                                game_focused = self.game_focused,
+                                has_target_rect = target_rect.is_some(),
+                                is_preview,
+                                "syncing in-game augment bar window"
+                            );
+                        } else {
+                            warn!(
+                                augment_slot_count,
+                                visible,
+                                overlay_visible = self.overlay_visible,
+                                game_focused = self.game_focused,
+                                has_target_rect = target_rect.is_some(),
+                                is_preview,
+                                "in-game augment bar not shown during window sync"
+                            );
+                        }
+                    }
                     let action = if augment_slot_count > 0 {
                         Win32WindowAction::InGameAugmentBar {
                             target_rect,
@@ -1574,6 +1690,7 @@ impl HexrsApp {
                             target_rect,
                             corner: self.overlay_corner,
                             visible,
+                            collapsed: self.in_game_hud_collapsed,
                         }
                     };
                     return Some(Win32WindowCommand { hwnd_raw, action });
@@ -1645,7 +1762,7 @@ impl Render for HexrsApp {
 
         match self.preview_mode.unwrap_or(self.mode) {
             AppMode::LobbyDocked => lobby_view::render_lobby_sidebar(self, cx).into_any_element(),
-            AppMode::InGameOverlay => overlay_view::render_in_game_overlay(self).into_any_element(),
+            AppMode::InGameOverlay => overlay_view::render_in_game_overlay(self, cx).into_any_element(),
             AppMode::Dormant => div()
                 .size_full()
                 .bg(theme::transparent())
@@ -2011,7 +2128,7 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                             div()
                                 .text_xs()
                                 .text_color(theme::text_muted())
-                                .child("提示：局内小窗永久穿透，预览时右键托盘“显示诊断面板”即可切回。"),
+                                .child("提示：右上角出装窗可点击标题栏「收起/展开」，三选一与加载页保持穿透；预览时右键托盘“显示诊断面板”即可切回。"),
                         ),
                 )
                 .child(
