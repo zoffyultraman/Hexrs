@@ -7,7 +7,7 @@ use hex_data::{
     SynergyRecommendation, TeamDiagnosis, TeamRecommendations,
 };
 
-use crate::app::HexrsApp;
+use crate::app::{AppUpdateUiState, HexrsApp, APP_VERSION};
 use crate::components::{self, TierBadgeSize};
 use crate::theme;
 
@@ -44,7 +44,12 @@ pub fn render_lobby_sidebar(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
         .when(is_preview, |root| {
             root.child(render_preview_banner(cx))
         })
-        .child(render_header(lcu_connected, champ_select))
+        .child(render_header(
+            lcu_connected,
+            champ_select,
+            &app.app_update_state,
+            cx,
+        ))
         .child(
             div()
                 .id("lobby-sidebar-scroll")
@@ -129,7 +134,12 @@ fn render_preview_banner(cx: &mut Context<HexrsApp>) -> Div {
         )
 }
 
-fn render_header(lcu_connected: bool, champ_select: Option<&ChampSelectState>) -> Div {
+fn render_header(
+    lcu_connected: bool,
+    champ_select: Option<&ChampSelectState>,
+    app_update_state: &AppUpdateUiState,
+    cx: &mut Context<HexrsApp>,
+) -> Div {
     let status_dot_color = if lcu_connected {
         theme::cyan()
     } else {
@@ -142,6 +152,7 @@ fn render_header(lcu_connected: bool, champ_select: Option<&ChampSelectState>) -
     let phase_label = champ_select
         .map(|s| format_phase(&s.phase))
         .unwrap_or("等待对局");
+    let has_update = matches!(app_update_state, AppUpdateUiState::UpdateAvailable { .. });
 
     div()
         .px_3()
@@ -152,11 +163,15 @@ fn render_header(lcu_connected: bool, champ_select: Option<&ChampSelectState>) -
         .flex()
         .items_center()
         .justify_between()
+        .gap_1()
         .child(
             div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
                 .flex()
                 .items_center()
-                .gap_2()
+                .gap(px(6.0))
                 .child(
                     div()
                         .w(px(8.0))
@@ -170,6 +185,15 @@ fn render_header(lcu_connected: bool, champ_select: Option<&ChampSelectState>) -
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme::gold())
                         .child("HEXRS"),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_size(px(10.0))
+                        .font_family(theme::MONO_FONT)
+                        .text_color(theme::text_muted())
+                        .child(APP_VERSION),
                 ),
         )
         .child(
@@ -177,6 +201,27 @@ fn render_header(lcu_connected: bool, champ_select: Option<&ChampSelectState>) -
                 .flex()
                 .items_center()
                 .gap_1()
+                .when(has_update, |row| {
+                    row.child(
+                        div()
+                            .id("lobby-app-update-pill")
+                            .cursor_pointer()
+                            .px(px(5.0))
+                            .py(px(1.0))
+                            .rounded(px(3.0))
+                            .bg(theme::gold_dim())
+                            .border_1()
+                            .border_color(theme::border_gold())
+                            .hover(|s| s.bg(theme::bg_highlight()))
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(theme::gold())
+                            .child("新版本 ↗")
+                            .on_click(cx.listener(|this, _event, _window, _cx| {
+                                this.open_app_release_page();
+                            })),
+                    )
+                })
                 .child(
                     div()
                         .px(px(6.0))

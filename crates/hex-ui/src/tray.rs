@@ -13,6 +13,8 @@ pub enum TrayAction {
     ToggleOverlay,
     ToggleOverlayCorner,
     ToggleDiagnostics,
+    CheckAppUpdate,
+    OpenReleasePage,
     CheckDataUpdate,
     ToggleTelemetry,
     OpenDataDir,
@@ -23,16 +25,20 @@ pub enum TrayAction {
 
 /// Owns the Windows/macOS system tray icon and menu items on the main UI thread.
 pub struct TrayController {
+    app_version: String,
     tray_icon: TrayIcon,
     status_item: MenuItem,
+    version_item: MenuItem,
     toggle_overlay_item: CheckMenuItem,
     toggle_corner_item: MenuItem,
     toggle_diagnostics_item: CheckMenuItem,
     toggle_telemetry_item: CheckMenuItem,
+    version_item_id: MenuId,
     toggle_overlay_id: MenuId,
     toggle_corner_id: MenuId,
     toggle_diagnostics_id: MenuId,
     toggle_telemetry_id: MenuId,
+    check_app_update_id: MenuId,
     check_update_id: MenuId,
     open_dir_id: MenuId,
     open_log_id: MenuId,
@@ -42,14 +48,16 @@ pub struct TrayController {
 
 impl TrayController {
     /// Creates the system tray icon and context menu; must be called on the main UI thread.
-    pub fn new() -> Result<Self> {
+    pub fn new(app_version: &str) -> Result<Self> {
         let menu = Menu::new();
 
         let status_item = MenuItem::new("状态: 休眠中", false, None);
+        let version_item = MenuItem::new(format!("版本: {app_version}"), false, None);
         let toggle_overlay_item = CheckMenuItem::new("显示悬浮窗", true, true, None);
         let toggle_corner_item = MenuItem::new("局内位置: 右上角 (点击切左上角)", true, None);
         let toggle_diagnostics_item = CheckMenuItem::new("显示诊断面板", true, false, None);
         let toggle_telemetry_item = CheckMenuItem::new("匿名众包战绩上报", true, true, None);
+        let check_app_update_item = MenuItem::new("检查软件版本更新", true, None);
         let check_update_item = MenuItem::new("检查数据热更新", true, None);
         let open_dir_item = MenuItem::new("打开数据目录", true, None);
         let open_log_item = MenuItem::new("打开运行日志", true, None);
@@ -65,6 +73,8 @@ impl TrayController {
 
         menu.append(&status_item)
             .context("failed to append status tray item")?;
+        menu.append(&version_item)
+            .context("failed to append version tray item")?;
         menu.append(&sep1)
             .context("failed to append separator")?;
         menu.append(&toggle_overlay_item)
@@ -75,6 +85,8 @@ impl TrayController {
             .context("failed to append diagnostics toggle item")?;
         menu.append(&toggle_telemetry_item)
             .context("failed to append telemetry toggle item")?;
+        menu.append(&check_app_update_item)
+            .context("failed to append check-app-update item")?;
         menu.append(&check_update_item)
             .context("failed to append check-update item")?;
         menu.append(&open_dir_item)
@@ -88,10 +100,12 @@ impl TrayController {
         menu.append(&quit_item)
             .context("failed to append quit item")?;
 
+        let version_item_id = version_item.id().clone();
         let toggle_overlay_id = toggle_overlay_item.id().clone();
         let toggle_corner_id = toggle_corner_item.id().clone();
         let toggle_diagnostics_id = toggle_diagnostics_item.id().clone();
         let toggle_telemetry_id = toggle_telemetry_item.id().clone();
+        let check_app_update_id = check_app_update_item.id().clone();
         let check_update_id = check_update_item.id().clone();
         let open_dir_id = open_dir_item.id().clone();
         let open_log_id = open_log_item.id().clone();
@@ -99,24 +113,29 @@ impl TrayController {
         let quit_id = quit_item.id().clone();
 
         let icon = build_hextech_icon()?;
+        let initial_tooltip = format!("Hexrs {app_version} · 休眠中");
         let tray_icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Hexrs · 休眠中")
+            .with_tooltip(initial_tooltip)
             .with_icon(icon)
             .build()
             .context("failed to build TrayIcon")?;
 
         Ok(Self {
+            app_version: app_version.to_owned(),
             tray_icon,
             status_item,
+            version_item,
             toggle_overlay_item,
             toggle_corner_item,
             toggle_diagnostics_item,
             toggle_telemetry_item,
+            version_item_id,
             toggle_overlay_id,
             toggle_corner_id,
             toggle_diagnostics_id,
             toggle_telemetry_id,
+            check_app_update_id,
             check_update_id,
             open_dir_id,
             open_log_id,
@@ -130,7 +149,9 @@ impl TrayController {
         let mut actions = Vec::new();
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             let id = event.id;
-            if id == self.toggle_overlay_id {
+            if id == self.version_item_id {
+                actions.push(TrayAction::OpenReleasePage);
+            } else if id == self.toggle_overlay_id {
                 actions.push(TrayAction::ToggleOverlay);
             } else if id == self.toggle_corner_id {
                 actions.push(TrayAction::ToggleOverlayCorner);
@@ -138,6 +159,8 @@ impl TrayController {
                 actions.push(TrayAction::ToggleDiagnostics);
             } else if id == self.toggle_telemetry_id {
                 actions.push(TrayAction::ToggleTelemetry);
+            } else if id == self.check_app_update_id {
+                actions.push(TrayAction::CheckAppUpdate);
             } else if id == self.check_update_id {
                 actions.push(TrayAction::CheckDataUpdate);
             } else if id == self.open_dir_id {
@@ -155,13 +178,20 @@ impl TrayController {
 
     /// Updates the disabled status line and tooltip to reflect the active mode.
     pub fn update_status(&self, mode: AppMode) {
-        let (status_label, tooltip) = match mode {
-            AppMode::Dormant => ("状态: 休眠中", "Hexrs · 休眠中"),
-            AppMode::LobbyDocked => ("状态: 选人侧边栏", "Hexrs · 选人侧边栏"),
-            AppMode::InGameOverlay => ("状态: 局内悬浮窗", "Hexrs · 局内悬浮窗"),
+        let (status_label, mode_desc) = match mode {
+            AppMode::Dormant => ("状态: 休眠中", "休眠中"),
+            AppMode::LobbyDocked => ("状态: 选人侧边栏", "选人侧边栏"),
+            AppMode::InGameOverlay => ("状态: 局内悬浮窗", "局内悬浮窗"),
         };
+        let tooltip = format!("Hexrs {} · {}", self.app_version, mode_desc);
         self.status_item.set_text(status_label);
-        let _ = self.tray_icon.set_tooltip(Some(tooltip));
+        let _ = self.tray_icon.set_tooltip(Some(tooltip.as_str()));
+    }
+
+    /// Updates the version line text and whether clicking it opens the release page.
+    pub fn update_app_version_status(&self, label: &str, clickable: bool) {
+        self.version_item.set_text(label);
+        self.version_item.set_enabled(clickable);
     }
 
     /// Updates the in-game corner menu label cleanly when flipped between TopLeft and TopRight.

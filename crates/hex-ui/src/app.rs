@@ -13,9 +13,10 @@ use hex_core::{
     SummonerRatingSummary, TeamRatingsSnapshot,
 };
 use hex_data::{
-    spawn_background_update, AugmentEvaluation, BenchHighlight, DynamicBuildPlan, EogReporter,
-    HeroPreview, HeroStats, IconCache, MetaEngine, TeamRecommendations, UpdateOutcome,
-    UpdaterConfig,
+    spawn_app_update_check, spawn_background_update, AppUpdateConfig, AppUpdateOutcome,
+    AugmentEvaluation, BenchHighlight, DynamicBuildPlan, EogReporter, HeroPreview, HeroStats,
+    IconCache, MetaEngine, TeamRecommendations, UpdateOutcome, UpdaterConfig,
+    DEFAULT_RELEASES_PAGE_URL,
 };
 use hex_vision::{
     LoadingAlignmentTargets, LoadingSlotTarget, SharedRoiManifest, TabAlignmentTargets,
@@ -40,9 +41,31 @@ use crate::win32::{
     self, OverlayCorner, TabScoreboardSide, Win32WindowAction, Win32WindowCommand, WindowRectInfo,
 };
 
+/// Compile-time injected Hexrs application version tag (set by `build.rs` / CI).
+pub const APP_VERSION: &str = env!("HEXRS_APP_VERSION");
+/// Compile-time injected short Git commit SHA (set by `build.rs` / CI).
+pub const APP_GIT_SHA: &str = env!("HEXRS_GIT_SHA");
+
 const BENCH_HIGHLIGHT_LIMIT: usize = 12;
 const TEAM_RECOMMENDATION_LIMIT: usize = 5;
 const PREVIEW_YASUO_HERO_ID: i32 = 157;
+
+/// UI-facing client application release check status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppUpdateUiState {
+    Checking,
+    UpToDate {
+        latest_version: String,
+        release_url: String,
+    },
+    UpdateAvailable {
+        latest_version: String,
+        release_url: String,
+        download_url: Option<String>,
+        is_prerelease: bool,
+    },
+    Failed(String),
+}
 
 /// Transient in-memory player key `(champion_id, normalized_display_name)` for stable Tab row locking.
 /// Never log, persist to disk, or emit to telemetry.
@@ -102,6 +125,11 @@ pub struct HexrsApp {
     update_tx: crossbeam_channel::Sender<anyhow::Result<UpdateOutcome>>,
     update_rx: Receiver<anyhow::Result<UpdateOutcome>>,
     update_in_flight: bool,
+    pub app_update_state: AppUpdateUiState,
+    app_update_config: AppUpdateConfig,
+    app_update_tx: crossbeam_channel::Sender<anyhow::Result<AppUpdateOutcome>>,
+    app_update_rx: Receiver<anyhow::Result<AppUpdateOutcome>>,
+    app_update_in_flight: bool,
     reporter: EogReporter,
     core_handle: CoreHandle,
     vision: VisionController,
@@ -177,6 +205,13 @@ impl HexrsApp {
         let updater_config = UpdaterConfig::from_env();
         let (update_tx, update_rx) = unbounded::<anyhow::Result<UpdateOutcome>>();
         spawn_background_update(updater_config.clone(), update_tx.clone());
+        let app_update_config = AppUpdateConfig::from_env();
+        let (app_update_tx, app_update_rx) = unbounded::<anyhow::Result<AppUpdateOutcome>>();
+        spawn_app_update_check(
+            app_update_config.clone(),
+            APP_VERSION.to_owned(),
+            app_update_tx.clone(),
+        );
         let reporter = EogReporter::from_env();
 
         let mode = core_handle.current_mode();
@@ -243,6 +278,11 @@ impl HexrsApp {
             update_tx,
             update_rx,
             update_in_flight: true,
+            app_update_state: AppUpdateUiState::Checking,
+            app_update_config,
+            app_update_tx,
+            app_update_rx,
+            app_update_in_flight: true,
             reporter,
             core_handle,
             vision,
@@ -332,6 +372,69 @@ impl HexrsApp {
             }
         }
 
+        while let Ok(outcome) = self.app_update_rx.try_recv() {
+            self.app_update_in_flight = false;
+            match outcome {
+                Ok(AppUpdateOutcome::UpdateAvailable {
+                    latest_version,
+                    release_url,
+                    download_url,
+                    is_prerelease,
+                    ..
+                }) => {
+                    info!(
+                        current_version = APP_VERSION,
+                        %latest_version,
+                        is_prerelease,
+                        "newer Hexrs client release available"
+                    );
+                    if let Some(ref tray_ctrl) = self.tray {
+                        tray_ctrl.update_app_version_status(
+                            &format!("发现新版本: {latest_version} (点击下载)"),
+                            true,
+                        );
+                    }
+                    self.app_update_state = AppUpdateUiState::UpdateAvailable {
+                        latest_version,
+                        release_url,
+                        download_url,
+                        is_prerelease,
+                    };
+                    dirty = true;
+                }
+                Ok(AppUpdateOutcome::UpToDate {
+                    latest_version,
+                    release_url,
+                    ..
+                }) => {
+                    debug!(
+                        current_version = APP_VERSION,
+                        %latest_version,
+                        "Hexrs client is up to date"
+                    );
+                    if let Some(ref tray_ctrl) = self.tray {
+                        tray_ctrl.update_app_version_status(
+                            &format!("版本: {APP_VERSION} (已是最新)"),
+                            false,
+                        );
+                    }
+                    self.app_update_state = AppUpdateUiState::UpToDate {
+                        latest_version,
+                        release_url,
+                    };
+                    dirty = true;
+                }
+                Err(err) => {
+                    debug!(error = %err, "silent app version update check failed");
+                    if let Some(ref tray_ctrl) = self.tray {
+                        tray_ctrl.update_app_version_status(&format!("版本: {APP_VERSION}"), false);
+                    }
+                    self.app_update_state = AppUpdateUiState::Failed(err.to_string());
+                    dirty = true;
+                }
+            }
+        }
+
         if let Some(actions) = self.tray.as_ref().map(TrayController::poll_actions) {
             for action in actions {
                 match action {
@@ -399,6 +502,13 @@ impl HexrsApp {
                             .unwrap_or(!self.telemetry_enabled);
                         self.reporter.set_enabled(self.telemetry_enabled);
                         info!(enabled = self.telemetry_enabled, "anonymized EOG telemetry toggled");
+                    }
+                    TrayAction::CheckAppUpdate => {
+                        self.trigger_app_update_check(cx);
+                        dirty = true;
+                    }
+                    TrayAction::OpenReleasePage => {
+                        self.open_app_release_page();
                     }
                     TrayAction::CheckDataUpdate => {
                         if !self.update_in_flight {
@@ -604,6 +714,36 @@ impl HexrsApp {
         }
         self.reset_window_sync_cache();
         cx.notify();
+    }
+
+    /// Triggers a non-blocking GitHub Releases check for a newer Hexrs client build.
+    pub fn trigger_app_update_check(&mut self, cx: &mut Context<Self>) {
+        if self.app_update_in_flight {
+            return;
+        }
+        self.app_update_in_flight = true;
+        self.app_update_state = AppUpdateUiState::Checking;
+        if let Some(ref tray_ctrl) = self.tray {
+            tray_ctrl.update_app_version_status(&format!("版本: {APP_VERSION} (检查中…)"), false);
+        }
+        spawn_app_update_check(
+            self.app_update_config.clone(),
+            APP_VERSION.to_owned(),
+            self.app_update_tx.clone(),
+        );
+        info!(
+            current_version = APP_VERSION,
+            "manual app version update check started"
+        );
+        cx.notify();
+    }
+
+    /// Opens the latest GitHub Release page (or fallback releases page) in the default browser.
+    pub fn open_app_release_page(&self) {
+        let url = resolve_release_open_url(&self.app_update_state);
+        if let Err(err) = win32::open_url(url) {
+            warn!(error = %err, "failed to open Hexrs release page in browser");
+        }
     }
 
     /// Triggers UAC elevation and exits this unprivileged instance upon success.
@@ -2355,6 +2495,51 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
         ),
     };
 
+    let (app_update_label, app_update_color, has_app_update) = match &app.app_update_state {
+        AppUpdateUiState::Checking => ("检查中…".to_owned(), theme::text_muted(), false),
+        AppUpdateUiState::UpToDate { latest_version, .. } => (
+            if latest_version.is_empty() {
+                "已是最新版本".to_owned()
+            } else {
+                format!("已是最新 ({latest_version})")
+            },
+            theme::cyan(),
+            false,
+        ),
+        AppUpdateUiState::UpdateAvailable {
+            latest_version,
+            is_prerelease,
+            ..
+        } => (
+            if *is_prerelease {
+                format!("发现新版本 {latest_version} (预发布)")
+            } else {
+                format!("发现新版本 {latest_version}")
+            },
+            theme::gold(),
+            true,
+        ),
+        AppUpdateUiState::Failed(reason) => (
+            if reason.is_empty() {
+                "检查失败".to_owned()
+            } else {
+                "检查失败 (请稍后重试)".to_owned()
+            },
+            theme::warning_text(),
+            false,
+        ),
+    };
+    let check_app_update_btn_label = if app.app_update_in_flight {
+        "检查软件更新中…"
+    } else {
+        "检查软件更新"
+    };
+    let release_btn_label = if has_app_update {
+        "前往下载新版本 ↗"
+    } else {
+        "查看 Release ↗"
+    };
+
     div()
         .size_full()
         .flex()
@@ -2375,10 +2560,29 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                 .justify_between()
                 .child(
                     div()
-                        .text_sm()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(theme::gold())
-                        .child("Hexrs · 运行诊断面板"),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(theme::gold())
+                                .child("Hexrs · 运行诊断面板"),
+                        )
+                        .child(
+                            div()
+                                .px(px(5.0))
+                                .py(px(1.0))
+                                .rounded(px(3.0))
+                                .bg(theme::card_elevated_bg())
+                                .border_1()
+                                .border_color(theme::border_subtle())
+                                .text_size(px(10.0))
+                                .font_family(theme::MONO_FONT)
+                                .text_color(theme::text_secondary())
+                                .child(APP_VERSION),
+                        ),
                 )
                 .child(
                     div()
@@ -2460,6 +2664,15 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                         .child(diag_row("MetaEngine 数据库", meta_status.to_owned()))
                         .child(diag_row("特征库规模", counts_str))
                         .child(diag_row("数据版本", data_version_str))
+                        .child(diag_row(
+                            "软件版本",
+                            format!("{APP_VERSION} ({APP_GIT_SHA})"),
+                        ))
+                        .child(diag_row_colored(
+                            "版本更新",
+                            app_update_label,
+                            app_update_color,
+                        ))
                         .child(diag_row_colored(
                             "当前权限",
                             if diag.is_elevated {
@@ -2731,6 +2944,67 @@ fn render_diagnostics_panel(app: &HexrsApp, cx: &mut Context<HexrsApp>) -> Div {
                                 .text_color(theme::text_muted())
                                 .child(format!("3. 完整运行日志位于：{}", log_file_path().display())),
                         ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("check-app-update-btn")
+                                .flex_1()
+                                .cursor_pointer()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(3.0))
+                                .bg(theme::card_elevated_bg())
+                                .border_1()
+                                .border_color(theme::border_subtle())
+                                .hover(|s| s.bg(theme::bg_highlight()))
+                                .flex()
+                                .justify_center()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::text_primary())
+                                .child(check_app_update_btn_label)
+                                .on_click(cx.listener(|this, _event, _window, cx| {
+                                    this.trigger_app_update_check(cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("open-app-release-btn")
+                                .flex_1()
+                                .cursor_pointer()
+                                .px_2()
+                                .py_1()
+                                .rounded(px(3.0))
+                                .bg(if has_app_update {
+                                    theme::gold_dim()
+                                } else {
+                                    theme::cyan_dim()
+                                })
+                                .border_1()
+                                .border_color(if has_app_update {
+                                    theme::border_gold()
+                                } else {
+                                    theme::border_cyan()
+                                })
+                                .hover(|s| s.bg(theme::card_elevated_bg()))
+                                .flex()
+                                .justify_center()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(if has_app_update {
+                                    theme::gold()
+                                } else {
+                                    theme::cyan()
+                                })
+                                .child(release_btn_label)
+                                .on_click(cx.listener(|this, _event, _window, _cx| {
+                                    this.open_app_release_page();
+                                })),
+                        ),
                 ),
         )
 }
@@ -2758,6 +3032,28 @@ fn diag_row_colored(label: &str, value: String, value_color: Rgba) -> Div {
                 .text_color(value_color)
                 .child(value),
         )
+}
+
+fn resolve_release_open_url(state: &AppUpdateUiState) -> &str {
+    match state {
+        AppUpdateUiState::UpdateAvailable {
+            release_url,
+            download_url,
+            ..
+        } => {
+            if !release_url.trim().is_empty() {
+                release_url.trim()
+            } else if let Some(url) = download_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+                url
+            } else {
+                DEFAULT_RELEASES_PAGE_URL
+            }
+        }
+        AppUpdateUiState::UpToDate { release_url, .. } if !release_url.trim().is_empty() => {
+            release_url.trim()
+        }
+        _ => DEFAULT_RELEASES_PAGE_URL,
+    }
 }
 
 fn normalize_tab_display_name(raw: &str) -> String {
@@ -3082,12 +3378,50 @@ fn format_rect_info(rect: Option<WindowRectInfo>) -> String {
 mod tests {
     use super::{
         apply_tab_visual_order, build_tab_team_entries, map_loading_team_slots_with,
-        order_subset_cards_for_display, resolve_live_hero_id_with, resolve_slot_order,
-        snapshot_has_augment_wings, tab_scoreboard_side_meta, HeroTier, LiveGameState,
-        LivePlayerEntry, LoadingCardHeroData, LoadingPlayerSlot, LoadingScreenSnapshot,
-        LoadingTeamSide, RatingTitlesConfig, SummonerRatingStatus, SummonerRatingSummary,
-        TabRosterKey, TeamRatingsSnapshot,
+        order_subset_cards_for_display, resolve_live_hero_id_with, resolve_release_open_url,
+        resolve_slot_order, snapshot_has_augment_wings, tab_scoreboard_side_meta,
+        AppUpdateUiState, HeroTier, LiveGameState, LivePlayerEntry, LoadingCardHeroData,
+        LoadingPlayerSlot, LoadingScreenSnapshot, LoadingTeamSide, RatingTitlesConfig,
+        SummonerRatingStatus, SummonerRatingSummary, TabRosterKey, TeamRatingsSnapshot,
+        DEFAULT_RELEASES_PAGE_URL,
     };
+
+    #[test]
+    fn resolves_release_open_url_with_fallback() {
+        assert_eq!(
+            resolve_release_open_url(&AppUpdateUiState::Checking),
+            DEFAULT_RELEASES_PAGE_URL
+        );
+        assert_eq!(
+            resolve_release_open_url(&AppUpdateUiState::Failed("net".to_owned())),
+            DEFAULT_RELEASES_PAGE_URL
+        );
+        assert_eq!(
+            resolve_release_open_url(&AppUpdateUiState::UpToDate {
+                latest_version: "v0.1.0".to_owned(),
+                release_url: "https://github.com/zoffyultraman/Hexrs/releases/tag/v0.1.0".to_owned(),
+            }),
+            "https://github.com/zoffyultraman/Hexrs/releases/tag/v0.1.0"
+        );
+        assert_eq!(
+            resolve_release_open_url(&AppUpdateUiState::UpdateAvailable {
+                latest_version: "v0.2.0".to_owned(),
+                release_url: "https://github.com/zoffyultraman/Hexrs/releases/tag/v0.2.0".to_owned(),
+                download_url: Some("https://github.com/zoffyultraman/Hexrs/releases/download/v0.2.0/Hexrs.zip".to_owned()),
+                is_prerelease: false,
+            }),
+            "https://github.com/zoffyultraman/Hexrs/releases/tag/v0.2.0"
+        );
+        assert_eq!(
+            resolve_release_open_url(&AppUpdateUiState::UpdateAvailable {
+                latest_version: "v0.2.0".to_owned(),
+                release_url: String::new(),
+                download_url: Some("https://github.com/zoffyultraman/Hexrs/releases/download/v0.2.0/Hexrs.zip".to_owned()),
+                is_prerelease: true,
+            }),
+            "https://github.com/zoffyultraman/Hexrs/releases/download/v0.2.0/Hexrs.zip"
+        );
+    }
 
     #[test]
     fn merges_live_five_players_with_partial_lcu_roster_including_anonymous_players() {

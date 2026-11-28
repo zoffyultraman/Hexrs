@@ -274,7 +274,7 @@ pub fn compute_loading_layout_dip(window_w_dip: f32, window_h_dip: f32) -> Loadi
     };
 
     let row_w = 5.0 * card_w_dip + 4.0 * card_gap_dip;
-    let row_left_dip = ((w - row_w) * 0.5 - w * 0.0015).max(0.0);
+    let row_left_dip = ((w - row_w) * 0.5 - w * 0.0033).max(0.0);
     let card_strip_h_dip = (48.0 * ui_scale).clamp(44.0, 62.0);
     let top_row_y_dip = h * 0.067;
     let bottom_row_y_dip = h * 0.553;
@@ -1497,6 +1497,35 @@ mod imp {
         }
         Ok(())
     }
+
+    /// Opens an `https://` URL in the user's default web browser via `ShellExecuteW`.
+    pub fn open_url(url: &str) -> Result<()> {
+        let trimmed = url.trim();
+        if !trimmed.starts_with("https://") {
+            anyhow::bail!("refusing to open non-HTTPS URL");
+        }
+        let url_w: Vec<u16> = trimmed.encode_utf16().chain(std::iter::once(0)).collect();
+
+        // SAFETY: `url_w` is null-terminated UTF-16 and lives across the synchronous `ShellExecuteW` call.
+        let res = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                PCWSTR::from_raw(url_w.as_ptr()),
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+
+        if (res.0 as isize) <= 32 {
+            anyhow::bail!(
+                "failed to open URL in browser (ShellExecuteW code={})",
+                res.0 as isize
+            );
+        }
+        Ok(())
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1615,18 +1644,37 @@ mod imp {
         tracing::warn!("relaunch_as_administrator requested on non-Windows");
         anyhow::bail!("仅支持 Windows UAC 提权")
     }
+
+    /// Non-Windows stub for `open_url`.
+    pub fn open_url(url: &str) -> Result<()> {
+        let trimmed = url.trim();
+        if !trimmed.starts_with("https://") {
+            anyhow::bail!("refusing to open non-HTTPS URL");
+        }
+        tracing::info!(url = trimmed, "open_url requested on non-Windows");
+        Ok(())
+    }
 }
 
 pub use imp::{
     apply_window_command, default_preview_game_rect, default_preview_lobby_rect,
     find_league_game_window, find_league_lobby_window, is_game_window_foreground,
     is_lobby_window_foreground, is_tab_scoreboard_hotkey_pressed, open_data_directory,
-    open_log_file, relaunch_as_administrator, window_hwnd_raw, window_scale_for_hwnd,
+    open_log_file, open_url, relaunch_as_administrator, window_hwnd_raw, window_scale_for_hwnd,
 };
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_loading_layout_dip, compute_tab_scoreboard_layout_dip, OverlayCorner};
+    use super::{
+        compute_loading_layout_dip, compute_tab_scoreboard_layout_dip, open_url, OverlayCorner,
+    };
+
+    #[test]
+    fn open_url_rejects_non_https_schemes() {
+        assert!(open_url("http://example.com").is_err());
+        assert!(open_url("javascript:alert(1)").is_err());
+        assert!(open_url("").is_err());
+    }
 
     #[test]
     fn overlay_corner_defaults_to_top_right() {

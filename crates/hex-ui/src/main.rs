@@ -77,11 +77,13 @@ fn main() {
 
     info!(
         log_path = %log_file_path().display(),
+        app_version = crate::app::APP_VERSION,
+        git_sha = crate::app::APP_GIT_SHA,
         "Hexrs starting GPUI event loop"
     );
 
     Application::new().run(move |cx: &mut App| {
-        let tray = match TrayController::new() {
+        let tray = match TrayController::new(crate::app::APP_VERSION) {
             Ok(controller) => Some(controller),
             Err(err) => {
                 warn!(error = %err, "failed to initialize system tray; continuing without tray icon");
